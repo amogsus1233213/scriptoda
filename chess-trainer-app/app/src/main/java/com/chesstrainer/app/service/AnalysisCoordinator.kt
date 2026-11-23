@@ -97,8 +97,15 @@ class AnalysisCoordinator(
          */
         private const val MAX_FRAMES_BEFORE_MAJORITY = 6
 
-        /** Consecutive contrary reads required before the board orientation is switched. */
-        private const val ORIENTATION_SWITCH_FRAMES = 3
+        /**
+         * Orientation hysteresis. Every read frame votes: a frame whose [Orientation.score]
+         * contradicts the locked orientation adds 2 votes when the evidence is strong
+         * (|score| >= [STRONG_ORIENTATION_SCORE]) and 1 when weak; an agreeing frame resets the
+         * count. The orientation switches at [ORIENTATION_SWITCH_VOTES], i.e. after 2 strong or 4
+         * weak contrary frames in a row.
+         */
+        private const val ORIENTATION_SWITCH_VOTES = 4
+        private const val STRONG_ORIENTATION_SCORE = 20f
 
         /** Frames without a visible board after which the overlay suggestion is cleared. */
         private const val MISSED_FRAMES_BEFORE_CLEAR = 6
@@ -614,7 +621,8 @@ class AnalysisCoordinator(
         templatesLoaded = true
         saveTemplates(result)
         // The starting position fixes the orientation; game tracking resyncs on its own when the
-        // start placement is read below.
+        // start placement is read below. Placements tracked with the other orientation are void.
+        if (whiteAtBottom != null && whiteAtBottom != bottomIsWhite) resetTracking()
         whiteAtBottom = bottomIsWhite
         orientationVotes = 0
         Log.i(TAG, "Learnt piece templates from the starting position")
@@ -668,14 +676,19 @@ class AnalysisCoordinator(
     }
 
     /**
-     * Returns the board orientation with hysteresis: with few pieces left the heuristic can be
-     * ambiguous, so a flip is only accepted after several consistent reads (or immediately when
-     * the starting position is shown).
+     * Returns the board orientation, re-checked on every read frame. A wrong orientation rotates
+     * the FEN by 180 degrees, so the engine's moves come out mirrored on screen (e.g. a pawn
+     * "moving backwards"); it must therefore be corrected quickly, yet one noisy frame must not
+     * flip it. See [ORIENTATION_SWITCH_VOTES]. The starting position fixes it immediately.
+     *
+     * When the orientation changes, all placements tracked so far were built with the wrong
+     * orientation, so move tracking is reset and resyncs from the next stable read.
      */
     private fun resolveOrientation(letters: Array<CharArray>): Boolean {
-        val detected = Orientation.whiteAtBottom(letters)
+        val score = Orientation.score(letters)
+        val detected = score >= 0f
         val locked = whiteAtBottom
-        if (locked == null || Fen.build(letters, detected).substringBefore(' ') == START_PLACEMENT) {
+        if (locked == null) {
             whiteAtBottom = detected
             orientationVotes = 0
             return detected
@@ -684,13 +697,33 @@ class AnalysisCoordinator(
             orientationVotes = 0
             return locked
         }
-        orientationVotes++
-        if (orientationVotes >= ORIENTATION_SWITCH_FRAMES) {
+        orientationVotes += if (abs(score) >= STRONG_ORIENTATION_SCORE) 2 else 1
+        val isStart = Fen.build(letters, detected).substringBefore(' ') == START_PLACEMENT
+        if (isStart || orientationVotes >= ORIENTATION_SWITCH_VOTES) {
+            Log.i(TAG, "Board orientation changed: white at bottom = $detected (score $score)")
             whiteAtBottom = detected
             orientationVotes = 0
+            resetTracking()
             return detected
         }
         return locked
+    }
+
+    /** Forgets all tracked placements and positions (but not the orientation). */
+    private fun resetTracking() {
+        candidatePlacement = null
+        candidateCount = 0
+        stablePlacement = null
+        candidateHistory.clear()
+        candidateFramesSinceStable = 0
+        previousFen = null
+        previousAnalysis = null
+        currentFen = null
+        currentAnalyses = null
+        lastMove = null
+        lastClassified = null
+        castlingRights = "KQkq"
+        fullMoveNumber = 1
     }
 
     private fun updateBoardBounds(grid: Grid, px: Pixels, bitmap: Bitmap) {
@@ -811,21 +844,9 @@ class AnalysisCoordinator(
     private fun resetGameState() {
         whiteAtBottom = null
         orientationVotes = 0
-        candidatePlacement = null
-        candidateCount = 0
-        stablePlacement = null
-        candidateHistory.clear()
-        candidateFramesSinceStable = 0
         missedFrames = 0
         boardVisible = false
-        previousFen = null
-        previousAnalysis = null
-        currentFen = null
-        currentAnalyses = null
-        lastMove = null
-        lastClassified = null
-        castlingRights = "KQkq"
-        fullMoveNumber = 1
+        resetTracking()
     }
 
     // -------------------------------------------------------------------------------------

@@ -501,8 +501,10 @@ object Classifier {
  *     fill, upper-body width, waist, aspect, left-right asymmetry), scored against per-piece
  *     prototypes with a normalized squared distance.
  *
- * Board-level checks then fix the least confident reads: no pawns on the first or last rank,
- * exactly one king per side, at most 8 pawns per side.
+ * Board-level checks then fix the least confident reads: 3..32 pieces in total (occupancy is
+ * re-read with stricter gates when there are too many), at most 16 pieces per colour, no pawns
+ * on the first or last rank, the tallest pieces of a colour hold its king and its clearly
+ * shortest pieces are pawns, exactly one king per side, at most 8 pawns per side.
  *
  * Prototype values are tuned for chess.com's default ("neo") pieces, but they rely on coarse
  * silhouette proportions only, so similar sets should work too.
@@ -516,10 +518,38 @@ object TemplateFreeClassifier {
     /** Side of the square corner patches ignored because of coordinate labels. */
     private const val CORNER = 3
 
-    private const val MIN_STRONG_BINS = 10
-    private const val MIN_MEAN_ENERGY = 0.02f
+    // Occupancy gates. Kept fairly strict so that coordinate labels, move highlights and
+    // anti-aliasing noise are not mistaken for pieces.
+    private const val MIN_STRONG_BINS = 15
+    private const val MIN_MEAN_ENERGY = 0.04f
     private const val MIN_SILHOUETTE_BINS = 14
     private const val MIN_COMPONENT_BINS = 3
+
+    /**
+     * Board-level piece-count sanity. More than 32 pieces is impossible, so the occupancy gates
+     * are tightened by [STRICTNESS_STEP] per retry (up to [MAX_STRICTNESS_LEVEL] retries). Fewer
+     * than [MIN_TOTAL_PIECES] pieces (two kings and at most nothing else) is treated as a failed
+     * read.
+     */
+    private const val MAX_TOTAL_PIECES = 32
+    private const val MIN_TOTAL_PIECES = 3
+    private const val MAX_PIECES_PER_SIDE = 16
+    private const val MAX_STRICTNESS_LEVEL = 3
+    private const val STRICTNESS_STEP = 0.25f
+
+    /**
+     * Relative-height heuristic. Heights are quantised to 1/N (one feature row = 0.0625).
+     * [HEIGHT_TIE]: pieces within about one row of the extreme count as "tallest"/"shortest".
+     * [MIN_PAWN_HEIGHT_GAP]: a pawn candidate must be clearly shorter than the side's tallest
+     * piece (a pawn is ~3-4 rows shorter than a king, a rook only ~1-2 rows).
+     * Boosts are subtracted from the prototype distance and only applied to reads whose current
+     * type wins by less than [LOW_CONFIDENCE_MARGIN].
+     */
+    private const val HEIGHT_TIE = 0.07f
+    private const val MIN_PAWN_HEIGHT_GAP = 0.15f
+    private const val LOW_CONFIDENCE_MARGIN = 2.0f
+    private const val KING_BOOST = 3.0f
+    private const val PAWN_BOOST = 3.0f
 
     private const val BODY_PERCENTILE = 0.65f
     private const val DEFAULT_COLOR_THRESHOLD = 150f
@@ -551,20 +581,36 @@ object TemplateFreeClassifier {
     private const val M_ASYM = 8 // left-right mirror mismatch
     private const val METRIC_COUNT = 9
 
-    /** Prototype means per type, metric order as above. */
+    /**
+     * Prototype means per type, metric order as above.
+     *
+     * The feature window is the central 76% of the square and all pieces stand on a common base
+     * line near (or below) the bottom of that window, so for every type `top + height` is close
+     * to 1. Distinguishing features per type:
+     *  - pawn: much lower top / shorter, small area, small round head (narrow top band), symmetric.
+     *  - knight: tall and strongly asymmetric (horse head) - asymmetry is the key metric.
+     *  - bishop: tall, narrow, pointed mitre (narrow top band), slim upper body.
+     *  - rook: a bit shorter, blocky, battlements make the top band nearly as wide as the body and
+     *    well filled.
+     *  - queen: tall, crown spikes make a moderately wide but poorly filled top band, large area.
+     *  - king: tallest, cross gives a narrow top band, but a very wide upper body and largest area.
+     */
     private val PROTO_MEAN = arrayOf(
-        //            top   height area  topSp topFl upper waist aspect asym
-        floatArrayOf(0.22f, 0.72f, 0.28f, 0.45f, 0.75f, 0.55f, 0.45f, 0.80f, 0.06f), // pawn
-        floatArrayOf(0.04f, 0.95f, 0.45f, 0.55f, 0.65f, 0.75f, 0.65f, 0.85f, 0.28f), // knight
-        floatArrayOf(0.02f, 0.98f, 0.38f, 0.30f, 0.70f, 0.50f, 0.40f, 0.68f, 0.07f), // bishop
-        floatArrayOf(0.09f, 0.90f, 0.48f, 0.92f, 0.82f, 0.72f, 0.62f, 0.82f, 0.06f), // rook
-        floatArrayOf(0.02f, 0.98f, 0.48f, 0.88f, 0.55f, 0.65f, 0.45f, 0.85f, 0.07f), // queen
-        floatArrayOf(0.00f, 1.00f, 0.55f, 0.38f, 0.60f, 0.92f, 0.70f, 0.85f, 0.06f), // king
+        //            top    height area   topSp  topFl  upper  waist  aspect asym
+        floatArrayOf(0.22f, 0.76f, 0.24f, 0.50f, 0.70f, 0.50f, 0.35f, 0.78f, 0.05f), // pawn
+        floatArrayOf(0.03f, 0.95f, 0.42f, 0.50f, 0.55f, 0.70f, 0.55f, 0.78f, 0.25f), // knight
+        floatArrayOf(0.02f, 0.96f, 0.32f, 0.28f, 0.65f, 0.42f, 0.35f, 0.58f, 0.06f), // bishop
+        floatArrayOf(0.06f, 0.92f, 0.50f, 0.95f, 0.88f, 0.75f, 0.70f, 0.80f, 0.05f), // rook
+        floatArrayOf(0.01f, 0.98f, 0.45f, 0.68f, 0.50f, 0.65f, 0.42f, 0.74f, 0.06f), // queen
+        floatArrayOf(0.00f, 1.00f, 0.52f, 0.35f, 0.55f, 0.85f, 0.65f, 0.78f, 0.05f), // king
     )
 
-    /** Tolerance per metric (shared by all types except knight asymmetry, which varies more). */
-    private val PROTO_SIGMA = floatArrayOf(0.07f, 0.08f, 0.08f, 0.15f, 0.15f, 0.12f, 0.12f, 0.12f, 0.07f)
-    private const val KNIGHT_ASYM_SIGMA = 0.12f
+    /**
+     * Tolerance per metric (shared by all types except knight asymmetry, which varies more).
+     * Deliberately wide: rendering size, anti-aliasing and the grid fit all shift the metrics.
+     */
+    private val PROTO_SIGMA = floatArrayOf(0.12f, 0.12f, 0.12f, 0.20f, 0.20f, 0.18f, 0.18f, 0.15f, 0.10f)
+    private const val KNIGHT_ASYM_SIGMA = 0.15f
 
     /** Per-square result before board-level validation. */
     private class Reading(
@@ -576,15 +622,26 @@ object TemplateFreeClassifier {
         val scores: FloatArray,
         var type: Int,
         val bodyLuma: Float,
+        /** Shape metrics of the silhouette (see M_* indices). */
+        val metrics: FloatArray,
     )
 
     /** Returns letters[row][col] in screen order (row 0 at top), '.' for empty squares. */
     fun classify(cells: List<Cell>): Array<CharArray> {
         require(cells.size == 64) { "Expected 64 cells, got ${cells.size}" }
 
-        val readings = arrayOfNulls<Reading>(64)
-        for (i in 0 until 64) readings[i] = readCell(cells[i], i / 8)
+        // Occupancy, retried with stricter gates while the count is impossible (> 32 pieces).
+        var level = 0
+        var readings = readAll(cells, level)
+        while (readings.count { it != null } > MAX_TOTAL_PIECES && level < MAX_STRICTNESS_LEVEL) {
+            level++
+            readings = readAll(cells, level)
+        }
         val occupied = readings.filterNotNull()
+        // Still impossible, or too few pieces for a real position: the read is garbage.
+        if (occupied.size > MAX_TOTAL_PIECES || occupied.size < MIN_TOTAL_PIECES) {
+            return Array(8) { CharArray(8) { '.' } }
+        }
 
         // Colour: split fill lumas into two clusters.
         val threshold = colorThreshold(occupied.map { it.bodyLuma })
@@ -618,11 +675,19 @@ object TemplateFreeClassifier {
         return nearRowEdge && nearColEdge
     }
 
-    /** Returns null for an empty square. */
-    private fun readCell(cell: Cell, row: Int): Reading? {
+    private fun readAll(cells: List<Cell>, strictness: Int): Array<Reading?> =
+        Array(64) { i -> readCell(cells[i], i / 8, strictness) }
+
+    /**
+     * Returns null for an empty square. [strictness] > 0 tightens the occupancy gates only (the
+     * silhouette is always built from the base mask so shape metrics stay comparable).
+     */
+    private fun readCell(cell: Cell, row: Int, strictness: Int = 0): Reading? {
         val f = cell.features
         if (f.size < N * N) return null
 
+        val factor = 1f + STRICTNESS_STEP * strictness
+        val occupancyThreshold = MASK_THRESHOLD * factor
         var strong = 0
         var energy = 0f
         var counted = 0
@@ -632,12 +697,10 @@ object TemplateFreeClassifier {
             val a = abs(f[i])
             energy += a
             counted++
-            if (a > MASK_THRESHOLD) {
-                mask[i] = true
-                strong++
-            }
+            if (a > MASK_THRESHOLD) mask[i] = true
+            if (a > occupancyThreshold) strong++
         }
-        if (strong < MIN_STRONG_BINS || energy / counted < MIN_MEAN_ENERGY) return null
+        if (strong < MIN_STRONG_BINS * factor || energy / counted < MIN_MEAN_ENERGY * factor) return null
 
         val sil = silhouette(mask)
         val silCount = sil.count { it }
@@ -656,7 +719,10 @@ object TemplateFreeClassifier {
         lumas.sort()
         val body = lumas[((silCount - 1) * BODY_PERCENTILE).roundToInt()]
 
-        return Reading(row, white = true, colorConfidence = 0f, scores = scores, type = type, bodyLuma = body)
+        return Reading(
+            row, white = true, colorConfidence = 0f, scores = scores, type = type, bodyLuma = body,
+            metrics = metrics,
+        )
     }
 
     /** Closing (dilate, fill holes, erode), unioned with the hole-filled raw mask. */
@@ -901,11 +967,68 @@ object TemplateFreeClassifier {
             }
         }
 
+        fixSideSizes(pieces)
+
         for (white in listOf(true, false)) {
             val side = pieces.filter { it.white == white }
             if (side.isEmpty()) continue
+            applyRelativeHeight(side)
             fixKings(side)
             fixPawns(side)
+        }
+    }
+
+    /**
+     * A side can have at most 16 pieces. If one side is over-full while the other has room, the
+     * over-full side's least certain colour reads are the likeliest errors; move them across.
+     */
+    private fun fixSideSizes(pieces: List<Reading>) {
+        for (white in listOf(true, false)) {
+            val own = pieces.filter { it.white == white }
+            val otherCount = pieces.size - own.size
+            val excess = min(own.size - MAX_PIECES_PER_SIDE, MAX_PIECES_PER_SIDE - otherCount)
+            if (excess <= 0) continue
+            for (rd in own.sortedBy { it.colorConfidence }.take(excess)) rd.white = !white
+        }
+    }
+
+    /**
+     * Uses the height ordering within one colour to fix shaky type reads. The king is the
+     * tallest piece and pawns are clearly the shortest, regardless of the exact rendering, so:
+     *  - if the side has no king, the cheapest-to-promote piece among the tallest becomes king;
+     *  - if the side's king is not among its tallest pieces, a low-confidence piece among the
+     *    tallest gets its king score boosted (fixKings then keeps the more convincing king);
+     *  - low-confidence non-pawns among the shortest pieces get their pawn score boosted.
+     * Heights of tall pieces are clipped by the feature window, so "tallest" is a tie group.
+     */
+    private fun applyRelativeHeight(side: List<Reading>) {
+        if (side.size < 2) return
+        val tallest = side.maxOf { it.metrics[M_HEIGHT] }
+        val shortest = side.minOf { it.metrics[M_HEIGHT] }
+        val tallGroup = side.filter { tallest - it.metrics[M_HEIGHT] <= HEIGHT_TIE }
+
+        val kings = side.filter { it.type == KING }
+        if (kings.isEmpty()) {
+            val pick = tallGroup.minByOrNull { it.scores[KING] - it.scores[it.type] }
+            if (pick != null) pick.type = KING
+        } else if (kings.none { tallest - it.metrics[M_HEIGHT] <= HEIGHT_TIE }) {
+            val pick = tallGroup
+                .filter { it.type != KING && margin(it, it.type) < LOW_CONFIDENCE_MARGIN }
+                .minByOrNull { it.scores[KING] - it.scores[it.type] }
+            if (pick != null) {
+                pick.scores[KING] -= KING_BOOST
+                pick.type = bestType(pick.scores, excludedFor(pick))
+            }
+        }
+
+        if (tallest - shortest < MIN_PAWN_HEIGHT_GAP) return
+        for (rd in side) {
+            if (rd.type == PAWN || rd.type == KING || rd.row == 0 || rd.row == 7) continue
+            val h = rd.metrics[M_HEIGHT]
+            if (h - shortest > HEIGHT_TIE || tallest - h < MIN_PAWN_HEIGHT_GAP) continue
+            if (margin(rd, rd.type) >= LOW_CONFIDENCE_MARGIN) continue
+            rd.scores[PAWN] -= PAWN_BOOST
+            rd.type = bestType(rd.scores, excludedFor(rd))
         }
     }
 
@@ -1012,24 +1135,62 @@ object Calibrator {
 // Orientation
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Decides which colour plays from the bottom of the screen. On chess.com the user's own pieces
+ * are at the bottom (white when playing white, black when playing black).
+ *
+ * Evidence, combined into one signed score (positive = white at bottom):
+ *  - **Home zones**: white pieces in the bottom two rows vs the top two rows (and the reverse for
+ *    black). Pieces mostly stay near their own back ranks, so this dominates early in a game.
+ *  - **Pawn files**: on a file holding pawns of both colours, the pawns can never have passed
+ *    each other, so the white pawn is below the black one when white is at the bottom.
+ *  - **Kings**: a king on its own back rank.
+ *  - **Centroid**: each piece's distance from the board centre towards its own side.
+ */
 object Orientation {
     private const val KING_BACK_RANK_BONUS = 4f
+    private const val HOME_ZONE_WEIGHT = 1.5f
+    private const val PAWN_FILE_WEIGHT = 2f
+    private const val CENTROID_WEIGHT = 0.5f
 
     /** True if white plays from the bottom of the screen. */
-    fun whiteAtBottom(letters: Array<CharArray>): Boolean {
+    fun whiteAtBottom(letters: Array<CharArray>): Boolean = score(letters) >= 0f
+
+    /**
+     * Signed orientation evidence: positive means white at the bottom, negative black at the
+     * bottom; the magnitude is a confidence (about 120 for the starting position, around 0 when
+     * the position is genuinely ambiguous).
+     */
+    fun score(letters: Array<CharArray>): Float {
         var score = 0f
         for (r in 0 until 8) for (c in 0 until 8) {
             val ch = letters[r][c]
             if (ch == '.') continue
-            // Positive when the piece is in the bottom half, scaled by distance from the centre.
-            val d = r - 3.5f
-            score += if (ch.isUpperCase()) d else -d
+            val white = ch.isUpperCase()
+            val sign = if (white) 1f else -1f
+
+            // Positive when the piece is in its own (bottom = white) half, scaled by distance.
+            score += sign * (r - 3.5f) * CENTROID_WEIGHT
+
+            if (r >= 6) score += sign * HOME_ZONE_WEIGHT
+            if (r <= 1) score -= sign * HOME_ZONE_WEIGHT
+
             when (ch) {
                 'K' -> if (r == 7) score += KING_BACK_RANK_BONUS else if (r == 0) score -= KING_BACK_RANK_BONUS
                 'k' -> if (r == 0) score += KING_BACK_RANK_BONUS else if (r == 7) score -= KING_BACK_RANK_BONUS
             }
         }
-        return score >= 0f
+
+        for (c in 0 until 8) {
+            for (rw in 0 until 8) {
+                if (letters[rw][c] != 'P') continue
+                for (rb in 0 until 8) {
+                    if (letters[rb][c] != 'p') continue
+                    score += if (rw > rb) PAWN_FILE_WEIGHT else -PAWN_FILE_WEIGHT
+                }
+            }
+        }
+        return score
     }
 }
 
