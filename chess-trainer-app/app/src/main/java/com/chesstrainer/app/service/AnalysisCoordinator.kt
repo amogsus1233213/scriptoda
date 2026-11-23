@@ -1114,6 +1114,9 @@ class AnalysisCoordinator(
             lastMove = move
             lastClassified = classified
             postOverlayClear()
+            if (classified != null) {
+                postOpponentBadge(move.uci.substring(2, 4), classified.classification.displayName, !userIsWhite)
+            }
             return
         }
         postOverlayThinking()
@@ -1311,6 +1314,10 @@ class AnalysisCoordinator(
 
     private fun postOverlayClear() {
         mainHandler.post { OverlayService.instance?.clearSuggestion() }
+    }
+
+    private fun postOpponentBadge(square: String, label: String, flipped: Boolean) {
+        mainHandler.post { OverlayService.instance?.showOpponentBadge(square, label, flipped) }
     }
 
     private fun postOverlayThinking() {

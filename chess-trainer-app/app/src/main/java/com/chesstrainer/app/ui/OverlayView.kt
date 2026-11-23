@@ -262,6 +262,13 @@ class OverlayService : Service() {
         }
     }
 
+    /** Shows a classification badge on the square the opponent's piece landed on. */
+    fun showOpponentBadge(square: String, label: String, isFlipped: Boolean) {
+        mainHandler.post {
+            arrowView?.setOpponentBadge(square, label, isFlipped)
+        }
+    }
+
     /** Clears all arrows and resets the panel to its waiting state. */
     fun clearSuggestion() {
         mainHandler.post {
@@ -775,6 +782,11 @@ class ArrowView(
 
     private var arrows: List<ArrowData> = emptyList()
 
+    // Opponent move classification badge (shown on the square the opponent's piece landed on)
+    private var opBadgeSquare: String? = null
+    private var opBadgeLabel: String? = null
+    private var opBadgeFlipped: Boolean = false
+
     private val shaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -814,11 +826,24 @@ class ArrowView(
             .map { it.copy(from = it.from.lowercase(Locale.ROOT), to = it.to.lowercase(Locale.ROOT)) }
             .sortedBy { it.rank }
             .take(MAX_ARROWS)
+        // New arrows mean the user's turn analysis arrived; the opponent badge is no longer needed.
+        opBadgeSquare = null
+        opBadgeLabel = null
         invalidate()
     }
 
     fun clearArrows() {
         arrows = emptyList()
+        opBadgeSquare = null
+        opBadgeLabel = null
+        invalidate()
+    }
+
+    /** Shows a small classification badge on the given square for the opponent's last move. */
+    fun setOpponentBadge(square: String, label: String, flipped: Boolean) {
+        opBadgeSquare = square.lowercase(Locale.ROOT)
+        opBadgeLabel = label
+        opBadgeFlipped = flipped
         invalidate()
     }
 
@@ -836,6 +861,7 @@ class ArrowView(
         val drawOrder = arrows.sortedByDescending { it.rank }
         for (arrow in drawOrder) drawArrow(canvas, arrow, board, square)
         for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
+        drawOpponentBadge(canvas, board, square)
     }
 
     private fun drawArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
@@ -908,6 +934,28 @@ class ArrowView(
         val cy = (end.y - offset).coerceIn(half, max(half, height - half))
 
         val drawable = getCachedDrawable(MoveColors.drawableResForLabel(arrow.label)) ?: return
+        val left = (cx - half).roundToInt()
+        val top = (cy - half).roundToInt()
+        drawable.setBounds(left, top, left + sizePx, top + sizePx)
+        drawable.draw(canvas)
+    }
+
+    /**
+     * Draws a small classification icon at the top-right corner of the opponent's destination
+     * square, so the user can see how good or bad the opponent's last move was.
+     */
+    private fun drawOpponentBadge(canvas: Canvas, board: RectF, square: Float) {
+        val sq = opBadgeSquare ?: return
+        val label = opBadgeLabel ?: return
+        val center = squareCenter(sq, board, opBadgeFlipped) ?: return
+        val sizePx = (18f * density).roundToInt()
+        if (sizePx <= 0) return
+        val half = sizePx / 2f
+        val offset = square * 0.45f
+        val cx = (center.x + offset).coerceIn(half, max(half, width - half))
+        val cy = (center.y - offset).coerceIn(half, max(half, height - half))
+
+        val drawable = getCachedDrawable(MoveColors.drawableResForLabel(label)) ?: return
         val left = (cx - half).roundToInt()
         val top = (cy - half).roundToInt()
         drawable.setBounds(left, top, left + sizePx, top + sizePx)
