@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Chess knight silhouette -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,20 C46,20 40,26 38,34 L36,34 C34,34 32,36 32,38 L32,42 C32,44 34,46 36,46 L38,46 C38,50 40,54 44,58 L40,66 C38,70 36,74 36,78 L36,86 L72,86 L72,78 C72,74 70,70 68,66 L64,58 C68,54 70,50 70,46 L72,46 C74,46 76,44 76,42 L76,38 C76,36 74,34 72,34 L70,34 C68,26 62,20 54,20 Z M48,32 C50,32 52,34 52,36 C52,38 50,40 48,40 C46,40 44,38 44,36 C44,34 46,32 48,32 Z" />
+</vector>

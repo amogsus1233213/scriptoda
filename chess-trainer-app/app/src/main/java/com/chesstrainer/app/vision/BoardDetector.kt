@@ -145,9 +145,39 @@ object BoardLocator {
 
         if (cw < 4f || ch < 4f) return null
         if (abs(cw - ch) / max(cw, ch) > MAX_ASPECT_ERROR) return null
-        if (gx < -cw / 2 || gy < -ch / 2) return null
-        if (gx + 8 * cw > w + cw / 2 || gy + 8 * ch > h + ch / 2) return null
-        return Grid(gx, gy, cw, ch)
+
+        // The 7 interior lines are ambiguous by one cell when an outer board edge is also a strong
+        // line. Resolve by picking the shift whose 64 squares form the cleanest checkerboard.
+        var best: Grid? = null
+        var bestScore = Float.NEGATIVE_INFINITY
+        for (sy in -1..1) for (sx in -1..1) {
+            val g = Grid(gx + sx * cw, gy + sy * ch, cw, ch)
+            if (!fitsInside(g, w, h)) continue
+            val sc = checkerboardScore(px, g)
+            if (sc > bestScore) {
+                bestScore = sc
+                best = g
+            }
+        }
+        return best
+    }
+
+    private fun fitsInside(g: Grid, w: Int, h: Int): Boolean =
+        g.x0 >= -g.cw / 2 && g.y0 >= -g.ch / 2 &&
+            g.x0 + 8 * g.cw <= w + g.cw / 2 && g.y0 + 8 * g.ch <= h + g.ch / 2
+
+    /** Contrast between the two square parities minus the spread within each parity. */
+    private fun checkerboardScore(px: Pixels, g: Grid): Float {
+        val even = ArrayList<Float>(32)
+        val odd = ArrayList<Float>(32)
+        for (r in 0 until 8) for (c in 0 until 8) {
+            val v = CellReader.background(px, g, r, c)
+            if ((r + c) % 2 == 0) even.add(v) else odd.add(v)
+        }
+        val me = CellReader.median(even)
+        val mo = CellReader.median(odd)
+        val spread = (even.sumOf { abs(it - me).toDouble() } + odd.sumOf { abs(it - mo).toDouble() }) / 64.0
+        return abs(me - mo) - spread.toFloat()
     }
 
     /** Index i = number of strong luma jumps between rows i-1 and i, for x in [xFrom, xTo). */
@@ -296,7 +326,7 @@ object CellReader {
     }
 
     /** Median of the four corner-patch means; robust to a coordinate label in one corner. */
-    private fun background(px: Pixels, grid: Grid, r: Int, c: Int): Float {
+    internal fun background(px: Pixels, grid: Grid, r: Int, c: Int): Float {
         val left = grid.x0 + c * grid.cw
         val top = grid.y0 + r * grid.ch
         val right = left + grid.cw
@@ -350,7 +380,7 @@ object CellReader {
         return out
     }
 
-    private fun median(values: List<Float>): Float {
+    internal fun median(values: List<Float>): Float {
         if (values.isEmpty()) return 0f
         val sorted = values.sorted()
         val n = sorted.size

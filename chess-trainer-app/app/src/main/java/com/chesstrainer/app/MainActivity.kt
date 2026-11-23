@@ -31,8 +31,8 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         /** Intent extras / actions understood by [ScreenCaptureService]. */
-        const val EXTRA_RESULT_CODE = "extra_result_code"
-        const val EXTRA_RESULT_DATA = "extra_result_data"
+        const val EXTRA_RESULT_CODE = "com.chesstrainer.app.extra.RESULT_CODE"
+        const val EXTRA_RESULT_DATA = "com.chesstrainer.app.extra.DATA"
         const val ACTION_CALIBRATE = "com.chesstrainer.app.action.CALIBRATE"
 
         private const val CALIBRATE_DELAY_MS = 5_000L
@@ -249,7 +249,7 @@ class MainActivity : AppCompatActivity() {
     private fun startServices(resultCode: Int, data: Intent) {
         val captureIntent = Intent(this, ScreenCaptureService::class.java).apply {
             putExtra(EXTRA_RESULT_CODE, resultCode)
-            putExtra(EXTRA_RESULT_DATA, data)
+            putExtra(ScreenCaptureService.EXTRA_DATA, data)
         }
         ContextCompat.startForegroundService(this, captureIntent)
         ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java))
