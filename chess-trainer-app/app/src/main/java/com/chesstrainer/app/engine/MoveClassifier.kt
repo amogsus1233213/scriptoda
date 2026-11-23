@@ -27,29 +27,39 @@ data class ClassifiedMove(
 /**
  * Classifies a played move by comparing the engine evaluation before and after it.
  *
- * All evaluations are converted to the mover's point of view. Mate scores are clamped
- * to +/-[EVAL_CAP] when computing centipawn loss, so "mate in 3" vs "+15" still counts
- * as a large loss while "mate in 3" vs "mate in 5" counts as almost none.
+ * All evaluations are converted to the mover's point of view. Evaluations are clamped to
+ * +/-[EVAL_CAP] when computing centipawn loss, so "mate in 3" vs "mate in 5" counts as no
+ * loss, while giving up a forced mate always counts as a large one, even when the mover
+ * stays far ahead.
  */
 object MoveClassifier {
 
-    private const val EVAL_CAP = 1_000
+    /** Above any realistic non-mate evaluation, so only mate scores saturate. */
+    private const val EVAL_CAP = 5_000
+    private const val MATE_THRESHOLD = StockfishEngine.MATE_SCORE - 1_000
 
     private const val EXCELLENT_MAX = 10      // CPL < 10
     private const val GOOD_MAX = 50           // 10 <= CPL < 50
     private const val INACCURACY_MAX = 100    // 50 <= CPL < 100
     private const val MISTAKE_MAX = 200       // 100 <= CPL <= 200, above is a blunder
 
-    /** A brilliant move must leave the mover at least this well off. */
-    private const val BRILLIANT_MIN_EVAL = -50
-    /** For an "only move", every alternative must be at least this bad for the mover. */
-    private const val ONLY_MOVE_ALTERNATIVE_MAX = -200
+    /** A brilliant or "only" move must leave the mover at least this well off. */
+    private const val HOLDING_MIN_EVAL = -50
+    /** A sacrifice in an already crushing position is not brilliant. */
+    private const val BRILLIANT_MAX_EVAL_BEFORE = 500
     /** Minimum net material (pawn units) put en prise to count as a sacrifice. */
     private const val SACRIFICE_MIN_MATERIAL = 2
 
+    /** For an "only move", every alternative must be at least this bad for the mover. */
+    private const val ONLY_MOVE_ALTERNATIVE_MAX = -200
+
     /** Eval swing (mover's POV, vs. before the opponent's last move) that makes a move "great". */
     private const val GREAT_MIN_SWING = 150
+    /** Punishing an error only counts as great if the mover is not still clearly losing. */
+    private const val GREAT_MIN_EVAL = -200
 
+    /** A miss requires an advantage that was there to be exploited. */
+    private const val MISS_MIN_EVAL_BEFORE = 150
     /** Below this eval after the move, a large loss is a blunder rather than a miss. */
     private const val MISS_LOSING_EVAL = -200
 
@@ -93,13 +103,11 @@ object MoveClassifier {
 
         val classification = when {
             isBookMove -> MoveClass.BOOK
-            isBest -> if (isBrilliant(engine, fen, played, board, evalAfter, depth)) {
-                MoveClass.BRILLIANT
-            } else {
-                MoveClass.BEST
-            }
+            isBest && isBrilliant(played, board, evalBefore, evalAfter) -> MoveClass.BRILLIANT
             isGreat(cpLoss, evalAfter, evalBeforeOpponentMove) -> MoveClass.GREAT
-            isMiss(cpLoss, evalAfter, board, best) -> MoveClass.MISS
+            isBest && isOnlyMove(engine, fen, played, depth) -> MoveClass.GREAT
+            isBest -> MoveClass.BEST
+            isMiss(cpLoss, evalBefore, evalAfter, board, best) -> MoveClass.MISS
             else -> byCpLoss(cpLoss)
         }
 
@@ -121,38 +129,41 @@ object MoveClassifier {
         else -> MoveClass.BLUNDER
     }
 
-    private fun isBrilliant(
-        engine: StockfishEngine,
-        fen: String,
-        move: String,
-        board: Board?,
-        evalAfter: Int,
-        depth: Int
-    ): Boolean {
-        if (clamp(evalAfter) < BRILLIANT_MIN_EVAL) return false
-        if (board?.isSacrifice(move, SACRIFICE_MIN_MATERIAL) == true) return true
+    private fun isBrilliant(move: String, board: Board?, evalBefore: Int, evalAfter: Int): Boolean {
+        if (evalAfter < HOLDING_MIN_EVAL) return false
+        if (evalBefore >= BRILLIANT_MAX_EVAL_BEFORE) return false
+        return board?.isSacrifice(move, SACRIFICE_MIN_MATERIAL) == true
+    }
 
-        // "Only move": every alternative loses while the best move holds.
+    /** True if [move] holds the position while every alternative loses. */
+    private fun isOnlyMove(engine: StockfishEngine, fen: String, move: String, depth: Int): Boolean {
         val lines = engine.analyzeMultiPv(fen, depth, 2) ?: return false
-        if (lines.size < 2) return false // forced move (single legal reply) is not brilliant
-        val bestLine = lines[0]
-        val secondLine = lines[1]
-        if (bestLine.bestMove.lowercase() != move) return false
-        return clamp(bestLine.eval) >= BRILLIANT_MIN_EVAL &&
-            clamp(secondLine.eval) <= ONLY_MOVE_ALTERNATIVE_MAX
+        if (lines.size < 2) return false // a forced move (single legal reply) is no achievement
+        val (bestLine, secondLine) = lines
+        if (bestLine.bestMove.trim().lowercase() != move) return false
+        return bestLine.eval >= HOLDING_MIN_EVAL && secondLine.eval <= ONLY_MOVE_ALTERNATIVE_MAX
     }
 
     private fun isGreat(cpLoss: Int, evalAfter: Int, evalBeforeOpponentMove: Int?): Boolean {
         if (evalBeforeOpponentMove == null) return false
         if (cpLoss >= EXCELLENT_MAX) return false
+        if (evalAfter < GREAT_MIN_EVAL) return false
         return clamp(evalAfter) - clamp(evalBeforeOpponentMove) >= GREAT_MIN_SWING
     }
 
-    private fun isMiss(cpLoss: Int, evalAfter: Int, board: Board?, bestMove: String): Boolean {
-        if (cpLoss <= INACCURACY_MAX) return false
-        if (board == null || bestMove.isEmpty()) return false
+    private fun isMiss(
+        cpLoss: Int,
+        evalBefore: Int,
+        evalAfter: Int,
+        board: Board?,
+        bestMove: String
+    ): Boolean {
+        if (cpLoss < INACCURACY_MAX) return false
+        if (evalBefore < MISS_MIN_EVAL_BEFORE) return false
         // A move that throws the game away is a blunder, not merely a missed chance.
-        if (cpLoss > MISTAKE_MAX && clamp(evalAfter) < MISS_LOSING_EVAL) return false
+        if (cpLoss > MISTAKE_MAX && evalAfter < MISS_LOSING_EVAL) return false
+        if (evalBefore >= MATE_THRESHOLD && evalAfter < MATE_THRESHOLD) return true
+        if (board == null || bestMove.isEmpty()) return false
         return board.isCapture(bestMove) || board.givesCheck(bestMove)
     }
 
