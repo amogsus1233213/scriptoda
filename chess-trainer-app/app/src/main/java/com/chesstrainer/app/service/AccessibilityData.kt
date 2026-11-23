@@ -14,7 +14,16 @@ object AccessibilityData {
      */
     @Volatile var userPlaysWhite: Boolean? = null
 
-    fun update(positions: Map<String, Char>?) {
+    /**
+     * On-screen orientation of the board [detectedPositions] was read from (true = white at the
+     * bottom), derived from the piece nodes' bounds; null if the view tree could not tell. The
+     * square names in [detectedPositions] are absolute, so this does not affect the FEN, only how
+     * the overlay must map squares to the screen.
+     */
+    @Volatile var detectedWhiteAtBottom: Boolean? = null
+
+    fun update(positions: Map<String, Char>?, whiteAtBottom: Boolean? = null) {
+        detectedWhiteAtBottom = whiteAtBottom
         detectedPositions = positions
         lastUpdateTime = System.currentTimeMillis()
     }
@@ -26,6 +35,7 @@ object AccessibilityData {
 
     fun clear() {
         detectedPositions = null
+        detectedWhiteAtBottom = null
         lastViewDump = ""
         lastUpdateTime = 0L
         targetPackageVisible = false
