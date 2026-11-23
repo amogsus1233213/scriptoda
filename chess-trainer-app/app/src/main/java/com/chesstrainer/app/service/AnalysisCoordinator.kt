@@ -1,0 +1,1051 @@
+package com.chesstrainer.app.service
+
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.RectF
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.AtomicFile
+import android.util.Log
+import com.chesstrainer.app.engine.AnalysisResult
+import com.chesstrainer.app.engine.ClassifiedMove
+import com.chesstrainer.app.engine.MoveClassifier
+import com.chesstrainer.app.engine.StockfishEngine
+import com.chesstrainer.app.ui.MoveColors
+import com.chesstrainer.app.ui.OverlayService
+import com.chesstrainer.app.vision.BoardLocator
+import com.chesstrainer.app.vision.CellReader
+import com.chesstrainer.app.vision.ChessScreenReader
+import com.chesstrainer.app.vision.Classifier
+import com.chesstrainer.app.vision.Fen
+import com.chesstrainer.app.vision.Grid
+import com.chesstrainer.app.vision.Orientation
+import com.chesstrainer.app.vision.Pixels
+import com.chesstrainer.app.vision.Templates
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.max
+
+/**
+ * Glue between screen capture, board recognition, the chess engine and the overlay.
+ *
+ * Pipeline per captured frame:
+ *  1. [ScreenCaptureService] delivers a (reused) bitmap on its capture thread; it is copied and
+ *     handed to a single worker thread. Frames that arrive while the worker is busy are dropped.
+ *  2. The board is located and its squares classified against the calibrated [Templates].
+ *  3. The piece placement must be read identically on [STABLE_FRAMES] consecutive frames before it
+ *     is accepted (filters out piece animations and drags).
+ *  4. A new placement is diffed against the previous one to recover the move that was played,
+ *     which also tells whose turn it is now. The move is classified with [MoveClassifier] and
+ *     the new position is analysed by Stockfish.
+ *  5. On the user's turn the overlay shows the engine's best move, the classification of the
+ *     opponent's last move and the evaluation. On the opponent's turn it shows feedback on the
+ *     move the user just played (arrow of that move + its classification).
+ *
+ * All recognition and engine work runs on one worker thread; all game state below is confined to
+ * that thread. Overlay calls are posted to the main thread.
+ */
+class AnalysisCoordinator(
+    context: Context,
+    private val depth: Int = DEFAULT_DEPTH,
+) {
+
+    companion object {
+        private const val TAG = "AnalysisCoordinator"
+
+        const val DEFAULT_DEPTH = 12
+
+        /** Name of the engine binary in the assets folder. */
+        const val STOCKFISH_ASSET = "stockfish"
+
+        /**
+         * Optional alternative packaging: the binary shipped as `jniLibs/<abi>/libstockfish.so`.
+         * Android 10+ refuses to execute files from app-writable storage for targetSdk >= 29, so
+         * the native library directory is preferred whenever the binary is found there.
+         */
+        private const val STOCKFISH_NATIVE_LIB = "libstockfish.so"
+
+        private const val PREFS_NAME = "chess_trainer_coordinator"
+        private const val KEY_BINARY_STAMP = "stockfish_binary_stamp"
+        private const val TEMPLATES_FILE = "board_templates.txt"
+
+        /** Consecutive identical reads required before a placement is trusted. */
+        private const val STABLE_FRAMES = 2
+
+        /** Consecutive contrary reads required before the board orientation is switched. */
+        private const val ORIENTATION_SWITCH_FRAMES = 3
+
+        /** Frames without a visible board after which the overlay suggestion is cleared. */
+        private const val MISSED_FRAMES_BEFORE_CLEAR = 6
+
+        /** Minimum change (screen fraction) before new board bounds are pushed to the overlay. */
+        private const val BOUNDS_EPSILON = 0.004f
+
+        private const val WORKER_KEEP_ALIVE_SECONDS = 30L
+
+        private const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
+        private const val EMPTY = '.'
+
+        private val binaryLock = Any()
+
+        /**
+         * Returns an executable Stockfish binary, copying `assets/stockfish` into the app's
+         * internal files directory on first run (and again after every app update).
+         *
+         * @return the binary, or null if it is neither packaged as a native library nor present
+         *   in the assets.
+         */
+        fun prepareStockfishBinary(context: Context): File? = synchronized(binaryLock) {
+            val appContext = context.applicationContext
+
+            val nativeDir = appContext.applicationInfo.nativeLibraryDir
+            if (nativeDir != null) {
+                val native = File(nativeDir, STOCKFISH_NATIVE_LIB)
+                if (native.isFile) return native
+            }
+
+            val target = File(appContext.filesDir, STOCKFISH_ASSET)
+            val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val stamp = installStamp(appContext)
+            if (target.isFile && target.length() > 0 && prefs.getLong(KEY_BINARY_STAMP, -1L) == stamp) {
+                if (!target.canExecute()) target.setExecutable(true, true)
+                return target
+            }
+
+            val tmp = File(appContext.filesDir, "$STOCKFISH_ASSET.tmp")
+            try {
+                appContext.assets.open(STOCKFISH_ASSET).use { input ->
+                    FileOutputStream(tmp).use { output ->
+                        input.copyTo(output)
+                        output.fd.sync()
+                    }
+                }
+                if (target.exists() && !target.delete()) {
+                    Log.w(TAG, "Could not delete stale engine binary")
+                }
+                if (!tmp.renameTo(target)) {
+                    tmp.copyTo(target, overwrite = true)
+                    tmp.delete()
+                }
+                if (!target.setExecutable(true, true)) {
+                    Log.w(TAG, "Could not mark engine binary executable")
+                }
+                prefs.edit().putLong(KEY_BINARY_STAMP, stamp).apply()
+                return target
+            } catch (e: IOException) {
+                Log.e(TAG, "Stockfish binary missing from assets/$STOCKFISH_ASSET", e)
+                tmp.delete()
+                return if (target.isFile && target.length() > 0) target else null
+            }
+        }
+
+        private fun installStamp(context: Context): Long = try {
+            val pm = context.packageManager
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(context.packageName, 0)
+            }
+            info.lastUpdateTime
+        } catch (e: PackageManager.NameNotFoundException) {
+            0L
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Public callbacks
+    // -------------------------------------------------------------------------------------
+
+    /** Human-readable status updates (engine state, calibration, board found ...). Main thread. */
+    @Volatile
+    var statusListener: ((String) -> Unit)? = null
+
+    /** Called on the main thread after each calibration attempt with its outcome. */
+    @Volatile
+    var calibrationListener: ((Boolean) -> Unit)? = null
+
+    // -------------------------------------------------------------------------------------
+    // Threading
+    // -------------------------------------------------------------------------------------
+
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Single worker thread; it exits after a period of inactivity and is recreated on demand. */
+    private val worker = ThreadPoolExecutor(
+        1, 1, WORKER_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS, LinkedBlockingQueue<Runnable>(),
+    ) { r -> Thread(r, "analysis-coordinator").apply { isDaemon = true } }.apply {
+        allowCoreThreadTimeOut(true)
+    }
+
+    private val running = AtomicBoolean(false)
+    private val processing = AtomicBoolean(false)
+    private val calibrationRequested = AtomicBoolean(false)
+
+    private val frameListener = ScreenCaptureService.Companion.FrameListener { bitmap -> onFrame(bitmap) }
+
+    @Volatile
+    private var engine: StockfishEngine? = null
+
+    @Volatile
+    private var templates: Templates? = null
+
+    // -------------------------------------------------------------------------------------
+    // Worker-thread state
+    // -------------------------------------------------------------------------------------
+
+    private var templatesLoaded = false
+
+    /** Locked board orientation; null until the first board was read. */
+    private var whiteAtBottom: Boolean? = null
+    private var orientationVotes = 0
+
+    private var candidatePlacement: String? = null
+    private var candidateCount = 0
+    private var stablePlacement: String? = null
+    private var missedFrames = 0
+    private var boardVisible = false
+
+    /** Position before [currentFen] and its analysis (mover = side to move in [previousFen]). */
+    private var previousFen: String? = null
+    private var previousAnalysis: AnalysisResult? = null
+    private var currentFen: String? = null
+    private var currentAnalysis: AnalysisResult? = null
+
+    private var lastMove: InferredMove? = null
+    private var lastClassified: ClassifiedMove? = null
+    private var castlingRights = "KQkq"
+    private var fullMoveNumber = 1
+
+    private var portraitBounds: RectF? = null
+    private var landscapeBounds: RectF? = null
+
+    /** Overlay instance that last received the board bounds. Main thread only. */
+    private var boundsDeliveredTo: OverlayService? = null
+
+    // -------------------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------------------
+
+    /** Prepares the engine, loads saved templates and starts consuming screen frames. */
+    fun start() {
+        if (!running.compareAndSet(false, true)) return
+        submit {
+            resetGameState()
+            ensureTemplatesLoaded()
+            initEngine()
+        }
+        ScreenCaptureService.listener = frameListener
+    }
+
+    /** Stops consuming frames, shuts the engine down and clears the overlay. */
+    fun stop() {
+        if (!running.compareAndSet(true, false)) return
+        if (ScreenCaptureService.listener === frameListener) {
+            ScreenCaptureService.listener = null
+        }
+        calibrationRequested.set(false)
+        // Interrupt a running search so the teardown below is not stuck behind it.
+        engine?.stop()
+        submit {
+            engine?.quit()
+            engine = null
+            resetGameState()
+        }
+        mainHandler.post {
+            OverlayService.instance?.clearSuggestion()
+            boundsDeliveredTo = null
+        }
+    }
+
+    fun isRunning(): Boolean = running.get()
+
+    /** True once calibration templates are available (calibrated now or loaded from disk). */
+    fun isCalibrated(): Boolean = templates != null || File(appContext.filesDir, TEMPLATES_FILE).isFile
+
+    // -------------------------------------------------------------------------------------
+    // Calibration
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * Builds recognition templates from a screenshot of the starting position with white at the
+     * bottom and persists them. Runs asynchronously; the outcome is reported to
+     * [calibrationListener]. The bitmap is copied, so the caller may reuse it immediately.
+     */
+    fun calibrate(bitmap: Bitmap) {
+        val copy = copyBitmap(bitmap)
+        if (copy == null) {
+            notifyCalibration(false, "Calibration failed: out of memory")
+            return
+        }
+        if (!submit { try { calibrateOnWorker(copy) } finally { copy.recycle() } }) {
+            copy.recycle()
+            notifyCalibration(false, "Calibration failed: coordinator unavailable")
+        }
+    }
+
+    /** Calibrates from the next captured frame (requires [start] to have been called). */
+    fun requestCalibration() {
+        calibrationRequested.set(true)
+        postStatus("Calibrating from the next frame…")
+    }
+
+    /** Deletes the stored templates; recognition is paused until calibrated again. */
+    fun clearCalibration() {
+        submit {
+            templates = null
+            templatesLoaded = true
+            AtomicFile(File(appContext.filesDir, TEMPLATES_FILE)).delete()
+            resetGameState()
+            postOverlayClear()
+        }
+    }
+
+    private fun calibrateOnWorker(bitmap: Bitmap) {
+        val result = try {
+            ChessScreenReader.calibrate(bitmap)
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "Calibration crashed", e)
+            null
+        }
+        if (result == null) {
+            notifyCalibration(false, "Calibration failed: show the starting position with white at the bottom")
+            return
+        }
+        templates = result
+        templatesLoaded = true
+        saveTemplates(result)
+        resetGameState()
+        // Calibration requires white at the bottom and the initial position on screen.
+        whiteAtBottom = true
+        notifyCalibration(true, "Calibration saved")
+    }
+
+    private fun ensureTemplatesLoaded() {
+        if (templatesLoaded) return
+        templatesLoaded = true
+        if (templates != null) return
+        val file = AtomicFile(File(appContext.filesDir, TEMPLATES_FILE))
+        templates = try {
+            Templates.deserialize(file.readFully().toString(Charsets.UTF_8))
+        } catch (e: IOException) {
+            null
+        }
+        postStatus(if (templates != null) "Calibration loaded" else "Not calibrated: press Calibrate")
+    }
+
+    private fun saveTemplates(t: Templates) {
+        val file = AtomicFile(File(appContext.filesDir, TEMPLATES_FILE))
+        var out: FileOutputStream? = null
+        try {
+            out = file.startWrite()
+            out.write(t.serialize().toByteArray(Charsets.UTF_8))
+            file.finishWrite(out)
+        } catch (e: IOException) {
+            Log.e(TAG, "Could not save templates", e)
+            if (out != null) file.failWrite(out)
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Engine
+    // -------------------------------------------------------------------------------------
+
+    private fun initEngine() {
+        if (engine != null) return
+        val binary = prepareStockfishBinary(appContext)
+        if (binary == null) {
+            postStatus("Stockfish binary not found")
+            return
+        }
+        val e = StockfishEngine(binary.absolutePath)
+        engine = e
+        postStatus(if (e.start()) "Engine ready" else "Engine failed to start")
+    }
+
+    private fun analyze(fen: String): AnalysisResult? {
+        val e = engine ?: return null
+        if (!running.get()) return null
+        return try {
+            e.analyze(fen, depth)
+        } catch (ex: RuntimeException) {
+            Log.e(TAG, "Analysis failed for $fen", ex)
+            null
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Frame intake (capture thread)
+    // -------------------------------------------------------------------------------------
+
+    private fun onFrame(bitmap: Bitmap) {
+        if (!running.get()) return
+
+        if (calibrationRequested.getAndSet(false)) {
+            calibrate(bitmap)
+            return
+        }
+
+        if (!processing.compareAndSet(false, true)) return
+        val copy = copyBitmap(bitmap)
+        if (copy == null) {
+            processing.set(false)
+            return
+        }
+        val accepted = submit {
+            try {
+                processFrame(copy)
+            } finally {
+                copy.recycle()
+                processing.set(false)
+            }
+        }
+        if (!accepted) {
+            copy.recycle()
+            processing.set(false)
+        }
+    }
+
+    private fun copyBitmap(bitmap: Bitmap): Bitmap? = try {
+        if (bitmap.isRecycled) null else bitmap.copy(Bitmap.Config.ARGB_8888, false)
+    } catch (e: OutOfMemoryError) {
+        Log.w(TAG, "Out of memory copying frame")
+        null
+    }
+
+    /** Runs [task] on the worker thread, logging failures. Returns false if it was rejected. */
+    private fun submit(task: () -> Unit): Boolean = try {
+        worker.execute {
+            try {
+                task()
+            } catch (t: Exception) {
+                Log.e(TAG, "Worker task failed", t)
+            }
+        }
+        true
+    } catch (e: RejectedExecutionException) {
+        false
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Frame processing (worker thread)
+    // -------------------------------------------------------------------------------------
+
+    private fun processFrame(bitmap: Bitmap) {
+        if (!running.get()) return
+        ensureTemplatesLoaded()
+        val tpl = templates ?: return
+
+        val px = Pixels(bitmap)
+        val grid = BoardLocator.locate(px)
+        if (grid == null) {
+            onBoardMissing()
+            return
+        }
+
+        val letters = Classifier.classify(CellReader.read(px, grid), tpl)
+        if (!isPlausible(letters)) return
+
+        missedFrames = 0
+        if (!boardVisible) {
+            boardVisible = true
+            postStatus("Board detected")
+        }
+        updateBoardBounds(grid, px, bitmap)
+
+        val bottomIsWhite = resolveOrientation(letters)
+        val placement = Fen.build(letters, bottomIsWhite).substringBefore(' ')
+
+        if (placement == candidatePlacement) {
+            candidateCount++
+        } else {
+            candidatePlacement = placement
+            candidateCount = 1
+        }
+        if (candidateCount < STABLE_FRAMES || placement == stablePlacement) return
+
+        stablePlacement = placement
+        onPositionChanged(placement)
+    }
+
+    private fun onBoardMissing() {
+        candidatePlacement = null
+        candidateCount = 0
+        missedFrames++
+        if (boardVisible && missedFrames >= MISSED_FRAMES_BEFORE_CLEAR) {
+            boardVisible = false
+            postOverlayClear()
+            postStatus("Board not visible")
+        }
+    }
+
+    /** Rejects reads that cannot be a legal chess position. */
+    private fun isPlausible(letters: Array<CharArray>): Boolean {
+        var whiteKings = 0
+        var blackKings = 0
+        var whitePawns = 0
+        var blackPawns = 0
+        var whitePieces = 0
+        var blackPieces = 0
+        for (r in 0 until 8) for (c in 0 until 8) {
+            val ch = letters[r][c]
+            if (ch == EMPTY) continue
+            if (ch.isUpperCase()) whitePieces++ else blackPieces++
+            when (ch) {
+                'K' -> whiteKings++
+                'k' -> blackKings++
+                'P' -> whitePawns++
+                'p' -> blackPawns++
+            }
+            // The top and bottom screen rows are the first and last ranks in either orientation.
+            if ((ch == 'P' || ch == 'p') && (r == 0 || r == 7)) return false
+        }
+        return whiteKings == 1 && blackKings == 1 &&
+            whitePawns <= 8 && blackPawns <= 8 &&
+            whitePieces <= 16 && blackPieces <= 16
+    }
+
+    /**
+     * Returns the board orientation with hysteresis: with few pieces left the heuristic can be
+     * ambiguous, so a flip is only accepted after several consistent reads (or immediately when
+     * the starting position is shown).
+     */
+    private fun resolveOrientation(letters: Array<CharArray>): Boolean {
+        val detected = Orientation.whiteAtBottom(letters)
+        val locked = whiteAtBottom
+        if (locked == null || Fen.build(letters, detected).substringBefore(' ') == START_PLACEMENT) {
+            whiteAtBottom = detected
+            orientationVotes = 0
+            return detected
+        }
+        if (detected == locked) {
+            orientationVotes = 0
+            return locked
+        }
+        orientationVotes++
+        if (orientationVotes >= ORIENTATION_SWITCH_FRAMES) {
+            whiteAtBottom = detected
+            orientationVotes = 0
+            return detected
+        }
+        return locked
+    }
+
+    private fun updateBoardBounds(grid: Grid, px: Pixels, bitmap: Bitmap) {
+        val bw = bitmap.width.toFloat()
+        val bh = bitmap.height.toFloat()
+        val s = px.scale
+        if (bw <= 0f || bh <= 0f || s <= 0f) return
+        val rect = RectF(
+            (grid.x0 / s / bw).coerceIn(0f, 1f),
+            (grid.y0 / s / bh).coerceIn(0f, 1f),
+            ((grid.x0 + 8f * grid.cw) / s / bw).coerceIn(0f, 1f),
+            ((grid.y0 + 8f * grid.ch) / s / bh).coerceIn(0f, 1f),
+        )
+        if (rect.width() <= 0f || rect.height() <= 0f) return
+
+        val landscape = bitmap.width > bitmap.height
+        val old = if (landscape) landscapeBounds else portraitBounds
+        if (old != null && closeTo(old, rect)) return
+        if (landscape) landscapeBounds = rect else portraitBounds = rect
+        postBoardBounds(force = true)
+    }
+
+    private fun closeTo(a: RectF, b: RectF): Boolean =
+        abs(a.left - b.left) < BOUNDS_EPSILON && abs(a.top - b.top) < BOUNDS_EPSILON &&
+            abs(a.right - b.right) < BOUNDS_EPSILON && abs(a.bottom - b.bottom) < BOUNDS_EPSILON
+
+    // -------------------------------------------------------------------------------------
+    // Move tracking (worker thread)
+    // -------------------------------------------------------------------------------------
+
+    private fun onPositionChanged(placement: String) {
+        val userIsWhite = whiteAtBottom ?: true
+        val prevFen = currentFen
+        val after = parsePlacement(placement) ?: return
+
+        val move = if (prevFen != null && placement != START_PLACEMENT) {
+            val before = parsePlacement(prevFen.substringBefore(' '))
+            if (before != null) MoveInference.infer(before, after, epSquareOf(prevFen)) else null
+        } else {
+            null
+        }
+
+        if (move == null) {
+            resyncTo(placement, after, if (placement == START_PLACEMENT) true else userIsWhite)
+            return
+        }
+
+        // The side that actually moved is authoritative; fix the previous FEN if we guessed wrong.
+        var beforeFen: String = prevFen ?: return
+        var beforeAnalysis = currentAnalysis
+        var olderAnalysis = previousAnalysis
+        if (sideToMoveIsWhite(beforeFen) != move.white) {
+            beforeFen = withSideToMove(beforeFen, move.white)
+            beforeAnalysis = null
+            olderAnalysis = null
+        }
+        if (move.enPassant && epSquareOf(beforeFen) != move.to) {
+            beforeFen = withEnPassant(beforeFen, move.to)
+            beforeAnalysis = null
+        }
+        if (beforeAnalysis == null) beforeAnalysis = analyze(beforeFen)
+        if (!running.get()) return
+
+        val e = engine
+        val classified = if (e != null && beforeAnalysis != null) {
+            try {
+                MoveClassifier.classify(
+                    engine = e,
+                    fen = beforeFen,
+                    playedMove = move.uci,
+                    analysisBefore = beforeAnalysis,
+                    depth = depth,
+                    isBookMove = false,
+                    // Eval before the opponent's previous move, from the current mover's POV.
+                    evalBeforeOpponentMove = olderAnalysis?.let { -it.eval },
+                )
+            } catch (ex: IllegalStateException) {
+                Log.w(TAG, "Could not classify ${move.uci}", ex)
+                null
+            }
+        } else {
+            null
+        }
+        if (!running.get()) return
+
+        castlingRights = updatedCastlingRights(castlingRights, move, after)
+        if (!move.white) fullMoveNumber++
+        val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
+        val newAnalysis = analyze(newFen)
+        if (!running.get()) return
+
+        previousFen = beforeFen
+        previousAnalysis = beforeAnalysis
+        currentFen = newFen
+        currentAnalysis = newAnalysis
+        lastMove = move
+        lastClassified = classified
+        render()
+    }
+
+    /** Starts tracking from [placement] without a known previous move. */
+    private fun resyncTo(placement: String, board: CharArray, whiteToMove: Boolean) {
+        castlingRights = castlingFromPlacement(board)
+        fullMoveNumber = 1
+        val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
+        val analysis = analyze(fen)
+        if (!running.get()) return
+        previousFen = null
+        previousAnalysis = null
+        currentFen = fen
+        currentAnalysis = analysis
+        lastMove = null
+        lastClassified = null
+        render()
+    }
+
+    private fun resetGameState() {
+        whiteAtBottom = null
+        orientationVotes = 0
+        candidatePlacement = null
+        candidateCount = 0
+        stablePlacement = null
+        missedFrames = 0
+        boardVisible = false
+        previousFen = null
+        previousAnalysis = null
+        currentFen = null
+        currentAnalysis = null
+        lastMove = null
+        lastClassified = null
+        castlingRights = "KQkq"
+        fullMoveNumber = 1
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Overlay output
+    // -------------------------------------------------------------------------------------
+
+    private fun render() {
+        val fen = currentFen ?: return
+        val analysis = currentAnalysis
+        val whiteToMove = sideToMoveIsWhite(fen)
+        val userIsWhite = whiteAtBottom ?: true
+        val flipped = !userIsWhite
+
+        // Engine scores are side-to-move relative; the overlay expects white's point of view.
+        var evalCp: Int? = null
+        var mateIn: Int? = null
+        if (analysis != null && analysis.mate != 0) {
+            val sign = if (whiteToMove) 1 else -1
+            evalCp = analysis.eval.coerceIn(-StockfishEngine.MATE_SCORE, StockfishEngine.MATE_SCORE) * sign
+            mateIn = analysis.mate?.let { it * sign }
+        }
+
+        val best = analysis?.bestMove.orEmpty()
+        val usersTurn = whiteToMove == userIsWhite
+        val classified = lastClassified
+        val played = lastMove
+
+        if (usersTurn && best.length >= 4) {
+            val label: String
+            val color: Int
+            if (classified != null) {
+                // Badge: how good the opponent's last move was.
+                label = classified.classification.displayName
+                color = MoveColors.forLabel(label)
+            } else {
+                label = "Your move"
+                color = MoveColors.BEST
+            }
+            postSuggestion(best.substring(0, 2), best.substring(2, 4), evalCp, mateIn, label, color, flipped)
+        } else if (classified != null && played != null) {
+            // Opponent to move (or game over): feedback on the move just played.
+            val label = classified.classification.displayName
+            postSuggestion(
+                squareName(played.from), squareName(played.to),
+                evalCp, mateIn, label, MoveColors.forLabel(label), flipped,
+            )
+        } else {
+            postOverlayClear()
+        }
+    }
+
+    private fun postSuggestion(
+        from: String,
+        to: String,
+        evalCp: Int?,
+        mateIn: Int?,
+        label: String,
+        color: Int,
+        flipped: Boolean,
+    ) {
+        if (!running.get()) return
+        postBoardBounds(force = false)
+        mainHandler.post {
+            if (running.get()) {
+                OverlayService.instance?.showSuggestion(from, to, evalCp, mateIn, label, color, flipped)
+            }
+        }
+    }
+
+    private fun postOverlayClear() {
+        mainHandler.post { OverlayService.instance?.clearSuggestion() }
+    }
+
+    /**
+     * Sends the known board bounds to the overlay. Unknown orientations get an empty rect, which
+     * makes the overlay hide the arrow instead of drawing it in the wrong place. Without [force]
+     * the bounds are only re-sent when the overlay service instance changed.
+     */
+    private fun postBoardBounds(force: Boolean) {
+        val portrait = portraitBounds?.let { RectF(it) } ?: RectF()
+        val landscape = landscapeBounds?.let { RectF(it) } ?: RectF()
+        if (portrait.isEmpty() && landscape.isEmpty()) return
+        mainHandler.post {
+            val overlay = OverlayService.instance ?: return@post
+            if (force || overlay !== boundsDeliveredTo) {
+                overlay.setBoardBounds(portrait, landscape)
+                boundsDeliveredTo = overlay
+            }
+        }
+    }
+
+    private fun postStatus(message: String) {
+        Log.i(TAG, message)
+        mainHandler.post { statusListener?.invoke(message) }
+    }
+
+    private fun notifyCalibration(success: Boolean, message: String) {
+        postStatus(message)
+        mainHandler.post { calibrationListener?.invoke(success) }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // FEN helpers
+    // -------------------------------------------------------------------------------------
+
+    /** Parses a FEN placement field into 64 squares indexed `rank * 8 + file` (a1 = 0). */
+    private fun parsePlacement(placement: String): CharArray? {
+        val rows = placement.split('/')
+        if (rows.size != 8) return null
+        val squares = CharArray(64) { EMPTY }
+        for ((rowIndex, row) in rows.withIndex()) {
+            val rank = 7 - rowIndex
+            var file = 0
+            for (c in row) {
+                if (c.isDigit()) {
+                    file += c - '0'
+                } else {
+                    if (file > 7) return null
+                    squares[rank * 8 + file] = c
+                    file++
+                }
+            }
+            if (file != 8) return null
+        }
+        return squares
+    }
+
+    private fun composeFen(
+        placement: String,
+        whiteToMove: Boolean,
+        castling: String,
+        epSquare: Int?,
+        fullMove: Int,
+    ): String {
+        val side = if (whiteToMove) "w" else "b"
+        val ep = epSquare?.let { squareName(it) } ?: "-"
+        return "$placement $side ${castling.ifEmpty { "-" }} $ep 0 ${max(1, fullMove)}"
+    }
+
+    private fun fenFields(fen: String): MutableList<String> {
+        val fields = fen.trim().split(Regex("\\s+")).toMutableList()
+        while (fields.size < 6) {
+            fields.add(
+                when (fields.size) {
+                    1 -> "w"
+                    2, 3 -> "-"
+                    4 -> "0"
+                    else -> "1"
+                },
+            )
+        }
+        return fields
+    }
+
+    private fun sideToMoveIsWhite(fen: String): Boolean = fenFields(fen)[1] != "b"
+
+    private fun withSideToMove(fen: String, white: Boolean): String {
+        val f = fenFields(fen)
+        f[1] = if (white) "w" else "b"
+        f[3] = "-" // an en passant square only makes sense for the side we assumed before
+        return f.joinToString(" ")
+    }
+
+    private fun withEnPassant(fen: String, square: Int): String {
+        val f = fenFields(fen)
+        f[3] = squareName(square)
+        return f.joinToString(" ")
+    }
+
+    private fun epSquareOf(fen: String): Int = squareIndex(fenFields(fen)[3]) ?: -1
+
+    private fun castlingFromPlacement(b: CharArray): String = buildString {
+        if (b[4] == 'K') {
+            if (b[7] == 'R') append('K')
+            if (b[0] == 'R') append('Q')
+        }
+        if (b[60] == 'k') {
+            if (b[63] == 'r') append('k')
+            if (b[56] == 'r') append('q')
+        }
+    }
+
+    /** Drops rights whose king or rook left (or was captured on) its home square. */
+    private fun updatedCastlingRights(rights: String, move: InferredMove, after: CharArray): String {
+        val possible = castlingFromPlacement(after)
+        val touched = setOf(move.from, move.to)
+        return buildString {
+            for (r in rights) {
+                val lost = when (r) {
+                    'K' -> 4 in touched || 7 in touched
+                    'Q' -> 4 in touched || 0 in touched
+                    'k' -> 60 in touched || 63 in touched
+                    'q' -> 60 in touched || 56 in touched
+                    else -> true
+                }
+                if (!lost && r in possible) append(r)
+            }
+        }
+    }
+
+    /** En passant target after a double pawn push, if an enemy pawn could actually capture. */
+    private fun enPassantTarget(move: InferredMove, after: CharArray): Int? {
+        val pawn = if (move.white) 'P' else 'p'
+        if (after[move.to] != pawn || abs(move.to - move.from) != 16) return null
+        val enemy = if (move.white) 'p' else 'P'
+        val file = move.to % 8
+        val adjacent = (file > 0 && after[move.to - 1] == enemy) || (file < 7 && after[move.to + 1] == enemy)
+        return if (adjacent) (move.from + move.to) / 2 else null
+    }
+
+    private fun squareName(index: Int): String = "${'a' + index % 8}${'1' + index / 8}"
+
+    private fun squareIndex(name: String): Int? {
+        if (name.length != 2) return null
+        val file = name[0] - 'a'
+        val rank = name[1] - '1'
+        if (file !in 0..7 || rank !in 0..7) return null
+        return rank * 8 + file
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Move inference
+    // -------------------------------------------------------------------------------------
+
+    private data class InferredMove(
+        val from: Int,
+        val to: Int,
+        val promotion: Char?,
+        val white: Boolean,
+        val enPassant: Boolean,
+    ) {
+        val uci: String
+            get() = buildString {
+                append('a' + from % 8).append('1' + from / 8)
+                append('a' + to % 8).append('1' + to / 8)
+                if (promotion != null) append(promotion.lowercaseChar())
+            }
+    }
+
+    /**
+     * Recovers the single move that turns one placement into another, or null if the difference
+     * is not explained by exactly one pseudo-legal move (missed moves, misreads, new game ...).
+     */
+    private object MoveInference {
+
+        fun infer(before: CharArray, after: CharArray, epSquare: Int): InferredMove? {
+            val changed = (0 until 64).filter { before[it] != after[it] }
+            if (changed.isEmpty() || changed.size > 4) return null
+
+            // Only the mover's pieces can appear on a square; the victim's can only disappear.
+            val whiteArrivals = changed.filter { after[it] != EMPTY && after[it].isUpperCase() }
+            val blackArrivals = changed.filter { after[it] != EMPTY && after[it].isLowerCase() }
+            val white = when {
+                whiteArrivals.isNotEmpty() && blackArrivals.isEmpty() -> true
+                blackArrivals.isNotEmpty() && whiteArrivals.isEmpty() -> false
+                else -> return null
+            }
+            val arrivals = if (white) whiteArrivals else blackArrivals
+            val vacated = changed.filter { isOwn(before[it], white) && after[it] == EMPTY }
+
+            if (arrivals.size == 2 && vacated.size == 2 && changed.size == 4) {
+                return castling(before, after, white, vacated, arrivals)
+            }
+            if (arrivals.size != 1 || vacated.size != 1) return null
+
+            val from = vacated[0]
+            val to = arrivals[0]
+            val piece = before[from]
+            val landed = after[to]
+            val target = before[to]
+            if (isOwn(target, white)) return null
+            if (target.lowercaseChar() == 'k') return null
+
+            val isPawn = piece.lowercaseChar() == 'p'
+            val lastRank = if (white) 7 else 0
+            var promotion: Char? = null
+            if (landed != piece) {
+                if (!isPawn || to / 8 != lastRank || landed.lowercaseChar() !in "nbrq") return null
+                promotion = landed
+            } else if (isPawn && to / 8 == lastRank) {
+                return null
+            }
+
+            // Any further change must be the pawn removed by an en passant capture.
+            val others = changed.filter { it != from && it != to }
+            var enPassant = false
+            if (others.isNotEmpty()) {
+                val victim = (from / 8) * 8 + to % 8
+                val enemyPawn = if (white) 'p' else 'P'
+                if (others.size != 1 || others[0] != victim || !isPawn || target != EMPTY ||
+                    before[victim] != enemyPawn || after[victim] != EMPTY ||
+                    abs(from % 8 - to % 8) != 1
+                ) {
+                    return null
+                }
+                enPassant = true
+            }
+
+            if (enPassant && epSquare >= 0 && to != epSquare) return null
+            if (!isPseudoLegal(before, from, to, piece, white, enPassant)) return null
+            return InferredMove(from, to, promotion, white, enPassant)
+        }
+
+        private fun castling(
+            before: CharArray,
+            after: CharArray,
+            white: Boolean,
+            vacated: List<Int>,
+            arrivals: List<Int>,
+        ): InferredMove? {
+            val king = if (white) 'K' else 'k'
+            val rook = if (white) 'R' else 'r'
+            val base = if (white) 0 else 56
+            val kingFrom = vacated.firstOrNull { before[it] == king } ?: return null
+            val kingTo = arrivals.firstOrNull { after[it] == king } ?: return null
+            val rookFrom = vacated.firstOrNull { before[it] == rook } ?: return null
+            val rookTo = arrivals.firstOrNull { after[it] == rook } ?: return null
+            if (kingFrom != base + 4) return null
+            val ok = (kingTo == base + 6 && rookFrom == base + 7 && rookTo == base + 5) ||
+                (kingTo == base + 2 && rookFrom == base && rookTo == base + 3)
+            if (!ok) return null
+            // Squares the rook passes must have been empty (b-file included for long castling).
+            val path = if (kingTo == base + 6) listOf(base + 5, base + 6) else listOf(base + 1, base + 2, base + 3)
+            if (path.any { before[it] != EMPTY }) return null
+            return InferredMove(kingFrom, kingTo, null, white, false)
+        }
+
+        private fun isOwn(c: Char, white: Boolean): Boolean = c != EMPTY && c.isUpperCase() == white
+
+        private fun isPseudoLegal(
+            board: CharArray,
+            from: Int,
+            to: Int,
+            piece: Char,
+            white: Boolean,
+            enPassantAllowed: Boolean,
+        ): Boolean {
+            val df = to % 8 - from % 8
+            val dr = to / 8 - from / 8
+            val adf = abs(df)
+            val adr = abs(dr)
+            val target = board[to]
+            return when (piece.lowercaseChar()) {
+                'p' -> {
+                    val dir = if (white) 1 else -1
+                    val startRank = if (white) 1 else 6
+                    when {
+                        df == 0 && dr == dir -> target == EMPTY
+                        df == 0 && dr == 2 * dir -> from / 8 == startRank && target == EMPTY &&
+                            board[from + 8 * dir] == EMPTY
+                        adf == 1 && dr == dir -> (target != EMPTY && !isOwn(target, white)) ||
+                            (target == EMPTY && enPassantAllowed)
+                        else -> false
+                    }
+                }
+                'n' -> (adf == 1 && adr == 2) || (adf == 2 && adr == 1)
+                'b' -> adf == adr && adf > 0 && pathClear(board, from, to)
+                'r' -> (adf == 0) != (adr == 0) && pathClear(board, from, to)
+                'q' -> ((adf == adr && adf > 0) || ((adf == 0) != (adr == 0))) && pathClear(board, from, to)
+                'k' -> max(adf, adr) == 1
+                else -> false
+            }
+        }
+
+        private fun pathClear(board: CharArray, from: Int, to: Int): Boolean {
+            val stepF = Integer.signum(to % 8 - from % 8)
+            val stepR = Integer.signum(to / 8 - from / 8)
+            var f = from % 8 + stepF
+            var r = from / 8 + stepR
+            while (r * 8 + f != to) {
+                if (board[r * 8 + f] != EMPTY) return false
+                f += stepF
+                r += stepR
+            }
+            return true
+        }
+    }
+}
