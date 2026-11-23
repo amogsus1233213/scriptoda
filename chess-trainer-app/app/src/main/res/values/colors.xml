@@ -27,5 +27,5 @@
     <color name="white">#FFFFFFFF</color>
 
     <!-- Launcher -->
-    <color name="launcher_bg">#1B1B1B</color>
+    <color name="launcher_bg">#EEEED2</color>
 </resources>
