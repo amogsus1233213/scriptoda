@@ -15,6 +15,7 @@ import com.chesstrainer.app.engine.MoveClassifier
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.ui.MoveColors
 import com.chesstrainer.app.ui.OverlayService
+import com.chesstrainer.app.ui.SuggestedLine
 import com.chesstrainer.app.vision.BoardLocator
 import com.chesstrainer.app.vision.Calibrator
 import com.chesstrainer.app.vision.Cell
@@ -69,6 +70,9 @@ class AnalysisCoordinator(
         private const val TAG = "AnalysisCoordinator"
 
         const val DEFAULT_DEPTH = 12
+
+        /** Number of engine lines (Multi-PV) shown as suggestions. */
+        private const val NUM_LINES = 3
 
         /** Name of the engine binary in the assets folder. */
         const val STOCKFISH_ASSET = "stockfish"
@@ -243,7 +247,8 @@ class AnalysisCoordinator(
     private var previousFen: String? = null
     private var previousAnalysis: AnalysisResult? = null
     private var currentFen: String? = null
-    private var currentAnalysis: AnalysisResult? = null
+    /** Multi-PV analysis of [currentFen], best line first. */
+    private var currentAnalyses: List<AnalysisResult>? = null
 
     private var lastMove: InferredMove? = null
     private var lastClassified: ClassifiedMove? = null
@@ -414,6 +419,18 @@ class AnalysisCoordinator(
             e.analyze(fen, depth)
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Analysis failed for $fen", ex)
+            null
+        }
+    }
+
+    /** Analyses [fen] with [NUM_LINES] principal variations, ordered best first. */
+    private fun analyzeMulti(fen: String): List<AnalysisResult>? {
+        val e = engine ?: return null
+        if (!running.get()) return null
+        return try {
+            e.analyzeMultiPv(fen, depth, NUM_LINES)
+        } catch (ex: RuntimeException) {
+            Log.e(TAG, "Multi-PV analysis failed for $fen", ex)
             null
         }
     }
@@ -723,7 +740,8 @@ class AnalysisCoordinator(
 
         // The side that actually moved is authoritative; fix the previous FEN if we guessed wrong.
         var beforeFen: String = prevFen ?: return
-        var beforeAnalysis = currentAnalysis
+        // Only the best line of the previous position is needed for classification.
+        var beforeAnalysis: AnalysisResult? = currentAnalyses?.firstOrNull()
         var olderAnalysis = previousAnalysis
         if (sideToMoveIsWhite(beforeFen) != move.white) {
             beforeFen = withSideToMove(beforeFen, move.white)
@@ -762,13 +780,13 @@ class AnalysisCoordinator(
         castlingRights = updatedCastlingRights(castlingRights, move, after)
         if (!move.white) fullMoveNumber++
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
-        val newAnalysis = analyze(newFen)
+        val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
 
         previousFen = beforeFen
         previousAnalysis = beforeAnalysis
         currentFen = newFen
-        currentAnalysis = newAnalysis
+        currentAnalyses = newAnalyses
         lastMove = move
         lastClassified = classified
         render()
@@ -779,12 +797,12 @@ class AnalysisCoordinator(
         castlingRights = castlingFromPlacement(board)
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
-        val analysis = analyze(fen)
+        val analyses = analyzeMulti(fen)
         if (!running.get()) return
         previousFen = null
         previousAnalysis = null
         currentFen = fen
-        currentAnalysis = analysis
+        currentAnalyses = analyses
         lastMove = null
         lastClassified = null
         render()
@@ -803,7 +821,7 @@ class AnalysisCoordinator(
         previousFen = null
         previousAnalysis = null
         currentFen = null
-        currentAnalysis = null
+        currentAnalyses = null
         lastMove = null
         lastClassified = null
         castlingRights = "KQkq"
@@ -814,65 +832,88 @@ class AnalysisCoordinator(
     // Overlay output
     // -------------------------------------------------------------------------------------
 
+    /**
+     * Shows up to [NUM_LINES] engine moves for the side to move. The best line carries the
+     * classification of the last played move when one is available; the other lines are labelled
+     * by how much worse they are than the best line.
+     */
     private fun render() {
         val fen = currentFen ?: return
-        val analysis = currentAnalysis
+        val analyses = currentAnalyses
         val whiteToMove = sideToMoveIsWhite(fen)
         val userIsWhite = whiteAtBottom ?: true
         val flipped = !userIsWhite
-
-        // Engine scores are side-to-move relative; the overlay expects white's point of view.
-        var evalCp: Int? = null
-        var mateIn: Int? = null
-        if (analysis != null) {
-            val sign = if (whiteToMove) 1 else -1
-            evalCp = analysis.eval.coerceIn(-StockfishEngine.MATE_SCORE, StockfishEngine.MATE_SCORE) * sign
-            mateIn = analysis.mate?.let { it * sign }
-        }
-
-        val best = analysis?.bestMove.orEmpty()
         val usersTurn = whiteToMove == userIsWhite
         val classified = lastClassified
 
-        // Always show the engine's best move for the side to move; the badge carries
-        // the classification of the last played move when one is available.
-        if (best.length >= 4) {
+        if (analyses.isNullOrEmpty()) {
+            postOverlayClear()
+            return
+        }
+
+        // Engine scores are side-to-move relative; the overlay expects white's point of view.
+        val sign = if (whiteToMove) 1 else -1
+        val bestEval = analyses[0].eval
+
+        val suggestions = analyses.take(NUM_LINES).mapIndexedNotNull { index, result ->
+            val move = result.bestMove
+            if (move.length < 4) return@mapIndexedNotNull null
+            val rank = index + 1
+            val evalCp = result.eval.coerceIn(-StockfishEngine.MATE_SCORE, StockfishEngine.MATE_SCORE) * sign
+            val mateIn = result.mate?.let { it * sign }
+
             val label: String
             val color: Int
             when {
-                classified != null -> {
+                rank == 1 && classified != null -> {
                     label = classified.classification.displayName
                     color = MoveColors.forLabel(label)
                 }
-                usersTurn -> {
-                    label = "Best move"
+                rank == 1 -> {
+                    label = if (usersTurn) "Best move" else "Best reply"
                     color = MoveColors.BEST
                 }
                 else -> {
-                    label = "Best reply"
-                    color = MoveColors.BEST
+                    // How much worse than the best line, from the side to move's POV.
+                    val cpDiff = bestEval - result.eval
+                    label = when {
+                        cpDiff < 10 -> "Excellent"
+                        cpDiff < 50 -> "Good"
+                        cpDiff < 100 -> "Inaccuracy"
+                        cpDiff < 200 -> "Mistake"
+                        else -> "Blunder"
+                    }
+                    color = MoveColors.forLabel(label)
                 }
             }
-            postSuggestion(best.substring(0, 2), best.substring(2, 4), evalCp, mateIn, label, color, flipped)
-        } else {
-            postOverlayClear()
+            SuggestedLineData(move.substring(0, 2), move.substring(2, 4), evalCp, mateIn, label, color, rank)
         }
+
+        if (suggestions.isEmpty()) {
+            postOverlayClear()
+            return
+        }
+        postMultiSuggestion(suggestions, flipped)
     }
 
-    private fun postSuggestion(
-        from: String,
-        to: String,
-        evalCp: Int?,
-        mateIn: Int?,
-        label: String,
-        color: Int,
-        flipped: Boolean,
-    ) {
+    private fun postMultiSuggestion(suggestions: List<SuggestedLineData>, flipped: Boolean) {
         if (!running.get()) return
         postBoardBounds(force = false)
         mainHandler.post {
             if (running.get()) {
-                OverlayService.instance?.showSuggestion(from, to, evalCp, mateIn, label, color, flipped)
+                val overlay = OverlayService.instance ?: return@post
+                val lines = suggestions.map { s ->
+                    SuggestedLine(
+                        from = s.from,
+                        to = s.to,
+                        evalCp = s.evalCp,
+                        mateIn = s.mateIn,
+                        label = s.label,
+                        labelColor = s.labelColor,
+                        rank = s.rank,
+                    )
+                }
+                overlay.showMultiSuggestion(lines, flipped)
             }
         }
     }
@@ -1031,6 +1072,17 @@ class AnalysisCoordinator(
     // -------------------------------------------------------------------------------------
     // Move inference
     // -------------------------------------------------------------------------------------
+
+    /** One engine line to draw on the overlay (eval in white's POV, rank 1 = best). */
+    private data class SuggestedLineData(
+        val from: String,
+        val to: String,
+        val evalCp: Int?,
+        val mateIn: Int?,
+        val label: String,
+        val labelColor: Int,
+        val rank: Int,
+    )
 
     private data class InferredMove(
         val from: Int,

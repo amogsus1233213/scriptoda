@@ -38,6 +38,7 @@ import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -72,7 +73,33 @@ object MoveColors {
         "blunder" -> BLUNDER
         else -> NEUTRAL
     }
+
+    /** Maps a classification label (case-insensitive) to its short symbol (matches MoveClass). */
+    fun symbolForLabel(label: String): String = when (label.trim().lowercase(Locale.ROOT)) {
+        "brilliant" -> "!!"
+        "great" -> "!"
+        "best" -> "★"
+        "excellent" -> "●"
+        "good" -> "○"
+        "book" -> "📖"
+        "inaccuracy" -> "?!"
+        "mistake" -> "?"
+        "miss" -> "△"
+        "blunder" -> "??"
+        else -> "·"
+    }
 }
+
+/** A single engine-suggested line shown on the overlay. */
+data class SuggestedLine(
+    val from: String,
+    val to: String,
+    val evalCp: Int?,
+    val mateIn: Int?,
+    val label: String,       // "Best", "Good", "Inaccuracy", etc.
+    val labelColor: Int,
+    val rank: Int,           // 1 = best move, 2 = second best, 3 = third best
+)
 
 private fun Context.dp(value: Float): Float =
     TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, resources.displayMetrics)
@@ -99,15 +126,7 @@ class OverlayService : Service() {
         fun canDrawOverlays(context: Context): Boolean = Settings.canDrawOverlays(context)
     }
 
-    private data class Suggestion(
-        val from: String,
-        val to: String,
-        val evalCp: Int?,
-        val mateIn: Int?,
-        val label: String,
-        val labelColor: Int,
-        val isFlipped: Boolean,
-    )
+    private val maxSuggestedLines = 3
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -121,14 +140,13 @@ class OverlayService : Service() {
     private lateinit var pillView: TextView
     private lateinit var expandedView: LinearLayout
     private lateinit var contentLayout: LinearLayout
-    private lateinit var badgeView: TextView
-    private lateinit var moveText: TextView
-    private lateinit var evalText: TextView
+    private lateinit var linesContainer: LinearLayout
     private lateinit var evalBar: EvalBarView
 
     private var expanded = false
     private var lastScreen = Point()
-    private var currentSuggestion: Suggestion? = null
+    private var currentLines: List<SuggestedLine> = emptyList()
+    private var currentFlipped = false
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
 
@@ -187,6 +205,7 @@ class OverlayService : Service() {
     // Public API (thread-safe: all calls are marshalled onto the main thread)
     // ---------------------------------------------------------------------------------------
 
+    /** Single-move API kept for backwards compatibility; wraps into a one-line multi suggestion. */
     fun showSuggestion(
         from: String,
         to: String,
@@ -196,17 +215,28 @@ class OverlayService : Service() {
         labelColor: Int,
         isFlipped: Boolean,
     ) {
-        val suggestion = Suggestion(from, to, evalCp, mateIn, label, labelColor, isFlipped)
+        showMultiSuggestion(
+            listOf(SuggestedLine(from, to, evalCp, mateIn, label, labelColor, rank = 1)),
+            isFlipped,
+        )
+    }
+
+    /** Shows up to three suggested lines (ordered by [SuggestedLine.rank]) as arrows + panel rows. */
+    fun showMultiSuggestion(lines: List<SuggestedLine>, isFlipped: Boolean) {
+        val snapshot = lines.sortedBy { it.rank }.take(maxSuggestedLines)
         mainHandler.post {
-            currentSuggestion = suggestion
-            renderSuggestion()
+            val wasEmpty = currentLines.isEmpty()
+            currentLines = snapshot
+            currentFlipped = isFlipped
+            renderMultiSuggestion(autoExpand = wasEmpty)
         }
     }
 
+    /** Clears all arrows and resets the panel to its waiting state. */
     fun clearSuggestion() {
         mainHandler.post {
-            currentSuggestion = null
-            renderSuggestion()
+            currentLines = emptyList()
+            renderMultiSuggestion(autoExpand = false)
         }
     }
 
@@ -284,7 +314,7 @@ class OverlayService : Service() {
         }
 
         applyOrientationLayout()
-        renderSuggestion()
+        renderMultiSuggestion(autoExpand = false)
         windowManager.addView(root, panelParams)
         panelRoot = root
     }
@@ -347,39 +377,15 @@ class OverlayService : Service() {
 
         contentLayout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
 
-        val info = LinearLayout(ctx).apply {
+        linesContainer = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            minimumWidth = ctx.dpInt(130f)
+            minimumWidth = ctx.dpInt(170f)
         }
-
-        badgeView = TextView(ctx).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = Typeface.DEFAULT_BOLD
-            val h = ctx.dpInt(8f)
-            val v = ctx.dpInt(3f)
-            setPadding(h, v, h, v)
-            background = roundedBackground(MoveColors.NEUTRAL, 6f)
+        val info = ScrollView(ctx).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(linesContainer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
-        info.addView(badgeView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        moveText = TextView(ctx).apply {
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            typeface = Typeface.DEFAULT_BOLD
-        }
-        info.addView(moveText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = ctx.dpInt(6f)
-        })
-
-        evalText = TextView(ctx).apply {
-            setTextColor(Color.parseColor("#D0D0D0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            typeface = Typeface.MONOSPACE
-        }
-        info.addView(evalText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = ctx.dpInt(2f)
-        })
 
         evalBar = EvalBarView(ctx)
 
@@ -426,24 +432,111 @@ class OverlayService : Service() {
         panelRoot?.post { clampAndUpdate() }
     }
 
-    private fun renderSuggestion() {
-        val s = currentSuggestion
-        if (s == null) {
-            badgeView.text = "Waiting"
-            (badgeView.background as GradientDrawable).setColor(MoveColors.NEUTRAL)
-            moveText.text = "—"
-            evalText.text = ""
+    /**
+     * Renders [currentLines] into the panel list, eval bar and arrow layer. Main thread only.
+     * @param autoExpand expand the panel if collapsed (used when the first suggestion arrives).
+     */
+    private fun renderMultiSuggestion(autoExpand: Boolean) {
+        val lines = currentLines
+        linesContainer.removeAllViews()
+        if (lines.isEmpty()) {
+            linesContainer.addView(buildLineRow(MoveColors.NEUTRAL, "·", "Waiting", "—", isBest = true), rowParams())
             evalBar.setEvaluation(0, null, false)
-            arrowView?.clearArrow()
+            arrowView?.clearArrows()
+            panelRoot?.post { clampAndUpdate() }
             return
         }
-        if (!expanded) setExpanded(true)
-        badgeView.text = s.label
-        (badgeView.background as GradientDrawable).setColor(s.labelColor)
-        moveText.text = "${s.from} → ${s.to}"
-        evalText.text = formatEval(s.evalCp, s.mateIn)
-        evalBar.setEvaluation(s.evalCp ?: 0, s.mateIn, s.isFlipped)
-        arrowView?.setArrow(s.from, s.to, s.labelColor, s.isFlipped)
+        if (autoExpand && !expanded) setExpanded(true)
+
+        lines.forEachIndexed { index, line ->
+            linesContainer.addView(
+                buildLineRow(
+                    color = line.labelColor,
+                    symbol = MoveColors.symbolForLabel(line.label),
+                    move = "${line.from} → ${line.to}",
+                    eval = formatEval(line.evalCp, line.mateIn),
+                    isBest = index == 0,
+                ),
+                rowParams(),
+            )
+        }
+
+        val best = lines.first()
+        evalBar.setEvaluation(best.evalCp ?: 0, best.mateIn, currentFlipped)
+        arrowView?.setArrows(
+            lines.map {
+                ArrowData(it.from, it.to, it.labelColor, it.rank, it.label, currentFlipped)
+            },
+        )
+        // Row count may have changed the panel size; keep it on screen.
+        panelRoot?.post { clampAndUpdate() }
+    }
+
+    private fun rowParams() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+    )
+
+    /** One panel row: colored dot, classification symbol, move text, eval. */
+    private fun buildLineRow(
+        color: Int,
+        symbol: String,
+        move: String,
+        eval: String,
+        isBest: Boolean,
+    ): LinearLayout {
+        val ctx = uiContext
+        val row = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val v = ctx.dpInt(if (isBest) 4f else 3f)
+            setPadding(0, v, 0, v)
+        }
+
+        val dotSize = ctx.dpInt(10f)
+        val dot = View(ctx).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(color)
+            }
+        }
+        row.addView(dot, LinearLayout.LayoutParams(dotSize, dotSize).apply {
+            marginEnd = ctx.dpInt(6f)
+        })
+
+        val symbolView = TextView(ctx).apply {
+            text = symbol
+            setTextColor(color)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBest) 15f else 13f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            minWidth = ctx.dpInt(20f)
+        }
+        row.addView(symbolView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            marginEnd = ctx.dpInt(6f)
+        })
+
+        val moveView = TextView(ctx).apply {
+            text = move
+            setTextColor(if (isBest) Color.WHITE else Color.parseColor("#D8D8D8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBest) 17f else 14f)
+            typeface = if (isBest) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            maxLines = 1
+        }
+        row.addView(moveView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val evalView = TextView(ctx).apply {
+            text = eval
+            setTextColor(Color.parseColor(if (isBest) "#E8E8E8" else "#B0B0B0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBest) 14f else 12f)
+            typeface = if (isBest) Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) else Typeface.MONOSPACE
+            gravity = Gravity.END
+            maxLines = 1
+        }
+        row.addView(evalView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            marginStart = ctx.dpInt(10f)
+        })
+        return row
     }
 
     private fun formatEval(evalCp: Int?, mateIn: Int?): String = when {
@@ -695,33 +788,71 @@ class EvalBarView(context: Context) : View(context) {
     }
 }
 
+/** One arrow to draw on the board. [rank] 1 = best move (drawn most prominently). */
+data class ArrowData(
+    val from: String,
+    val to: String,
+    val color: Int,
+    val rank: Int,
+    val label: String,
+    val isFlipped: Boolean,
+)
+
 /**
- * Full-screen, non-interactive layer that draws a move arrow on top of the detected board.
- * Board bounds are expressed as ratios of the full (real) screen size.
+ * Full-screen, non-interactive layer that draws up to three move arrows on top of the detected
+ * board, each with a classification badge near its tip. Board bounds are expressed as ratios of
+ * the full (real) screen size.
  */
 class ArrowView(
     context: Context,
     private val screenSizeProvider: () -> Point,
 ) : View(context) {
 
+    /** Visual parameters per rank; sizes are fractions of the square size, badge in dp. */
+    private data class ArrowStyle(
+        val alpha: Int,
+        val shaftFactor: Float,
+        val headLengthFactor: Float,
+        val headHalfWidthFactor: Float,
+        val badgeDp: Float,
+    )
+
+    private companion object {
+        const val MAX_ARROWS = 3
+        val STYLE_RANK_1 = ArrowStyle(220, 0.20f, 0.50f, 0.32f, 20f)
+        val STYLE_RANK_2 = ArrowStyle(140, 0.14f, 0.42f, 0.25f, 16f)
+        val STYLE_RANK_3 = ArrowStyle(90, 0.10f, 0.36f, 0.20f, 14f)
+
+        fun styleFor(rank: Int): ArrowStyle = when {
+            rank <= 1 -> STYLE_RANK_1
+            rank == 2 -> STYLE_RANK_2
+            else -> STYLE_RANK_3
+        }
+    }
+
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
 
-    private var from: String? = null
-    private var to: String? = null
-    private var flipped = false
+    private var arrows: List<ArrowData> = emptyList()
 
     private val shaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
     }
     private val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val badgeRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.argb(230, 255, 255, 255)
+    }
+    private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
     private val headPath = Path()
     private val location = IntArray(2)
-
-    init {
-        setColor(MoveColors.BEST)
-    }
+    private val density = context.resources.displayMetrics.density
 
     fun setBoardBounds(portrait: RectF, landscape: RectF) {
         portraitBounds = RectF(portrait)
@@ -729,24 +860,18 @@ class ArrowView(
         invalidate()
     }
 
-    fun setArrow(from: String, to: String, color: Int, isFlipped: Boolean) {
-        this.from = from.lowercase(Locale.ROOT)
-        this.to = to.lowercase(Locale.ROOT)
-        flipped = isFlipped
-        setColor(color)
+    /** Replaces all arrows. Only the three best-ranked arrows are drawn. */
+    fun setArrows(arrows: List<ArrowData>) {
+        this.arrows = arrows
+            .map { it.copy(from = it.from.lowercase(Locale.ROOT), to = it.to.lowercase(Locale.ROOT)) }
+            .sortedBy { it.rank }
+            .take(MAX_ARROWS)
         invalidate()
     }
 
-    fun clearArrow() {
-        from = null
-        to = null
+    fun clearArrows() {
+        arrows = emptyList()
         invalidate()
-    }
-
-    private fun setColor(color: Int) {
-        val withAlpha = Color.argb(220, Color.red(color), Color.green(color), Color.blue(color))
-        shaftPaint.color = withAlpha
-        headPaint.color = withAlpha
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -756,27 +881,36 @@ class ArrowView(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val src = from ?: return
-        val dst = to ?: return
+        if (arrows.isEmpty()) return
         val board = boardRectInView() ?: return
-        val start = squareCenter(src, board) ?: return
-        val end = squareCenter(dst, board) ?: return
-
         val square = board.width() / 8f
+        // Worst rank first so the best arrow (and its badge) ends up on top.
+        val drawOrder = arrows.sortedByDescending { it.rank }
+        for (arrow in drawOrder) drawArrow(canvas, arrow, board, square)
+        for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
+    }
+
+    private fun drawArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
+        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
+        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
         val dx = end.x - start.x
         val dy = end.y - start.y
         val length = hypot(dx, dy)
         if (length < 1f) return
 
+        val style = styleFor(arrow.rank)
+        val color = withAlpha(arrow.color, style.alpha)
+        shaftPaint.color = color
+        headPaint.color = color
+
         val angle = atan2(dy, dx)
-        val headLength = min(square * 0.5f, length * 0.6f)
-        val headHalfWidth = square * 0.32f
-        val shaftWidth = square * 0.2f
+        val headLength = min(square * style.headLengthFactor, length * 0.6f)
+        val headHalfWidth = square * style.headHalfWidthFactor
 
         val baseX = end.x - headLength * cos(angle)
         val baseY = end.y - headLength * sin(angle)
 
-        shaftPaint.strokeWidth = shaftWidth
+        shaftPaint.strokeWidth = square * style.shaftFactor
         canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
 
         val perpX = -sin(angle) * headHalfWidth
@@ -788,6 +922,30 @@ class ArrowView(
         headPath.close()
         canvas.drawPath(headPath, headPaint)
     }
+
+    /** Draws the classification badge above-right of the destination square center. */
+    private fun drawBadge(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
+        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val style = styleFor(arrow.rank)
+        val radius = style.badgeDp * density / 2f
+        val offset = square * 0.32f
+        val cx = (end.x + offset).coerceIn(radius, max(radius, width - radius))
+        val cy = (end.y - offset).coerceIn(radius, max(radius, height - radius))
+
+        badgePaint.color = withAlpha(arrow.color, 255)
+        canvas.drawCircle(cx, cy, radius, badgePaint)
+        badgeRingPaint.strokeWidth = max(1f, density * if (arrow.rank <= 1) 1.5f else 1f)
+        canvas.drawCircle(cx, cy, radius, badgeRingPaint)
+
+        val symbol = MoveColors.symbolForLabel(arrow.label)
+        badgeTextPaint.textSize = radius * 2f * if (symbol.length >= 2) 0.52f else 0.66f
+        val fm = badgeTextPaint.fontMetrics
+        val baseline = cy - (fm.ascent + fm.descent) / 2f
+        canvas.drawText(symbol, cx, baseline, badgeTextPaint)
+    }
+
+    private fun withAlpha(color: Int, alpha: Int): Int =
+        Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
 
     /** Converts the screen-ratio board bounds for the current orientation into view pixels. */
     private fun boardRectInView(): RectF? {
@@ -805,7 +963,7 @@ class ArrowView(
     }
 
     /** Returns the pixel center of an algebraic square (e.g. "e4"), honoring board flip. */
-    private fun squareCenter(square: String, board: RectF): PointF? {
+    private fun squareCenter(square: String, board: RectF, flipped: Boolean): PointF? {
         if (square.length < 2) return null
         val file = square[0] - 'a'
         val rank = square[1] - '1'
