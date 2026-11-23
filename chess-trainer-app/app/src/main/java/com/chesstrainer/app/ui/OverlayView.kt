@@ -38,16 +38,13 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.chesstrainer.app.R
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
@@ -117,7 +114,7 @@ data class SuggestedLine(
     val mateIn: Int?,
     val label: String,       // "Best", "Good", "Inaccuracy", etc.
     val labelColor: Int,
-    val rank: Int,           // 1 = best move, 2 = second best, 3 = third best
+    val rank: Int,           // 1 = best move, 2 = second best, ... 5 = fifth best
     val commentary: String = "", // short coach comment, only shown for the best line
 )
 
@@ -137,6 +134,8 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.chesstrainer.app.action.STOP_OVERLAY"
         private const val CHANNEL_ID = "chess_overlay"
         private const val NOTIFICATION_ID = 2002
+        private const val WAITING_TEXT = "Mittens is waiting for a move..."
+        private const val THINKING_TEXT = "Mittens is thinking..."
 
         /** Currently running service instance, or null if the overlay is not shown. */
         @Volatile
@@ -146,7 +145,7 @@ class OverlayService : Service() {
         fun canDrawOverlays(context: Context): Boolean = Settings.canDrawOverlays(context)
     }
 
-    private val maxSuggestedLines = 3
+    private val maxSuggestedLines = 5
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -159,11 +158,8 @@ class OverlayService : Service() {
 
     private lateinit var pillView: TextView
     private lateinit var expandedView: LinearLayout
-    private lateinit var contentLayout: LinearLayout
-    private lateinit var linesContainer: LinearLayout
-    private lateinit var evalBar: EvalBarView
 
-    /** Coach commentary bubble below the move rows; created lazily and reused. */
+    /** Mittens commentary bubble; the only content of the expanded panel. */
     private var commentaryView: TextView? = null
 
     private var expanded = false
@@ -244,7 +240,7 @@ class OverlayService : Service() {
         )
     }
 
-    /** Shows up to three suggested lines (ordered by [SuggestedLine.rank]) as arrows + panel rows. */
+    /** Shows up to five suggested lines (ordered by [SuggestedLine.rank]) as arrows + commentary. */
     fun showMultiSuggestion(lines: List<SuggestedLine>, isFlipped: Boolean) {
         val snapshot = lines.sortedBy { it.rank }.take(maxSuggestedLines)
         mainHandler.post {
@@ -336,7 +332,6 @@ class OverlayService : Service() {
             y = (lastScreen.y * 0.15f).roundToInt()
         }
 
-        applyOrientationLayout()
         renderMultiSuggestion(autoExpand = false)
         windowManager.addView(root, panelParams)
         panelRoot = root
@@ -376,69 +371,38 @@ class OverlayService : Service() {
         setOnTouchListener(DragTouchListener())
     }
 
+    /**
+     * Compact speech bubble: a small drag handle (tap to collapse) above the Mittens commentary.
+     * The whole bubble can be dragged.
+     */
     private fun buildPanel(): LinearLayout {
         val ctx = uiContext
         val panel = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBackground(Color.parseColor("#262421"), 14f)
             elevation = ctx.dp(8f)
-            val p = ctx.dpInt(12f)
-            setPadding(p, ctx.dpInt(8f), p, p)
+            val h = ctx.dpInt(10f)
+            setPadding(h, ctx.dpInt(4f), h, ctx.dpInt(10f))
         }
 
-        val header = TextView(ctx).apply {
-            text = "Coach ▾"
-            setTextColor(Color.parseColor("#BABABA"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        val handle = TextView(ctx).apply {
+            text = "Mittens ▾"
+            setTextColor(Color.parseColor("#8A8A8A"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             typeface = Typeface.DEFAULT_BOLD
-            val v = ctx.dpInt(4f)
-            setPadding(0, v, 0, v + ctx.dpInt(4f))
+            gravity = Gravity.CENTER
+            val v = ctx.dpInt(2f)
+            setPadding(0, v, 0, v + ctx.dpInt(2f))
+            contentDescription = "Collapse coach"
             setOnClickListener { setExpanded(false) }
             setOnTouchListener(DragTouchListener())
         }
-        panel.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        panel.addView(handle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        contentLayout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-
-        linesContainer = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            minimumWidth = ctx.dpInt(170f)
-        }
-        val info = ScrollView(ctx).apply {
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            addView(linesContainer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
-
-        evalBar = EvalBarView(ctx)
-
-        contentLayout.addView(info)
-        contentLayout.addView(evalBar)
-        panel.addView(contentLayout, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val commentary = buildCommentaryView()
+        commentaryView = commentary
+        panel.addView(commentary, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         return panel
-    }
-
-    /** Portrait: vertical stack with horizontal bar. Landscape: side by side with vertical bar. */
-    private fun applyOrientationLayout() {
-        val landscape = isLandscape()
-        val ctx = uiContext
-        val barThickness = ctx.dpInt(10f)
-        val gap = ctx.dpInt(10f)
-        if (landscape) {
-            contentLayout.orientation = LinearLayout.HORIZONTAL
-            evalBar.vertical = true
-            evalBar.layoutParams = LinearLayout.LayoutParams(barThickness, ctx.dpInt(84f)).apply {
-                marginStart = gap
-                gravity = Gravity.CENTER_VERTICAL
-            }
-        } else {
-            contentLayout.orientation = LinearLayout.VERTICAL
-            evalBar.vertical = false
-            evalBar.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, barThickness).apply {
-                topMargin = gap
-            }
-        }
-        contentLayout.requestLayout()
     }
 
     // ---------------------------------------------------------------------------------------
@@ -456,160 +420,55 @@ class OverlayService : Service() {
     }
 
     /**
-     * Renders [currentLines] into the panel list, eval bar and arrow layer. Main thread only.
+     * Renders [currentLines] into the commentary bubble and arrow layer. Main thread only.
      * @param autoExpand expand the panel if collapsed (used when the first suggestion arrives).
      */
     private fun renderMultiSuggestion(autoExpand: Boolean) {
         val lines = currentLines
-        linesContainer.removeAllViews()
+        val view = commentaryView ?: return
         if (lines.isEmpty()) {
-            linesContainer.addView(buildLineRow(MoveColors.NEUTRAL, null, "Waiting", "—", isBest = true), rowParams())
-            evalBar.setEvaluation(0, null, false)
+            view.text = WAITING_TEXT
             arrowView?.clearArrows()
             panelRoot?.post { clampAndUpdate() }
             return
         }
         if (autoExpand && !expanded) setExpanded(true)
 
-        lines.forEachIndexed { index, line ->
-            linesContainer.addView(
-                buildLineRow(
-                    color = line.labelColor,
-                    label = line.label,
-                    move = "${line.from} → ${line.to}",
-                    eval = formatEval(line.evalCp, line.mateIn),
-                    isBest = index == 0,
-                ),
-                rowParams(),
-            )
-        }
-
-        // Coach commentary for the best line, below the move rows (rows are rebuilt each render,
-        // so the reused bubble is simply re-appended at the end).
         val commentary = lines.first().commentary
+        // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis).
         if (commentary.isNotEmpty()) {
-            val view = commentaryView ?: buildCommentaryView().also { commentaryView = it }
             view.text = commentary
-            (view.parent as? ViewGroup)?.removeView(view)
-            linesContainer.addView(
-                view,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = uiContext.dpInt(6f) },
-            )
+        } else if (view.text.isNullOrEmpty() || view.text == WAITING_TEXT) {
+            view.text = THINKING_TEXT
         }
 
-        val best = lines.first()
-        evalBar.setEvaluation(best.evalCp ?: 0, best.mateIn, currentFlipped)
         arrowView?.setArrows(
             lines.map {
                 ArrowData(it.from, it.to, it.labelColor, it.rank, it.label, currentFlipped)
             },
         )
-        // Row count may have changed the panel size; keep it on screen.
+        // Text length may have changed the panel size; keep it on screen.
         panelRoot?.post { clampAndUpdate() }
     }
 
     private fun buildCommentaryView(): TextView {
         val ctx = uiContext
         return TextView(ctx).apply {
+            text = WAITING_TEXT
             setTextColor(Color.parseColor("#E8E8E8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = Typeface.defaultFromStyle(Typeface.ITALIC)
-            // Keep the panel compact: wrap instead of widening it, at most two lines.
+            // Keep the bubble compact: wrap instead of widening it.
             maxWidth = ctx.dpInt(220f)
-            maxLines = 2
+            maxLines = 3
             ellipsize = android.text.TextUtils.TruncateAt.END
             val h = ctx.dpInt(8f)
-            setPadding(h, ctx.dpInt(6f), h, ctx.dpInt(4f))
+            val v = ctx.dpInt(6f)
+            setPadding(h, v, h, v)
             background = roundedBackground(Color.parseColor("#33FFFFFF"), 8f)
+            // Dragging the bubble itself moves the panel too; taps do nothing.
+            setOnTouchListener(DragTouchListener())
         }
-    }
-
-    private fun rowParams() = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-    )
-
-    /**
-     * One panel row: classification icon, move text, eval.
-     * A null [label] (waiting state) shows a plain dot in [color] instead of an icon.
-     */
-    private fun buildLineRow(
-        color: Int,
-        label: String?,
-        move: String,
-        eval: String,
-        isBest: Boolean,
-    ): LinearLayout {
-        val ctx = uiContext
-        val row = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val v = ctx.dpInt(if (isBest) 4f else 3f)
-            setPadding(0, v, 0, v)
-        }
-
-        if (label != null) {
-            val iconSize = ctx.dpInt(if (isBest) 18f else 14f)
-            val iconView = ImageView(ctx).apply {
-                setImageResource(MoveColors.drawableResForLabel(label))
-                scaleType = ImageView.ScaleType.FIT_CENTER
-                contentDescription = label
-            }
-            row.addView(iconView, LinearLayout.LayoutParams(iconSize, iconSize).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                marginEnd = ctx.dpInt(6f)
-            })
-        } else {
-            val dotSize = ctx.dpInt(10f)
-            val dot = View(ctx).apply {
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(color)
-                }
-            }
-            row.addView(dot, LinearLayout.LayoutParams(dotSize, dotSize).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                marginEnd = ctx.dpInt(6f)
-            })
-        }
-
-        val moveView = TextView(ctx).apply {
-            text = move
-            setTextColor(if (isBest) Color.WHITE else Color.parseColor("#D8D8D8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBest) 17f else 14f)
-            typeface = if (isBest) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-            maxLines = 1
-        }
-        row.addView(moveView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        val evalView = TextView(ctx).apply {
-            text = eval
-            setTextColor(Color.parseColor(if (isBest) "#E8E8E8" else "#B0B0B0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBest) 14f else 12f)
-            typeface = if (isBest) Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) else Typeface.MONOSPACE
-            gravity = Gravity.END
-            maxLines = 1
-        }
-        row.addView(evalView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            marginStart = ctx.dpInt(10f)
-        })
-        return row
-    }
-
-    private fun formatEval(evalCp: Int?, mateIn: Int?): String = when {
-        mateIn != null && mateIn != 0 -> if (mateIn > 0) "M$mateIn" else "-M${abs(mateIn)}"
-        evalCp != null -> {
-            val pawns = evalCp / 100.0
-            when {
-                evalCp > 0 -> String.format(Locale.US, "+%.1f", pawns)
-                evalCp < 0 -> String.format(Locale.US, "%.1f", pawns)
-                else -> "0.0"
-            }
-        }
-        else -> ""
     }
 
     private fun handleScreenChange() {
@@ -625,7 +484,6 @@ class OverlayService : Service() {
             panelParams.y = (cy * newScreen.y - h / 2f).roundToInt()
         }
         lastScreen = newScreen
-        applyOrientationLayout()
         clampAndUpdate()
         root.post { clampAndUpdate() }
         arrowView?.invalidate()
@@ -646,11 +504,6 @@ class OverlayService : Service() {
         if (root.isAttachedToWindow) {
             windowManager.updateViewLayout(root, panelParams)
         }
-    }
-
-    private fun isLandscape(): Boolean {
-        val size = screenSize()
-        return size.x > size.y
     }
 
     private fun screenSize(): Point {
@@ -859,7 +712,7 @@ data class ArrowData(
 )
 
 /**
- * Full-screen, non-interactive layer that draws up to three move arrows on top of the detected
+ * Full-screen, non-interactive layer that draws up to five move arrows on top of the detected
  * board, each with a classification badge near its tip. Board bounds are expressed as ratios of
  * the full (real) screen size.
  */
@@ -881,15 +734,21 @@ class ArrowView(
     )
 
     private companion object {
-        const val MAX_ARROWS = 3
+        const val MAX_ARROWS = 5
         val STYLE_RANK_1 = ArrowStyle(255, 0.24f, 0.55f, 0.36f, 24f)  // Best: opaque, thick
         val STYLE_RANK_2 = ArrowStyle(255, 0.12f, 0.40f, 0.22f, 16f)  // 2nd: opaque, thin
         val STYLE_RANK_3 = ArrowStyle(255, 0.08f, 0.32f, 0.16f, 14f)  // 3rd: opaque, very thin
+        val STYLE_RANK_4 = ArrowStyle(255, 0.06f, 0.26f, 0.13f, 12f)  // 4th: hairline
+        val STYLE_RANK_5 = ArrowStyle(255, 0.04f, 0.22f, 0.11f, 10f)  // 5th: thinnest
 
         /** Muted steel blue for the second-best arrow. */
         val COLOR_RANK_2 = Color.parseColor("#6B8EB5")
         /** Muted warm gray for the third-best arrow. */
         val COLOR_RANK_3 = Color.parseColor("#8B8680")
+        /** Muted olive for the fourth-best arrow. */
+        val COLOR_RANK_4 = Color.parseColor("#7A7A6B")
+        /** Muted gray for the fifth-best arrow. */
+        val COLOR_RANK_5 = Color.parseColor("#6B6B6B")
 
         /** Alpha of the dark outline drawn behind every arrow. */
         const val BORDER_ALPHA = 100
@@ -899,14 +758,18 @@ class ArrowView(
         fun styleFor(rank: Int): ArrowStyle = when {
             rank <= 1 -> STYLE_RANK_1
             rank == 2 -> STYLE_RANK_2
-            else -> STYLE_RANK_3
+            rank == 3 -> STYLE_RANK_3
+            rank == 4 -> STYLE_RANK_4
+            else -> STYLE_RANK_5
         }
 
         /** Best move keeps its classification color; alternatives use fixed muted colors. */
         fun arrowColorForRank(rank: Int, classColor: Int): Int = when {
             rank <= 1 -> classColor
             rank == 2 -> COLOR_RANK_2
-            else -> COLOR_RANK_3
+            rank == 3 -> COLOR_RANK_3
+            rank == 4 -> COLOR_RANK_4
+            else -> COLOR_RANK_5
         }
     }
 
@@ -948,7 +811,7 @@ class ArrowView(
         invalidate()
     }
 
-    /** Replaces all arrows. Only the three best-ranked arrows are drawn. */
+    /** Replaces all arrows. Only the five best-ranked arrows are drawn. */
     fun setArrows(arrows: List<ArrowData>) {
         this.arrows = arrows
             .map { it.copy(from = it.from.lowercase(Locale.ROOT), to = it.to.lowercase(Locale.ROOT)) }

@@ -73,7 +73,7 @@ class AnalysisCoordinator(
         const val DEFAULT_DEPTH = 12
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
-        private const val NUM_LINES = 3
+        private const val NUM_LINES = 5
 
         /** Name of the engine binary in the assets folder. */
         const val STOCKFISH_ASSET = "stockfish"

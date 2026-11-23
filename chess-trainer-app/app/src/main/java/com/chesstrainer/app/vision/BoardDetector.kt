@@ -597,20 +597,41 @@ object TemplateFreeClassifier {
      */
     private val PROTO_MEAN = arrayOf(
         //            top    height area   topSp  topFl  upper  waist  aspect asym
-        floatArrayOf(0.22f, 0.76f, 0.24f, 0.50f, 0.70f, 0.50f, 0.35f, 0.78f, 0.05f), // pawn
+        floatArrayOf(0.30f, 0.68f, 0.24f, 0.50f, 0.70f, 0.50f, 0.35f, 0.78f, 0.05f), // pawn
         floatArrayOf(0.03f, 0.95f, 0.42f, 0.50f, 0.55f, 0.70f, 0.55f, 0.78f, 0.25f), // knight
-        floatArrayOf(0.02f, 0.96f, 0.32f, 0.28f, 0.65f, 0.42f, 0.35f, 0.58f, 0.06f), // bishop
+        floatArrayOf(0.02f, 0.96f, 0.32f, 0.28f, 0.50f, 0.42f, 0.35f, 0.58f, 0.06f), // bishop
         floatArrayOf(0.06f, 0.92f, 0.50f, 0.95f, 0.88f, 0.75f, 0.70f, 0.80f, 0.05f), // rook
         floatArrayOf(0.01f, 0.98f, 0.45f, 0.68f, 0.50f, 0.65f, 0.42f, 0.74f, 0.06f), // queen
         floatArrayOf(0.00f, 1.00f, 0.52f, 0.35f, 0.55f, 0.85f, 0.65f, 0.78f, 0.05f), // king
     )
 
     /**
-     * Tolerance per metric (shared by all types except knight asymmetry, which varies more).
-     * Deliberately wide: rendering size, anti-aliasing and the grid fit all shift the metrics.
+     * Tolerance per metric. The discriminating metrics are tight: asymmetry (knight vs the
+     * rest), top span (rook's battlements) and height (pawn's shortness). The others stay wide
+     * because rendering size, anti-aliasing and the grid fit all shift them.
      */
-    private val PROTO_SIGMA = floatArrayOf(0.12f, 0.12f, 0.12f, 0.20f, 0.20f, 0.18f, 0.18f, 0.15f, 0.10f)
-    private const val KNIGHT_ASYM_SIGMA = 0.15f
+    private val PROTO_SIGMA = floatArrayOf(0.12f, 0.10f, 0.12f, 0.12f, 0.18f, 0.18f, 0.18f, 0.15f, 0.06f)
+
+    /**
+     * The knight's own asymmetry tolerance is a bit wider (how lopsided the head looks depends
+     * on the set and resolution), while every symmetric type uses the tight 0.06 above, so an
+     * asymmetric silhouette is expensive for every type except the knight.
+     */
+    private const val KNIGHT_ASYM_SIGMA = 0.10f
+
+    // Hard pre-classification rules (see earlyClassify).
+    private const val EARLY_KNIGHT_ASYM = 0.18f
+    private const val EARLY_ROOK_TOP_SPAN = 0.85f
+    private const val EARLY_ROOK_TOP_FILL = 0.80f
+    private const val EARLY_ROOK_MAX_ASYM = 0.12f
+    private const val EARLY_PAWN_MAX_HEIGHT = 0.70f
+    private const val EARLY_PAWN_MAX_ASYM = 0.12f
+
+    /** Score lead given to an early (rule-based) type so later margin checks treat it as sure. */
+    private const val EARLY_LOCK_MARGIN = 10f
+
+    /** A rook read whose raw asymmetry is above this is really a knight. */
+    private const val ROOK_TO_KNIGHT_ASYM = 0.14f
 
     /** Per-square result before board-level validation. */
     private class Reading(
@@ -624,6 +645,8 @@ object TemplateFreeClassifier {
         val bodyLuma: Float,
         /** Shape metrics of the silhouette (see M_* indices). */
         val metrics: FloatArray,
+        /** Set by [earlyClassify]: the type came from a hard rule and must not be re-guessed. */
+        val locked: Boolean = false,
     )
 
     /** Returns letters[row][col] in screen order (row 0 at top), '.' for empty squares. */
@@ -709,7 +732,17 @@ object TemplateFreeClassifier {
         val metrics = shapeMetrics(sil) ?: return null
         val scores = FloatArray(TYPE_COUNT) { t -> distance(metrics, t) }
         val backRank = row == 0 || row == 7
-        val type = bestType(scores, if (backRank) setOf(PAWN) else emptySet())
+        val early = earlyClassify(metrics, backRank)
+        val type: Int
+        if (early != null) {
+            type = TYPE_CHARS.indexOf(early)
+            // Make the rule's type the clear favourite so margin-based fixes leave it alone.
+            var bestOther = Float.MAX_VALUE
+            for (t in 0 until TYPE_COUNT) if (t != type) bestOther = min(bestOther, scores[t])
+            scores[type] = min(scores[type], bestOther - EARLY_LOCK_MARGIN)
+        } else {
+            type = bestType(scores, if (backRank) setOf(PAWN) else emptySet())
+        }
 
         // Absolute luma of the piece fill: a bright percentile inside the silhouette, so the
         // dark outline (present on both colours) does not dominate.
@@ -721,8 +754,28 @@ object TemplateFreeClassifier {
 
         return Reading(
             row, white = true, colorConfidence = 0f, scores = scores, type = type, bodyLuma = body,
-            metrics = metrics,
+            metrics = metrics, locked = early != null,
         )
+    }
+
+    /**
+     * Hard decision rules applied before the prototype matching. Returns a (black) FEN letter
+     * when the silhouette is unambiguous, or null to fall back to the Gaussian scores.
+     *  - The knight is the only asymmetric piece (horse head): strong asymmetry means knight.
+     *  - A wide, well-filled top band (battlements as wide as the body) means rook.
+     *  - A clearly short, symmetric silhouette means pawn (never on the first/last rank).
+     */
+    private fun earlyClassify(metrics: FloatArray, backRank: Boolean): Char? {
+        val asym = metrics[M_ASYM]
+        if (asym > EARLY_KNIGHT_ASYM) return 'n'
+        if (metrics[M_TOP_SPAN] > EARLY_ROOK_TOP_SPAN &&
+            metrics[M_TOP_FILL] > EARLY_ROOK_TOP_FILL &&
+            asym < EARLY_ROOK_MAX_ASYM
+        ) {
+            return 'r'
+        }
+        if (!backRank && metrics[M_HEIGHT] < EARLY_PAWN_MAX_HEIGHT && asym < EARLY_PAWN_MAX_ASYM) return 'p'
+        return null
     }
 
     /** Closing (dilate, fill holes, erode), unioned with the hole-filled raw mask. */
@@ -1002,17 +1055,25 @@ object TemplateFreeClassifier {
      * Heights of tall pieces are clipped by the feature window, so "tallest" is a tie group.
      */
     private fun applyRelativeHeight(side: List<Reading>) {
+        // A rook never has a lopsided silhouette; if the raw metrics say it does, it is a knight
+        // whose head happened to look blocky. Independent of the side size.
+        for (rd in side) {
+            if (rd.locked || rd.type != ROOK) continue
+            if (rd.metrics[M_ASYM] > ROOK_TO_KNIGHT_ASYM) rd.type = KNIGHT
+        }
+
         if (side.size < 2) return
         val tallest = side.maxOf { it.metrics[M_HEIGHT] }
         val shortest = side.minOf { it.metrics[M_HEIGHT] }
         val tallGroup = side.filter { tallest - it.metrics[M_HEIGHT] <= HEIGHT_TIE }
+        val unlockedTall = tallGroup.filter { !it.locked }
 
         val kings = side.filter { it.type == KING }
         if (kings.isEmpty()) {
-            val pick = tallGroup.minByOrNull { it.scores[KING] - it.scores[it.type] }
+            val pick = unlockedTall.minByOrNull { it.scores[KING] - it.scores[it.type] }
             if (pick != null) pick.type = KING
         } else if (kings.none { tallest - it.metrics[M_HEIGHT] <= HEIGHT_TIE }) {
-            val pick = tallGroup
+            val pick = unlockedTall
                 .filter { it.type != KING && margin(it, it.type) < LOW_CONFIDENCE_MARGIN }
                 .minByOrNull { it.scores[KING] - it.scores[it.type] }
             if (pick != null) {
@@ -1021,14 +1082,33 @@ object TemplateFreeClassifier {
             }
         }
 
-        if (tallest - shortest < MIN_PAWN_HEIGHT_GAP) return
+        if (tallest - shortest >= MIN_PAWN_HEIGHT_GAP) {
+            // The clearly shortest pieces of a side are pawns. A bishop is one of the tallest
+            // pieces, so a "bishop" down there is always a pawn; other types switch when unsure.
+            for (rd in side) {
+                if (rd.locked || rd.type == PAWN || rd.type == KING || rd.row == 0 || rd.row == 7) continue
+                val h = rd.metrics[M_HEIGHT]
+                if (h - shortest > HEIGHT_TIE || tallest - h < MIN_PAWN_HEIGHT_GAP) continue
+                if (rd.type == BISHOP) {
+                    rd.type = PAWN
+                    continue
+                }
+                if (margin(rd, rd.type) >= LOW_CONFIDENCE_MARGIN) continue
+                rd.scores[PAWN] -= PAWN_BOOST
+                rd.type = bestType(rd.scores, excludedFor(rd))
+            }
+        }
+
+        // A "pawn" as tall as the side's real pieces is not a pawn (typically a bishop whose
+        // narrow outline matched the pawn prototype). Re-pick among the non-pawn types.
+        val nonPawnHeights = side.filter { it.type != PAWN }.map { it.metrics[M_HEIGHT] }
+        if (nonPawnHeights.isEmpty()) return
+        val refHeight = CellReader.median(nonPawnHeights)
         for (rd in side) {
-            if (rd.type == PAWN || rd.type == KING || rd.row == 0 || rd.row == 7) continue
+            if (rd.locked || rd.type != PAWN) continue
             val h = rd.metrics[M_HEIGHT]
-            if (h - shortest > HEIGHT_TIE || tallest - h < MIN_PAWN_HEIGHT_GAP) continue
-            if (margin(rd, rd.type) >= LOW_CONFIDENCE_MARGIN) continue
-            rd.scores[PAWN] -= PAWN_BOOST
-            rd.type = bestType(rd.scores, excludedFor(rd))
+            if (h < refHeight - HEIGHT_TIE || tallest - h >= MIN_PAWN_HEIGHT_GAP) continue
+            rd.type = bestType(rd.scores, setOf(PAWN))
         }
     }
 
@@ -1037,7 +1117,8 @@ object TemplateFreeClassifier {
         when {
             kings.isEmpty() -> {
                 // Promote the piece for which "king" costs the least relative to its current read.
-                val pick = side.minByOrNull { it.scores[KING] - it.scores[it.type] } ?: return
+                val pool = side.filter { !it.locked }.ifEmpty { side }
+                val pick = pool.minByOrNull { it.scores[KING] - it.scores[it.type] } ?: return
                 pick.type = KING
             }
             kings.size > 1 -> {
@@ -1052,7 +1133,8 @@ object TemplateFreeClassifier {
     private fun fixPawns(side: List<Reading>) {
         val pawns = side.filter { it.type == PAWN }
         if (pawns.size <= MAX_PAWNS) return
-        val leastSure = pawns.sortedBy { margin(it, PAWN) }
+        // Rule-based pawns are demoted last; within each group the least sure go first.
+        val leastSure = pawns.sortedWith(compareBy<Reading>({ it.locked }, { margin(it, PAWN) }))
         for (i in 0 until pawns.size - MAX_PAWNS) {
             val rd = leastSure[i]
             rd.type = bestType(rd.scores, setOf(PAWN, KING))
