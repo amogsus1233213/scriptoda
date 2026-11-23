@@ -141,6 +141,12 @@ class ScreenCaptureService : Service() {
             return START_NOT_STICKY
         }
 
+        if (intent.action == "com.chesstrainer.app.action.CALIBRATE") {
+            val app = com.chesstrainer.app.ChessTrainerApp.get(this)
+            app.coordinator.requestCalibration()
+            return START_NOT_STICKY
+        }
+
         applyConfig(intent)
 
         // Android 14: the service must be in the foreground with type mediaProjection

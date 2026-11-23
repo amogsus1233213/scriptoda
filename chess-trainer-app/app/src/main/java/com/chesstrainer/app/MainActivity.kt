@@ -253,6 +253,17 @@ class MainActivity : AppCompatActivity() {
         }
         ContextCompat.startForegroundService(this, captureIntent)
         ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java))
+
+        val app = ChessTrainerApp.get(this)
+        app.coordinator.statusListener = { msg -> runOnUiThread { setStatus(msg) } }
+        app.coordinator.calibrationListener = { ok ->
+            runOnUiThread {
+                if (ok) setStatus("Calibration saved")
+                else setStatus("Calibration failed — try again with the starting position")
+            }
+        }
+        app.coordinator.start()
+
         running = true
         refreshUi()
     }
@@ -264,6 +275,7 @@ class MainActivity : AppCompatActivity() {
     private fun onStopClicked() {
         calibrationTimer?.cancel()
         calibrationTimer = null
+        ChessTrainerApp.get(this).coordinator.stop()
         stopService(Intent(this, OverlayService::class.java))
         stopService(Intent(this, ScreenCaptureService::class.java))
         running = false
