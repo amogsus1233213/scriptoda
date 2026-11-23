@@ -72,7 +72,7 @@ class AnalysisCoordinator(
     companion object {
         private const val TAG = "AnalysisCoordinator"
 
-        const val DEFAULT_DEPTH = 12
+        const val DEFAULT_DEPTH = 21
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 5
