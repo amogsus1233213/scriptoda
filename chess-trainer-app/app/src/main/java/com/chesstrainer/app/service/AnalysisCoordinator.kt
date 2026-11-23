@@ -11,7 +11,6 @@ import com.chesstrainer.app.engine.AnalysisResult
 import com.chesstrainer.app.engine.ClassifiedMove
 import com.chesstrainer.app.engine.MoveClassifier
 import com.chesstrainer.app.engine.MoveCommentary
-import com.chesstrainer.app.engine.StockfishBinaryExtractor
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.service.AccessibilityData
 import com.chesstrainer.app.service.FenConverter
@@ -77,6 +76,13 @@ class AnalysisCoordinator(
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 5
+
+        /**
+         * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
+         * to execute files from app-writable storage (targetSdk >= 29), so the binary must be run
+         * from the native library directory, where the installer extracts it (legacy packaging).
+         */
+        private const val STOCKFISH_NATIVE_LIB = "libstockfish.so"
 
         private const val TEMPLATES_FILE = "board_templates.txt"
 
@@ -349,8 +355,10 @@ class AnalysisCoordinator(
 
     private fun initEngine() {
         if (engine != null) return
-        val binary = StockfishBinaryExtractor.extractBinary(appContext)
-        if (binary == null) {
+        val nativeDir = appContext.applicationInfo.nativeLibraryDir
+        val binary = nativeDir?.let { File(it, STOCKFISH_NATIVE_LIB) }
+        if (binary == null || !binary.exists() || !binary.canExecute()) {
+            Log.e(TAG, "Stockfish binary not found or not executable in $nativeDir")
             postStatus("Stockfish binary not found")
             return
         }
