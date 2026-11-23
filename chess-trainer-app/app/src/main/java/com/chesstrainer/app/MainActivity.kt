@@ -163,6 +163,7 @@ class MainActivity : AppCompatActivity() {
         boardReaderStatusText.setTextColor(
             ContextCompat.getColor(this, if (enabled) R.color.accent_green else R.color.accent_red)
         )
+        enableBoardReaderButton.visibility = if (enabled) android.view.View.GONE else android.view.View.VISIBLE
     }
 
     /** getRunningServices is deprecated but still reports this app's own services. */
