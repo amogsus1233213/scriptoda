@@ -38,6 +38,18 @@ class MainActivity : AppCompatActivity() {
 
         private const val CALIBRATE_DELAY_MS = 5_000L
         private const val KEY_RUNNING = "running"
+        private const val KEY_BOARD_FOUND = "board_found"
+
+        /**
+         * AnalysisCoordinator status messages that reveal whether a board is on screen. They
+         * must match the coordinator's STATUS_* strings exactly.
+         */
+        private const val STATUS_BOARD_LOST = "Looking for chess board..."
+        private val STATUS_BOARD_FOUND = setOf(
+            "Board found — reading pieces...",
+            "Board recognized",
+            "Analyzing...",
+        )
     }
 
     private lateinit var statusText: TextView
@@ -46,9 +58,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var calibrateButton: MaterialButton
     private lateinit var boardReaderStatusText: TextView
     private lateinit var enableBoardReaderButton: MaterialButton
+    private lateinit var overlayStatusText: TextView
+    private lateinit var captureStatusText: TextView
+    private lateinit var engineStatusText: TextView
+    private lateinit var boardStatusText: TextView
 
     private var running = false
     private var calibrationTimer: CountDownTimer? = null
+
+    /** Whether the coordinator last reported a visible board (inferred from its status messages). */
+    private var boardFound = false
 
     private val projectionManager by lazy {
         getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -84,6 +103,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         running = savedInstanceState?.getBoolean(KEY_RUNNING) ?: false
+        boardFound = savedInstanceState?.getBoolean(KEY_BOARD_FOUND) ?: false
         setContentView(buildContent())
         refreshUi()
     }
@@ -92,8 +112,48 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         // The overlay may have been stopped from its notification while we were away.
         running = isServiceRunning(OverlayService::class.java)
+        // The coordinator outlives this activity; point its callbacks at the current instance
+        // (e.g. after a rotation) so status and board detection keep updating.
+        val coordinator = ChessTrainerApp.get(this).coordinator
+        if (coordinator.isRunning()) attachCoordinatorListeners()
         refreshUi()
+        updateAllStatuses()
+    }
+
+    /** Refreshes every row of the System Status section plus the Board Reader status. */
+    private fun updateAllStatuses() {
         updateBoardReaderStatus()
+
+        // Overlay permission
+        val overlayOk = OverlayService.canDrawOverlays(this)
+        overlayStatusText.text = if (overlayOk) "Overlay Permission: GRANTED" else "Overlay Permission: DENIED"
+        overlayStatusText.setTextColor(
+            ContextCompat.getColor(this, if (overlayOk) R.color.accent_green else R.color.accent_red)
+        )
+
+        // Screen capture
+        val captureRunning = isServiceRunning(ScreenCaptureService::class.java)
+        captureStatusText.text = if (captureRunning) "Screen Capture: ACTIVE" else "Screen Capture: OFF"
+        captureStatusText.setTextColor(
+            ContextCompat.getColor(this, if (captureRunning) R.color.accent_green else R.color.accent_red)
+        )
+
+        // Engine
+        val coordinator = ChessTrainerApp.get(this).coordinator
+        val engineRunning = coordinator.isRunning()
+        engineStatusText.text = if (engineRunning) "Engine: RUNNING" else "Engine: STOPPED"
+        engineStatusText.setTextColor(
+            ContextCompat.getColor(this, if (engineRunning) R.color.accent_green else R.color.accent_red)
+        )
+
+        // Board detection: only meaningful while the coordinator is analysing frames.
+        val (boardLabel, boardColor) = when {
+            !engineRunning -> "Board Detection: OFF" to R.color.accent_red
+            boardFound -> "Board Detection: FOUND" to R.color.accent_green
+            else -> "Board Detection: SEARCHING" to R.color.accent_yellow
+        }
+        boardStatusText.text = boardLabel
+        boardStatusText.setTextColor(ContextCompat.getColor(this, boardColor))
     }
 
     /** Reflects whether the board-reader accessibility service is enabled in system settings. */
@@ -115,6 +175,7 @@ class MainActivity : AppCompatActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(KEY_RUNNING, running)
+        outState.putBoolean(KEY_BOARD_FOUND, boardFound)
     }
 
     override fun onDestroy() {
@@ -200,6 +261,31 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(enableBoardReaderButton, matchWrap().apply { topMargin = dp(12f) })
 
+        // Diagnostics: one colour-coded row per component (green = working, red = off/broken,
+        // yellow = warning). Filled in by updateAllStatuses().
+        val statusHeader = TextView(this).apply {
+            text = "System Status"
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        root.addView(statusHeader, matchWrap().apply { topMargin = dp(32f) })
+
+        overlayStatusText = statusRow("Overlay Permission")
+        captureStatusText = statusRow("Screen Capture")
+        engineStatusText = statusRow("Engine")
+        boardStatusText = statusRow("Board Detection")
+        val statusPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = dp(4f)
+            setPadding(0, p, 0, p)
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.surface))
+            listOf(overlayStatusText, captureStatusText, engineStatusText, boardStatusText)
+                .forEach { addView(it, matchWrap()) }
+        }
+        root.addView(statusPanel, matchWrap().apply { topMargin = dp(12f) })
+
         val hint = TextView(this).apply {
             text = "Start the service, then open your chess app. The board is detected " +
                 "automatically when you show the starting position. " +
@@ -215,6 +301,17 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.background))
             addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
+    }
+
+    /** A System Status row; [label] is shown until [updateAllStatuses] fills in the state. */
+    private fun statusRow(label: String): TextView = TextView(this).apply {
+        text = label
+        setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.START
+        val p = dp(8f)
+        setPadding(dp(16f), p, dp(16f), p)
     }
 
     private fun matchWrap() = LinearLayout.LayoutParams(
@@ -294,18 +391,13 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(this, captureIntent)
         ContextCompat.startForegroundService(this, Intent(this, OverlayService::class.java))
 
-        val app = ChessTrainerApp.get(this)
-        app.coordinator.statusListener = { msg -> runOnUiThread { setStatus(msg) } }
-        app.coordinator.calibrationListener = { ok ->
-            runOnUiThread {
-                if (ok) setStatus("Calibration saved")
-                else setStatus("Calibration failed — try again with the starting position")
-            }
-        }
-        app.coordinator.start()
+        attachCoordinatorListeners()
+        ChessTrainerApp.get(this).coordinator.start()
 
         running = true
+        boardFound = false
         refreshUi()
+        updateAllStatuses()
         // Set after refreshUi() so the generic "Running" text doesn't overwrite it;
         // the coordinator replaces this via statusListener once it finds the board.
         setStatus("Looking for chess board...")
@@ -320,6 +412,27 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) { }
     }
 
+    /** Routes coordinator callbacks to this activity instance. */
+    private fun attachCoordinatorListeners() {
+        val coordinator = ChessTrainerApp.get(this).coordinator
+        coordinator.statusListener = { msg -> runOnUiThread { onCoordinatorStatus(msg) } }
+        coordinator.calibrationListener = { ok ->
+            runOnUiThread {
+                if (ok) setStatus("Calibration saved")
+                else setStatus("Calibration failed — try again with the starting position")
+            }
+        }
+    }
+
+    private fun onCoordinatorStatus(message: String) {
+        setStatus(message)
+        when (message) {
+            STATUS_BOARD_LOST -> boardFound = false
+            in STATUS_BOARD_FOUND -> boardFound = true
+        }
+        updateAllStatuses()
+    }
+
     // ---------------------------------------------------------------------------------------
     // Stop / calibrate
     // ---------------------------------------------------------------------------------------
@@ -331,7 +444,9 @@ class MainActivity : AppCompatActivity() {
         stopService(Intent(this, OverlayService::class.java))
         stopService(Intent(this, ScreenCaptureService::class.java))
         running = false
+        boardFound = false
         refreshUi()
+        updateAllStatuses()
     }
 
     private fun onCalibrateClicked() {
