@@ -87,6 +87,12 @@ class AnalysisCoordinator(
         /** Consecutive identical reads required before a placement is trusted. */
         private const val STABLE_FRAMES = 2
 
+        /**
+         * Unstable reads (differing from the stable placement) after which the most frequently
+         * read placement is accepted by majority vote, tolerating noisy frames.
+         */
+        private const val MAX_FRAMES_BEFORE_MAJORITY = 6
+
         /** Consecutive contrary reads required before the board orientation is switched. */
         private const val ORIENTATION_SWITCH_FRAMES = 3
 
@@ -228,6 +234,8 @@ class AnalysisCoordinator(
     private var candidatePlacement: String? = null
     private var candidateCount = 0
     private var stablePlacement: String? = null
+    private var candidateHistory = HashMap<String, Int>()
+    private var candidateFramesSinceStable = 0
     private var missedFrames = 0
     private var boardVisible = false
 
@@ -509,10 +517,34 @@ class AnalysisCoordinator(
             candidatePlacement = placement
             candidateCount = 1
         }
-        if (candidateCount < STABLE_FRAMES || placement == stablePlacement) return
 
-        stablePlacement = placement
-        onPositionChanged(placement)
+        // Track all readings since last stable position for majority vote
+        if (placement != stablePlacement) {
+            candidateFramesSinceStable++
+            candidateHistory[placement] = (candidateHistory[placement] ?: 0) + 1
+        }
+
+        val accepted = when {
+            // Normal path: two identical reads in a row
+            candidateCount >= STABLE_FRAMES && placement != stablePlacement -> true
+            // Majority vote: after MAX_FRAMES_BEFORE_MAJORITY frames, pick the most-read position
+            candidateFramesSinceStable >= MAX_FRAMES_BEFORE_MAJORITY && candidateHistory.isNotEmpty() -> {
+                val best = candidateHistory.maxByOrNull { it.value }
+                if (best != null && best.key != stablePlacement && best.value >= 2) {
+                    candidatePlacement = best.key
+                    true
+                } else false
+            }
+            else -> false
+        }
+
+        if (!accepted) return
+
+        val finalPlacement = candidatePlacement ?: return
+        stablePlacement = finalPlacement
+        candidateHistory.clear()
+        candidateFramesSinceStable = 0
+        onPositionChanged(finalPlacement)
     }
 
     /**
@@ -762,6 +794,8 @@ class AnalysisCoordinator(
         candidatePlacement = null
         candidateCount = 0
         stablePlacement = null
+        candidateHistory.clear()
+        candidateFramesSinceStable = 0
         missedFrames = 0
         boardVisible = false
         previousFen = null
@@ -788,7 +822,7 @@ class AnalysisCoordinator(
         // Engine scores are side-to-move relative; the overlay expects white's point of view.
         var evalCp: Int? = null
         var mateIn: Int? = null
-        if (analysis != null && analysis.mate != 0) {
+        if (analysis != null) {
             val sign = if (whiteToMove) 1 else -1
             evalCp = analysis.eval.coerceIn(-StockfishEngine.MATE_SCORE, StockfishEngine.MATE_SCORE) * sign
             mateIn = analysis.mate?.let { it * sign }
@@ -797,27 +831,27 @@ class AnalysisCoordinator(
         val best = analysis?.bestMove.orEmpty()
         val usersTurn = whiteToMove == userIsWhite
         val classified = lastClassified
-        val played = lastMove
 
-        if (usersTurn && best.length >= 4) {
+        // Always show the engine's best move for the side to move; the badge carries
+        // the classification of the last played move when one is available.
+        if (best.length >= 4) {
             val label: String
             val color: Int
-            if (classified != null) {
-                // Badge: how good the opponent's last move was.
-                label = classified.classification.displayName
-                color = MoveColors.forLabel(label)
-            } else {
-                label = "Your move"
-                color = MoveColors.BEST
+            when {
+                classified != null -> {
+                    label = classified.classification.displayName
+                    color = MoveColors.forLabel(label)
+                }
+                usersTurn -> {
+                    label = "Best move"
+                    color = MoveColors.BEST
+                }
+                else -> {
+                    label = "Best reply"
+                    color = MoveColors.BEST
+                }
             }
             postSuggestion(best.substring(0, 2), best.substring(2, 4), evalCp, mateIn, label, color, flipped)
-        } else if (classified != null && played != null) {
-            // Opponent to move (or game over): feedback on the move just played.
-            val label = classified.classification.displayName
-            postSuggestion(
-                squareName(played.from), squareName(played.to),
-                evalCp, mateIn, label, MoveColors.forLabel(label), flipped,
-            )
         } else {
             postOverlayClear()
         }

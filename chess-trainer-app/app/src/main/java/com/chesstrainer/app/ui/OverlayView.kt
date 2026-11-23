@@ -437,6 +437,7 @@ class OverlayService : Service() {
             arrowView?.clearArrow()
             return
         }
+        if (!expanded) setExpanded(true)
         badgeView.text = s.label
         (badgeView.background as GradientDrawable).setColor(s.labelColor)
         moveText.text = "${s.from} → ${s.to}"
