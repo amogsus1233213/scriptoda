@@ -25,6 +25,7 @@ import com.chesstrainer.app.vision.Fen
 import com.chesstrainer.app.vision.Grid
 import com.chesstrainer.app.vision.Orientation
 import com.chesstrainer.app.vision.Pixels
+import com.chesstrainer.app.vision.TemplateFreeClassifier
 import com.chesstrainer.app.vision.Templates
 import java.io.File
 import java.io.FileOutputStream
@@ -43,7 +44,10 @@ import kotlin.math.max
  * Pipeline per captured frame:
  *  1. [ScreenCaptureService] delivers a (reused) bitmap on its capture thread; it is copied and
  *     handed to a single worker thread. Frames that arrive while the worker is busy are dropped.
- *  2. The board is located and its squares classified against the calibrated [Templates].
+ *  2. The board is located and its squares classified. No setup is needed: the
+ *     [TemplateFreeClassifier] reads any position from the first frame. If [Templates] exist
+ *     (learnt silently whenever the starting position is on screen, or from an explicit
+ *     [calibrate] call) they are tried first, as they are more accurate for the current theme.
  *  3. The piece placement must be read identically on [STABLE_FRAMES] consecutive frames before it
  *     is accepted (filters out piece animations and drags).
  *  4. A new placement is diffed against the previous one to recover the move that was played,
@@ -96,8 +100,8 @@ class AnalysisCoordinator(
 
         // User-facing status messages. Users should never need to know about "calibration".
         private const val STATUS_LOOKING = "Looking for chess board..."
-        private const val STATUS_SHOW_START = "Board found — show starting position"
-        private const val STATUS_CALIBRATED = "Board calibrated!"
+        private const val STATUS_READING = "Board found — reading pieces..."
+        private const val STATUS_RECOGNIZED = "Board recognized"
         private const val STATUS_ANALYZING = "Analyzing..."
 
         private const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
@@ -214,8 +218,8 @@ class AnalysisCoordinator(
 
     private var templatesLoaded = false
 
-    /** Last hint posted while waiting for auto-calibration; used to avoid repeating it. */
-    private var lastAutoCalibrationStatus: String? = null
+    /** Last hint posted while no position could be read yet; used to avoid repeating it. */
+    private var lastHintStatus: String? = null
 
     /** Locked board orientation; null until the first board was read. */
     private var whiteAtBottom: Boolean? = null
@@ -281,11 +285,14 @@ class AnalysisCoordinator(
 
     fun isRunning(): Boolean = running.get()
 
-    /** True once calibration templates are available (calibrated now or loaded from disk). */
+    /**
+     * True once optional recognition templates are available (learnt now or loaded from disk).
+     * Recognition does not depend on this: without templates the template-free classifier is used.
+     */
     fun isCalibrated(): Boolean = templates != null || File(appContext.filesDir, TEMPLATES_FILE).isFile
 
     // -------------------------------------------------------------------------------------
-    // Calibration
+    // Optional templates (accuracy enhancement, never required)
     // -------------------------------------------------------------------------------------
 
     /**
@@ -296,12 +303,12 @@ class AnalysisCoordinator(
     fun calibrate(bitmap: Bitmap) {
         val copy = copyBitmap(bitmap)
         if (copy == null) {
-            notifyCalibration(false, "Calibration failed: out of memory")
+            notifyCalibration(false, "Could not read the board: out of memory")
             return
         }
         if (!submit { try { calibrateOnWorker(copy) } finally { copy.recycle() } }) {
             copy.recycle()
-            notifyCalibration(false, "Calibration failed: coordinator unavailable")
+            notifyCalibration(false, "Could not read the board right now")
         }
     }
 
@@ -311,7 +318,10 @@ class AnalysisCoordinator(
         postStatus("Reading the board…")
     }
 
-    /** Deletes the stored templates; recognition is paused until calibrated again. */
+    /**
+     * Deletes the stored templates. Recognition continues uninterrupted with the template-free
+     * classifier; templates are re-learnt silently the next time the starting position is seen.
+     */
     fun clearCalibration() {
         submit {
             templates = null
@@ -319,8 +329,7 @@ class AnalysisCoordinator(
             AtomicFile(File(appContext.filesDir, TEMPLATES_FILE)).delete()
             resetGameState()
             postOverlayClear()
-            // Recognition resumes automatically once the starting position is seen again.
-            lastAutoCalibrationStatus = STATUS_LOOKING
+            lastHintStatus = STATUS_LOOKING
             postStatus(STATUS_LOOKING)
         }
     }
@@ -329,21 +338,22 @@ class AnalysisCoordinator(
         val result = try {
             ChessScreenReader.calibrate(bitmap)
         } catch (e: RuntimeException) {
-            Log.e(TAG, "Calibration crashed", e)
+            Log.e(TAG, "Template building crashed", e)
             null
         }
         if (result == null) {
-            notifyCalibration(false, "Show the starting position with white at the bottom")
+            // Not an error for the user: recognition keeps working without templates.
+            notifyCalibration(false, STATUS_LOOKING)
             return
         }
         templates = result
         templatesLoaded = true
         saveTemplates(result)
         resetGameState()
-        // Calibration requires white at the bottom and the initial position on screen.
+        // Templates are only built from the initial position with white at the bottom.
         whiteAtBottom = true
-        lastAutoCalibrationStatus = null
-        notifyCalibration(true, STATUS_CALIBRATED)
+        lastHintStatus = null
+        notifyCalibration(true, STATUS_RECOGNIZED)
     }
 
     private fun ensureTemplatesLoaded() {
@@ -356,7 +366,7 @@ class AnalysisCoordinator(
         } catch (e: IOException) {
             null
         }
-        if (templates == null) lastAutoCalibrationStatus = STATUS_LOOKING
+        lastHintStatus = STATUS_LOOKING
         postStatus(STATUS_LOOKING)
     }
 
@@ -465,22 +475,30 @@ class AnalysisCoordinator(
         val grid = BoardLocator.locate(px)
         if (grid == null) {
             onBoardMissing()
-            if (templates == null) postAutoCalibrationStatus(STATUS_LOOKING)
+            if (!boardVisible) postHintStatus(STATUS_LOOKING)
             return
         }
 
-        val cells = CellReader.read(px, grid)
-        val tpl = templates ?: autoCalibrate(cells, grid, px, bitmap) ?: return
-
-        val letters = Classifier.classify(cells, tpl)
-        if (!isPlausible(letters)) return
-
+        // The board is on screen: keep the overlay aligned even if this frame's pieces are
+        // unreadable (e.g. mid-animation).
         missedFrames = 0
+        updateBoardBounds(grid, px, bitmap)
+
+        val cells = CellReader.read(px, grid)
+        // Optional accuracy boost: silently learn templates when the starting position shows up.
+        if (templates == null) learnTemplatesFromStartPosition(cells)
+
+        val letters = readLetters(cells)
+        if (letters == null) {
+            if (!boardVisible) postHintStatus(STATUS_READING)
+            return
+        }
+
         if (!boardVisible) {
             boardVisible = true
+            lastHintStatus = null
             postStatus(STATUS_ANALYZING)
         }
-        updateBoardBounds(grid, px, bitmap)
 
         val bottomIsWhite = resolveOrientation(letters)
         val placement = Fen.build(letters, bottomIsWhite).substringBefore(' ')
@@ -498,50 +516,65 @@ class AnalysisCoordinator(
     }
 
     /**
-     * Tries to build templates from a frame in which a board grid was found but no templates exist
-     * yet. Succeeds only when the frame shows the starting position ([Calibrator.fromCells]
-     * validates this), with white at the bottom or, failing that, with black at the bottom (the
-     * cells are then read in reverse order, which maps each screen square onto the matching
-     * square of a white-at-bottom starting position and preserves the square colours).
+     * Reads the piece letters of a frame. Templates (if any) are tried first because they match
+     * the exact theme; if they are missing or give an impossible position (e.g. the user changed
+     * the piece set since they were learnt) the template-free classifier is used.
      *
-     * The board bounds are pushed to the overlay either way so it knows where the board is.
-     *
-     * @return the new templates, or null if this frame could not be used.
+     * @return screen-ordered letters of a plausible position, or null if none could be read.
      */
-    private fun autoCalibrate(cells: List<Cell>, grid: Grid, px: Pixels, bitmap: Bitmap): Templates? {
-        missedFrames = 0
-        updateBoardBounds(grid, px, bitmap)
+    private fun readLetters(cells: List<Cell>): Array<CharArray>? {
+        val tpl = templates
+        if (tpl != null) {
+            val byTemplate = try {
+                Classifier.classify(cells, tpl)
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Template classification failed", e)
+                null
+            }
+            if (byTemplate != null && isPlausible(byTemplate)) return byTemplate
+        }
+        val free = try {
+            TemplateFreeClassifier.classify(cells)
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "Template-free classification failed", e)
+            null
+        }
+        return if (free != null && isPlausible(free)) free else null
+    }
 
+    /**
+     * Opportunistically builds templates when the frame shows the starting position
+     * ([Calibrator.fromCells] validates this), with white at the bottom or, failing that, with
+     * black at the bottom (the cells are then read in reverse order, which maps each screen
+     * square onto the matching square of a white-at-bottom starting position and preserves the
+     * square colours). Never required and never reported to the user: recognition already works
+     * without templates, this only improves accuracy for the current theme.
+     */
+    private fun learnTemplatesFromStartPosition(cells: List<Cell>) {
         var bottomIsWhite = true
         val result = try {
             Calibrator.fromCells(cells)
                 ?: Calibrator.fromCells(cells.asReversed())?.also { bottomIsWhite = false }
         } catch (e: RuntimeException) {
-            Log.e(TAG, "Auto-calibration crashed", e)
+            Log.e(TAG, "Template learning crashed", e)
             null
         }
-        if (result == null) {
-            postAutoCalibrationStatus(STATUS_SHOW_START)
-            return null
-        }
+        if (result == null) return
 
         templates = result
         templatesLoaded = true
         saveTemplates(result)
-        resetGameState()
+        // The starting position fixes the orientation; game tracking resyncs on its own when the
+        // start placement is read below.
         whiteAtBottom = bottomIsWhite
-        // The board is on screen; marking it visible keeps "Board calibrated!" from being
-        // immediately replaced by "Analyzing..." when this frame is processed below.
-        boardVisible = true
-        lastAutoCalibrationStatus = null
-        notifyCalibration(true, STATUS_CALIBRATED)
-        return result
+        orientationVotes = 0
+        Log.i(TAG, "Learnt piece templates from the starting position")
     }
 
-    /** Posts an auto-calibration hint, skipping repeats so the status is not spammed per frame. */
-    private fun postAutoCalibrationStatus(message: String) {
-        if (message == lastAutoCalibrationStatus) return
-        lastAutoCalibrationStatus = message
+    /** Posts a hint status, skipping repeats so the status is not spammed per frame. */
+    private fun postHintStatus(message: String) {
+        if (message == lastHintStatus) return
+        lastHintStatus = message
         postStatus(message)
     }
 
@@ -552,6 +585,7 @@ class AnalysisCoordinator(
         if (boardVisible && missedFrames >= MISSED_FRAMES_BEFORE_CLEAR) {
             boardVisible = false
             postOverlayClear()
+            lastHintStatus = STATUS_LOOKING
             postStatus(STATUS_LOOKING)
         }
     }

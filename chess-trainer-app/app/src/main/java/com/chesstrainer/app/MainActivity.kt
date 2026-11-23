@@ -284,6 +284,15 @@ class MainActivity : AppCompatActivity() {
         // Set after refreshUi() so the generic "Running" text doesn't overwrite it;
         // the coordinator replaces this via statusListener once it finds the board.
         setStatus("Looking for chess board...")
+
+        // Auto-open chess.com app
+        try {
+            val chessIntent = packageManager.getLaunchIntentForPackage("com.chess")
+            if (chessIntent != null) {
+                chessIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(chessIntent)
+            }
+        } catch (_: Exception) { }
     }
 
     // ---------------------------------------------------------------------------------------

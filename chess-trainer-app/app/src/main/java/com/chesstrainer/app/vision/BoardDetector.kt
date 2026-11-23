@@ -483,6 +483,461 @@ object Classifier {
 }
 
 // ---------------------------------------------------------------------------------------------
+// TemplateFreeClassifier
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Classifies board squares without templates, so recognition works from any position.
+ *
+ * Per cell:
+ *  1. **Occupancy**: count of feature bins that differ strongly from the square colour (corner
+ *     bins are ignored because chess.com draws coordinate labels there).
+ *  2. **Silhouette**: strong bins, morphologically closed and hole-filled. Filling matters for
+ *     white pieces on light squares, where only the dark outline differs from the background.
+ *  3. **Colour**: a bright percentile of the *absolute* luma inside the silhouette (the piece
+ *     fill), split into two groups by 2-means over all occupied squares. This is more robust
+ *     than the sign of the mean feature, which the dark outline can flip on light squares.
+ *  4. **Type**: shape metrics of the silhouette (top row, height, area, top-band width and
+ *     fill, upper-body width, waist, aspect, left-right asymmetry), scored against per-piece
+ *     prototypes with a normalized squared distance.
+ *
+ * Board-level checks then fix the least confident reads: no pawns on the first or last rank,
+ * exactly one king per side, at most 8 pawns per side.
+ *
+ * Prototype values are tuned for chess.com's default ("neo") pieces, but they rely on coarse
+ * silhouette proportions only, so similar sets should work too.
+ */
+object TemplateFreeClassifier {
+    private const val N = CellReader.FEATURE_SIZE
+
+    /** |feature| above which a bin counts as part of a piece (about 23 luma levels). */
+    private const val MASK_THRESHOLD = 0.09f
+
+    /** Side of the square corner patches ignored because of coordinate labels. */
+    private const val CORNER = 3
+
+    private const val MIN_STRONG_BINS = 10
+    private const val MIN_MEAN_ENERGY = 0.02f
+    private const val MIN_SILHOUETTE_BINS = 14
+    private const val MIN_COMPONENT_BINS = 3
+
+    private const val BODY_PERCENTILE = 0.65f
+    private const val DEFAULT_COLOR_THRESHOLD = 150f
+    private const val MIN_COLOR_SEPARATION = 40f
+    private const val MIN_COLOR_THRESHOLD = 70f
+    private const val MAX_COLOR_THRESHOLD = 210f
+
+    private const val MAX_PAWNS = 8
+
+    // Type indices; TYPE_CHARS maps them to (black) FEN letters.
+    private const val PAWN = 0
+    private const val KNIGHT = 1
+    private const val BISHOP = 2
+    private const val ROOK = 3
+    private const val QUEEN = 4
+    private const val KING = 5
+    private const val TYPE_COUNT = 6
+    private val TYPE_CHARS = charArrayOf('p', 'n', 'b', 'r', 'q', 'k')
+
+    // Shape metric indices.
+    private const val M_TOP = 0 // first silhouette row / N
+    private const val M_HEIGHT = 1 // silhouette rows / N
+    private const val M_AREA = 2 // silhouette bins / N^2
+    private const val M_TOP_SPAN = 3 // widest row in the top 20% / widest row overall
+    private const val M_TOP_FILL = 4 // fill ratio of the top 20% band
+    private const val M_UPPER_SPAN = 5 // mean width of 20%..45% band / widest row
+    private const val M_WAIST = 6 // narrowest row in 45%..80% band / widest row
+    private const val M_ASPECT = 7 // widest row / height
+    private const val M_ASYM = 8 // left-right mirror mismatch
+    private const val METRIC_COUNT = 9
+
+    /** Prototype means per type, metric order as above. */
+    private val PROTO_MEAN = arrayOf(
+        //            top   height area  topSp topFl upper waist aspect asym
+        floatArrayOf(0.22f, 0.72f, 0.28f, 0.45f, 0.75f, 0.55f, 0.45f, 0.80f, 0.06f), // pawn
+        floatArrayOf(0.04f, 0.95f, 0.45f, 0.55f, 0.65f, 0.75f, 0.65f, 0.85f, 0.28f), // knight
+        floatArrayOf(0.02f, 0.98f, 0.38f, 0.30f, 0.70f, 0.50f, 0.40f, 0.68f, 0.07f), // bishop
+        floatArrayOf(0.09f, 0.90f, 0.48f, 0.92f, 0.82f, 0.72f, 0.62f, 0.82f, 0.06f), // rook
+        floatArrayOf(0.02f, 0.98f, 0.48f, 0.88f, 0.55f, 0.65f, 0.45f, 0.85f, 0.07f), // queen
+        floatArrayOf(0.00f, 1.00f, 0.55f, 0.38f, 0.60f, 0.92f, 0.70f, 0.85f, 0.06f), // king
+    )
+
+    /** Tolerance per metric (shared by all types except knight asymmetry, which varies more). */
+    private val PROTO_SIGMA = floatArrayOf(0.07f, 0.08f, 0.08f, 0.15f, 0.15f, 0.12f, 0.12f, 0.12f, 0.07f)
+    private const val KNIGHT_ASYM_SIGMA = 0.12f
+
+    /** Per-square result before board-level validation. */
+    private class Reading(
+        val row: Int,
+        var white: Boolean,
+        /** Distance of the fill luma from the colour threshold (higher = surer). */
+        var colorConfidence: Float,
+        /** Distance to each type prototype (lower = better). */
+        val scores: FloatArray,
+        var type: Int,
+        val bodyLuma: Float,
+    )
+
+    /** Returns letters[row][col] in screen order (row 0 at top), '.' for empty squares. */
+    fun classify(cells: List<Cell>): Array<CharArray> {
+        require(cells.size == 64) { "Expected 64 cells, got ${cells.size}" }
+
+        val readings = arrayOfNulls<Reading>(64)
+        for (i in 0 until 64) readings[i] = readCell(cells[i], i / 8)
+        val occupied = readings.filterNotNull()
+
+        // Colour: split fill lumas into two clusters.
+        val threshold = colorThreshold(occupied.map { it.bodyLuma })
+        for (rd in occupied) {
+            rd.white = rd.bodyLuma > threshold
+            rd.colorConfidence = abs(rd.bodyLuma - threshold)
+        }
+
+        validate(occupied)
+
+        return Array(8) { r ->
+            CharArray(8) { c ->
+                val rd = readings[r * 8 + c]
+                if (rd == null) {
+                    '.'
+                } else {
+                    val ch = TYPE_CHARS[rd.type]
+                    if (rd.white) ch.uppercaseChar() else ch
+                }
+            }
+        }
+    }
+
+    // ---- per cell ----------------------------------------------------------------------
+
+    private fun isCorner(i: Int): Boolean {
+        val r = i / N
+        val c = i % N
+        val nearRowEdge = r < CORNER || r >= N - CORNER
+        val nearColEdge = c < CORNER || c >= N - CORNER
+        return nearRowEdge && nearColEdge
+    }
+
+    /** Returns null for an empty square. */
+    private fun readCell(cell: Cell, row: Int): Reading? {
+        val f = cell.features
+        if (f.size < N * N) return null
+
+        var strong = 0
+        var energy = 0f
+        var counted = 0
+        val mask = BooleanArray(N * N)
+        for (i in 0 until N * N) {
+            if (isCorner(i)) continue
+            val a = abs(f[i])
+            energy += a
+            counted++
+            if (a > MASK_THRESHOLD) {
+                mask[i] = true
+                strong++
+            }
+        }
+        if (strong < MIN_STRONG_BINS || energy / counted < MIN_MEAN_ENERGY) return null
+
+        val sil = silhouette(mask)
+        val silCount = sil.count { it }
+        if (silCount < MIN_SILHOUETTE_BINS) return null
+
+        val metrics = shapeMetrics(sil) ?: return null
+        val scores = FloatArray(TYPE_COUNT) { t -> distance(metrics, t) }
+        val backRank = row == 0 || row == 7
+        val type = bestType(scores, if (backRank) setOf(PAWN) else emptySet())
+
+        // Absolute luma of the piece fill: a bright percentile inside the silhouette, so the
+        // dark outline (present on both colours) does not dominate.
+        val lumas = FloatArray(silCount)
+        var k = 0
+        for (i in 0 until N * N) if (sil[i]) lumas[k++] = f[i] * 255f + cell.background
+        lumas.sort()
+        val body = lumas[((silCount - 1) * BODY_PERCENTILE).roundToInt()]
+
+        return Reading(row, white = true, colorConfidence = 0f, scores = scores, type = type, bodyLuma = body)
+    }
+
+    /** Closing (dilate, fill holes, erode), unioned with the hole-filled raw mask. */
+    private fun silhouette(mask: BooleanArray): BooleanArray {
+        val direct = fillHoles(mask)
+        val closed = erode(fillHoles(dilate(mask)))
+        val out = BooleanArray(N * N) { direct[it] || closed[it] }
+        return removeSmallComponents(out)
+    }
+
+    private fun dilate(m: BooleanArray): BooleanArray = BooleanArray(N * N) { i ->
+        val r = i / N
+        val c = i % N
+        m[i] || (r > 0 && m[i - N]) || (r < N - 1 && m[i + N]) ||
+            (c > 0 && m[i - 1]) || (c < N - 1 && m[i + 1])
+    }
+
+    /** Erosion that ignores out-of-grid neighbours (pieces may be clipped by the grid edge). */
+    private fun erode(m: BooleanArray): BooleanArray = BooleanArray(N * N) { i ->
+        val r = i / N
+        val c = i % N
+        m[i] && (r == 0 || m[i - N]) && (r == N - 1 || m[i + N]) &&
+            (c == 0 || m[i - 1]) && (c == N - 1 || m[i + 1])
+    }
+
+    /** Everything not 4-connected to the grid border through background becomes foreground. */
+    private fun fillHoles(m: BooleanArray): BooleanArray {
+        val outside = BooleanArray(N * N)
+        val stack = IntArray(N * N)
+        var sp = 0
+        for (i in 0 until N * N) {
+            val r = i / N
+            val c = i % N
+            if ((r == 0 || r == N - 1 || c == 0 || c == N - 1) && !m[i]) {
+                outside[i] = true
+                stack[sp++] = i
+            }
+        }
+        while (sp > 0) {
+            val i = stack[--sp]
+            val r = i / N
+            val c = i % N
+            if (r > 0) sp = visit(i - N, m, outside, stack, sp)
+            if (r < N - 1) sp = visit(i + N, m, outside, stack, sp)
+            if (c > 0) sp = visit(i - 1, m, outside, stack, sp)
+            if (c < N - 1) sp = visit(i + 1, m, outside, stack, sp)
+        }
+        return BooleanArray(N * N) { !outside[it] }
+    }
+
+    private fun visit(j: Int, m: BooleanArray, seen: BooleanArray, stack: IntArray, sp: Int): Int {
+        if (m[j] || seen[j]) return sp
+        seen[j] = true
+        stack[sp] = j
+        return sp + 1
+    }
+
+    /** Drops 8-connected specks (label remnants, noise); the largest component is always kept. */
+    private fun removeSmallComponents(m: BooleanArray): BooleanArray {
+        val label = IntArray(N * N) { -1 }
+        val sizes = ArrayList<Int>()
+        val stack = IntArray(N * N)
+        for (start in 0 until N * N) {
+            if (!m[start] || label[start] >= 0) continue
+            val id = sizes.size
+            var size = 0
+            var sp = 0
+            label[start] = id
+            stack[sp++] = start
+            while (sp > 0) {
+                val i = stack[--sp]
+                size++
+                val r = i / N
+                val c = i % N
+                for (dr in -1..1) for (dc in -1..1) {
+                    val rr = r + dr
+                    val cc = c + dc
+                    if (rr !in 0 until N || cc !in 0 until N) continue
+                    val j = rr * N + cc
+                    if (m[j] && label[j] < 0) {
+                        label[j] = id
+                        stack[sp++] = j
+                    }
+                }
+            }
+            sizes.add(size)
+        }
+        if (sizes.isEmpty()) return m
+        val largest = sizes.indices.maxByOrNull { sizes[it] } ?: 0
+        return BooleanArray(N * N) { i ->
+            val id = label[i]
+            id >= 0 && (id == largest || sizes[id] >= MIN_COMPONENT_BINS)
+        }
+    }
+
+    private fun shapeMetrics(sil: BooleanArray): FloatArray? {
+        val left = IntArray(N) { -1 }
+        val right = IntArray(N) { -1 }
+        val rowCount = IntArray(N)
+        var count = 0
+        for (r in 0 until N) for (c in 0 until N) {
+            if (!sil[r * N + c]) continue
+            count++
+            rowCount[r]++
+            if (left[r] < 0) left[r] = c
+            right[r] = c
+        }
+        if (count == 0) return null
+        val top = (0 until N).first { rowCount[it] > 0 }
+        val bottom = (0 until N).last { rowCount[it] > 0 }
+        val h = bottom - top + 1
+
+        fun span(r: Int): Int = if (rowCount[r] > 0) right[r] - left[r] + 1 else 0
+        var maxSpan = 1
+        for (r in top..bottom) maxSpan = max(maxSpan, span(r))
+
+        fun bandStart(frac: Float): Int = min(bottom, top + (h * frac).roundToInt())
+
+        // Top band: first 20% of the piece's rows (at least one row).
+        val topEnd = max(top, bandStart(0.2f) - 1)
+        var topSpanMax = 0
+        var topCount = 0
+        for (r in top..topEnd) {
+            topSpanMax = max(topSpanMax, span(r))
+            topCount += rowCount[r]
+        }
+        val topRows = topEnd - top + 1
+        val topFill = if (topSpanMax > 0) topCount.toFloat() / (topRows * topSpanMax) else 0f
+
+        // Upper body: 20%..45%.
+        val upFrom = bandStart(0.2f)
+        val upTo = max(upFrom, bandStart(0.45f) - 1)
+        var upSum = 0f
+        for (r in upFrom..upTo) upSum += span(r)
+        val upperSpan = upSum / (upTo - upFrom + 1) / maxSpan
+
+        // Waist: narrowest non-empty row in 45%..80%.
+        val wFrom = bandStart(0.45f)
+        val wTo = max(wFrom, bandStart(0.8f) - 1)
+        var waist = maxSpan
+        for (r in wFrom..wTo) {
+            val s = span(r)
+            if (s > 0) waist = min(waist, s)
+        }
+
+        // Asymmetry: mirror about the bounding-box centre (tolerates small grid offsets).
+        var lo = N
+        var hi = -1
+        for (r in top..bottom) {
+            if (rowCount[r] == 0) continue
+            lo = min(lo, left[r])
+            hi = max(hi, right[r])
+        }
+        var mismatch = 0
+        for (r in top..bottom) for (c in 0 until N) {
+            if (!sil[r * N + c]) continue
+            val m = lo + hi - c
+            if (m !in 0 until N || !sil[r * N + m]) mismatch++
+        }
+
+        val out = FloatArray(METRIC_COUNT)
+        out[M_TOP] = top.toFloat() / N
+        out[M_HEIGHT] = h.toFloat() / N
+        out[M_AREA] = count.toFloat() / (N * N)
+        out[M_TOP_SPAN] = topSpanMax.toFloat() / maxSpan
+        out[M_TOP_FILL] = topFill
+        out[M_UPPER_SPAN] = upperSpan
+        out[M_WAIST] = waist.toFloat() / maxSpan
+        out[M_ASPECT] = maxSpan.toFloat() / h
+        out[M_ASYM] = mismatch.toFloat() / count
+        return out
+    }
+
+    private fun distance(metrics: FloatArray, type: Int): Float {
+        val mean = PROTO_MEAN[type]
+        var d = 0f
+        for (m in 0 until METRIC_COUNT) {
+            val sigma = if (type == KNIGHT && m == M_ASYM) KNIGHT_ASYM_SIGMA else PROTO_SIGMA[m]
+            val z = (metrics[m] - mean[m]) / sigma
+            d += z * z
+        }
+        return d
+    }
+
+    private fun bestType(scores: FloatArray, excluded: Set<Int>): Int {
+        var best = -1
+        for (t in 0 until TYPE_COUNT) {
+            if (t in excluded) continue
+            if (best < 0 || scores[t] < scores[best]) best = t
+        }
+        return if (best < 0) QUEEN else best
+    }
+
+    /** How much better [type] is than the best alternative (positive = [type] preferred). */
+    private fun margin(rd: Reading, type: Int): Float {
+        val excluded = if (rd.row == 0 || rd.row == 7) setOf(PAWN, type) else setOf(type)
+        return rd.scores[bestType(rd.scores, excluded)] - rd.scores[type]
+    }
+
+    private fun excludedFor(rd: Reading, vararg extra: Int): Set<Int> {
+        val s = extra.toMutableSet()
+        if (rd.row == 0 || rd.row == 7) s.add(PAWN)
+        return s
+    }
+
+    // ---- board level -------------------------------------------------------------------
+
+    /** Two-means threshold between the white and black fill lumas. */
+    private fun colorThreshold(values: List<Float>): Float {
+        if (values.size < 2) return DEFAULT_COLOR_THRESHOLD
+        var lo = values.minOrNull() ?: return DEFAULT_COLOR_THRESHOLD
+        var hi = values.maxOrNull() ?: return DEFAULT_COLOR_THRESHOLD
+        if (hi - lo < MIN_COLOR_SEPARATION) return DEFAULT_COLOR_THRESHOLD
+        repeat(12) {
+            val t = (lo + hi) / 2f
+            val low = values.filter { it <= t }
+            val high = values.filter { it > t }
+            if (low.isEmpty() || high.isEmpty()) return@repeat
+            lo = low.average().toFloat()
+            hi = high.average().toFloat()
+        }
+        if (hi - lo < MIN_COLOR_SEPARATION) return DEFAULT_COLOR_THRESHOLD
+        return ((lo + hi) / 2f).coerceIn(MIN_COLOR_THRESHOLD, MAX_COLOR_THRESHOLD)
+    }
+
+    private fun validate(pieces: List<Reading>) {
+        // Pawns can never stand on the first or last rank (screen rows 0 and 7 in either
+        // orientation); readCell already excluded them there, this is a safety net.
+        for (rd in pieces) {
+            if (rd.type == PAWN && (rd.row == 0 || rd.row == 7)) {
+                rd.type = bestType(rd.scores, setOf(PAWN))
+            }
+        }
+
+        // Two kings of one colour and none of the other: the less certain one has the wrong colour.
+        for (white in listOf(true, false)) {
+            val own = pieces.filter { it.type == KING && it.white == white }
+            val other = pieces.filter { it.type == KING && it.white != white }
+            if (own.size >= 2 && other.isEmpty()) {
+                val flip = own.minByOrNull { it.colorConfidence } ?: continue
+                flip.white = !white
+            }
+        }
+
+        for (white in listOf(true, false)) {
+            val side = pieces.filter { it.white == white }
+            if (side.isEmpty()) continue
+            fixKings(side)
+            fixPawns(side)
+        }
+    }
+
+    private fun fixKings(side: List<Reading>) {
+        val kings = side.filter { it.type == KING }
+        when {
+            kings.isEmpty() -> {
+                // Promote the piece for which "king" costs the least relative to its current read.
+                val pick = side.minByOrNull { it.scores[KING] - it.scores[it.type] } ?: return
+                pick.type = KING
+            }
+            kings.size > 1 -> {
+                val keep = kings.maxByOrNull { margin(it, KING) } ?: return
+                for (k in kings) {
+                    if (k !== keep) k.type = bestType(k.scores, excludedFor(k, KING))
+                }
+            }
+        }
+    }
+
+    private fun fixPawns(side: List<Reading>) {
+        val pawns = side.filter { it.type == PAWN }
+        if (pawns.size <= MAX_PAWNS) return
+        val leastSure = pawns.sortedBy { margin(it, PAWN) }
+        for (i in 0 until pawns.size - MAX_PAWNS) {
+            val rd = leastSure[i]
+            rd.type = bestType(rd.scores, setOf(PAWN, KING))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Calibrator
 // ---------------------------------------------------------------------------------------------
 
@@ -633,15 +1088,19 @@ object Fen {
 // ChessScreenReader
 // ---------------------------------------------------------------------------------------------
 
-/** Entry point: screenshot in, FEN out. */
-class ChessScreenReader(private val templates: Templates) {
+/**
+ * Entry point: screenshot in, FEN out. Uses [templates] when given, otherwise the
+ * [TemplateFreeClassifier], so no setup is required.
+ */
+class ChessScreenReader(private val templates: Templates? = null) {
 
     /** Returns the FEN of the board in [bitmap], or null if no board was found. */
     fun read(bitmap: Bitmap, whiteToMove: Boolean = true): String? {
         val px = Pixels(bitmap)
         val grid = BoardLocator.locate(px) ?: return null
         val cells = CellReader.read(px, grid)
-        val letters = Classifier.classify(cells, templates)
+        val tpl = templates
+        val letters = if (tpl != null) Classifier.classify(cells, tpl) else TemplateFreeClassifier.classify(cells)
         val whiteBottom = Orientation.whiteAtBottom(letters)
         return Fen.build(letters, whiteBottom, whiteToMove)
     }
