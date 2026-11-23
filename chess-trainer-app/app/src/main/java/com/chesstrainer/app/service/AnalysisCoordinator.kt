@@ -16,6 +16,8 @@ import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.ui.MoveColors
 import com.chesstrainer.app.ui.OverlayService
 import com.chesstrainer.app.vision.BoardLocator
+import com.chesstrainer.app.vision.Calibrator
+import com.chesstrainer.app.vision.Cell
 import com.chesstrainer.app.vision.CellReader
 import com.chesstrainer.app.vision.ChessScreenReader
 import com.chesstrainer.app.vision.Classifier
@@ -91,6 +93,12 @@ class AnalysisCoordinator(
         private const val BOUNDS_EPSILON = 0.004f
 
         private const val WORKER_KEEP_ALIVE_SECONDS = 30L
+
+        // User-facing status messages. Users should never need to know about "calibration".
+        private const val STATUS_LOOKING = "Looking for chess board..."
+        private const val STATUS_SHOW_START = "Board found — show starting position"
+        private const val STATUS_CALIBRATED = "Board calibrated!"
+        private const val STATUS_ANALYZING = "Analyzing..."
 
         private const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
         private const val EMPTY = '.'
@@ -206,6 +214,9 @@ class AnalysisCoordinator(
 
     private var templatesLoaded = false
 
+    /** Last hint posted while waiting for auto-calibration; used to avoid repeating it. */
+    private var lastAutoCalibrationStatus: String? = null
+
     /** Locked board orientation; null until the first board was read. */
     private var whiteAtBottom: Boolean? = null
     private var orientationVotes = 0
@@ -297,7 +308,7 @@ class AnalysisCoordinator(
     /** Calibrates from the next captured frame (requires [start] to have been called). */
     fun requestCalibration() {
         calibrationRequested.set(true)
-        postStatus("Calibrating from the next frame…")
+        postStatus("Reading the board…")
     }
 
     /** Deletes the stored templates; recognition is paused until calibrated again. */
@@ -308,6 +319,9 @@ class AnalysisCoordinator(
             AtomicFile(File(appContext.filesDir, TEMPLATES_FILE)).delete()
             resetGameState()
             postOverlayClear()
+            // Recognition resumes automatically once the starting position is seen again.
+            lastAutoCalibrationStatus = STATUS_LOOKING
+            postStatus(STATUS_LOOKING)
         }
     }
 
@@ -319,7 +333,7 @@ class AnalysisCoordinator(
             null
         }
         if (result == null) {
-            notifyCalibration(false, "Calibration failed: show the starting position with white at the bottom")
+            notifyCalibration(false, "Show the starting position with white at the bottom")
             return
         }
         templates = result
@@ -328,7 +342,8 @@ class AnalysisCoordinator(
         resetGameState()
         // Calibration requires white at the bottom and the initial position on screen.
         whiteAtBottom = true
-        notifyCalibration(true, "Calibration saved")
+        lastAutoCalibrationStatus = null
+        notifyCalibration(true, STATUS_CALIBRATED)
     }
 
     private fun ensureTemplatesLoaded() {
@@ -341,7 +356,8 @@ class AnalysisCoordinator(
         } catch (e: IOException) {
             null
         }
-        postStatus(if (templates != null) "Calibration loaded" else "Not calibrated: press Calibrate")
+        if (templates == null) lastAutoCalibrationStatus = STATUS_LOOKING
+        postStatus(STATUS_LOOKING)
     }
 
     private fun saveTemplates(t: Templates) {
@@ -444,22 +460,25 @@ class AnalysisCoordinator(
     private fun processFrame(bitmap: Bitmap) {
         if (!running.get()) return
         ensureTemplatesLoaded()
-        val tpl = templates ?: return
 
         val px = Pixels(bitmap)
         val grid = BoardLocator.locate(px)
         if (grid == null) {
             onBoardMissing()
+            if (templates == null) postAutoCalibrationStatus(STATUS_LOOKING)
             return
         }
 
-        val letters = Classifier.classify(CellReader.read(px, grid), tpl)
+        val cells = CellReader.read(px, grid)
+        val tpl = templates ?: autoCalibrate(cells, grid, px, bitmap) ?: return
+
+        val letters = Classifier.classify(cells, tpl)
         if (!isPlausible(letters)) return
 
         missedFrames = 0
         if (!boardVisible) {
             boardVisible = true
-            postStatus("Board detected")
+            postStatus(STATUS_ANALYZING)
         }
         updateBoardBounds(grid, px, bitmap)
 
@@ -478,6 +497,54 @@ class AnalysisCoordinator(
         onPositionChanged(placement)
     }
 
+    /**
+     * Tries to build templates from a frame in which a board grid was found but no templates exist
+     * yet. Succeeds only when the frame shows the starting position ([Calibrator.fromCells]
+     * validates this), with white at the bottom or, failing that, with black at the bottom (the
+     * cells are then read in reverse order, which maps each screen square onto the matching
+     * square of a white-at-bottom starting position and preserves the square colours).
+     *
+     * The board bounds are pushed to the overlay either way so it knows where the board is.
+     *
+     * @return the new templates, or null if this frame could not be used.
+     */
+    private fun autoCalibrate(cells: List<Cell>, grid: Grid, px: Pixels, bitmap: Bitmap): Templates? {
+        missedFrames = 0
+        updateBoardBounds(grid, px, bitmap)
+
+        var bottomIsWhite = true
+        val result = try {
+            Calibrator.fromCells(cells)
+                ?: Calibrator.fromCells(cells.asReversed())?.also { bottomIsWhite = false }
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "Auto-calibration crashed", e)
+            null
+        }
+        if (result == null) {
+            postAutoCalibrationStatus(STATUS_SHOW_START)
+            return null
+        }
+
+        templates = result
+        templatesLoaded = true
+        saveTemplates(result)
+        resetGameState()
+        whiteAtBottom = bottomIsWhite
+        // The board is on screen; marking it visible keeps "Board calibrated!" from being
+        // immediately replaced by "Analyzing..." when this frame is processed below.
+        boardVisible = true
+        lastAutoCalibrationStatus = null
+        notifyCalibration(true, STATUS_CALIBRATED)
+        return result
+    }
+
+    /** Posts an auto-calibration hint, skipping repeats so the status is not spammed per frame. */
+    private fun postAutoCalibrationStatus(message: String) {
+        if (message == lastAutoCalibrationStatus) return
+        lastAutoCalibrationStatus = message
+        postStatus(message)
+    }
+
     private fun onBoardMissing() {
         candidatePlacement = null
         candidateCount = 0
@@ -485,7 +552,7 @@ class AnalysisCoordinator(
         if (boardVisible && missedFrames >= MISSED_FRAMES_BEFORE_CLEAR) {
             boardVisible = false
             postOverlayClear()
-            postStatus("Board not visible")
+            postStatus(STATUS_LOOKING)
         }
     }
 

@@ -158,12 +158,27 @@ class MainActivity : AppCompatActivity() {
         stopButton = button(getString(R.string.stop), R.color.accent_red) { onStopClicked() }
         root.addView(stopButton, matchWrap().apply { topMargin = dp(12f) })
 
-        calibrateButton = button("Calibrate", R.color.accent_blue) { onCalibrateClicked() }
-        root.addView(calibrateButton, matchWrap().apply { topMargin = dp(12f) })
+        // Secondary fallback: calibration normally happens automatically.
+        calibrateButton = button("Re-calibrate", R.color.accent_blue) { onCalibrateClicked() }.apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            minHeight = dp(40f)
+            minimumHeight = dp(40f)
+        }
+        root.addView(
+            calibrateButton,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                topMargin = dp(24f)
+                gravity = Gravity.CENTER_HORIZONTAL
+            },
+        )
 
         val hint = TextView(this).apply {
-            text = "Calibrate: open your chess app with a board in the starting position. " +
-                "A screenshot is taken after a short countdown and used to learn the board layout."
+            text = "Start the service, then open your chess app. The board is detected " +
+                "automatically when you show the starting position. " +
+                "Use Re-calibrate if detection isn't working."
             setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.CENTER
@@ -200,8 +215,8 @@ class MainActivity : AppCompatActivity() {
     private fun refreshUi() {
         if (calibrationTimer == null) {
             setStatus(
-                if (running) "${getString(R.string.status_running)} — switch to your chess app"
-                else getString(R.string.status_idle)
+                if (running) "Running — open your chess app"
+                else "Press Start, then open your chess app"
             )
         }
         startButton.isEnabled = !running
@@ -266,6 +281,9 @@ class MainActivity : AppCompatActivity() {
 
         running = true
         refreshUi()
+        // Set after refreshUi() so the generic "Running" text doesn't overwrite it;
+        // the coordinator replaces this via statusListener once it finds the board.
+        setStatus("Looking for chess board...")
     }
 
     // ---------------------------------------------------------------------------------------
