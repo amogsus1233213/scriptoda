@@ -1,10 +1,8 @@
 package com.chesstrainer.app.service
 
 import android.content.Context
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.RectF
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.AtomicFile
@@ -13,6 +11,7 @@ import com.chesstrainer.app.engine.AnalysisResult
 import com.chesstrainer.app.engine.ClassifiedMove
 import com.chesstrainer.app.engine.MoveClassifier
 import com.chesstrainer.app.engine.MoveCommentary
+import com.chesstrainer.app.engine.StockfishBinaryExtractor
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.service.AccessibilityData
 import com.chesstrainer.app.service.FenConverter
@@ -79,18 +78,6 @@ class AnalysisCoordinator(
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 5
 
-        /** Name of the engine binary in the assets folder. */
-        const val STOCKFISH_ASSET = "stockfish"
-
-        /**
-         * Optional alternative packaging: the binary shipped as `jniLibs/<abi>/libstockfish.so`.
-         * Android 10+ refuses to execute files from app-writable storage for targetSdk >= 29, so
-         * the native library directory is preferred whenever the binary is found there.
-         */
-        private const val STOCKFISH_NATIVE_LIB = "libstockfish.so"
-
-        private const val PREFS_NAME = "chess_trainer_coordinator"
-        private const val KEY_BINARY_STAMP = "stockfish_binary_stamp"
         private const val TEMPLATES_FILE = "board_templates.txt"
 
         /** Consecutive identical reads required before a placement is trusted. */
@@ -134,72 +121,6 @@ class AnalysisCoordinator(
 
         private const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
         private const val EMPTY = '.'
-
-        private val binaryLock = Any()
-
-        /**
-         * Returns an executable Stockfish binary, copying `assets/stockfish` into the app's
-         * internal files directory on first run (and again after every app update).
-         *
-         * @return the binary, or null if it is neither packaged as a native library nor present
-         *   in the assets.
-         */
-        fun prepareStockfishBinary(context: Context): File? = synchronized(binaryLock) {
-            val appContext = context.applicationContext
-
-            val nativeDir = appContext.applicationInfo.nativeLibraryDir
-            if (nativeDir != null) {
-                val native = File(nativeDir, STOCKFISH_NATIVE_LIB)
-                if (native.isFile) return native
-            }
-
-            val target = File(appContext.filesDir, STOCKFISH_ASSET)
-            val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val stamp = installStamp(appContext)
-            if (target.isFile && target.length() > 0 && prefs.getLong(KEY_BINARY_STAMP, -1L) == stamp) {
-                if (!target.canExecute()) target.setExecutable(true, true)
-                return target
-            }
-
-            val tmp = File(appContext.filesDir, "$STOCKFISH_ASSET.tmp")
-            try {
-                appContext.assets.open(STOCKFISH_ASSET).use { input ->
-                    FileOutputStream(tmp).use { output ->
-                        input.copyTo(output)
-                        output.fd.sync()
-                    }
-                }
-                if (target.exists() && !target.delete()) {
-                    Log.w(TAG, "Could not delete stale engine binary")
-                }
-                if (!tmp.renameTo(target)) {
-                    tmp.copyTo(target, overwrite = true)
-                    tmp.delete()
-                }
-                if (!target.setExecutable(true, true)) {
-                    Log.w(TAG, "Could not mark engine binary executable")
-                }
-                prefs.edit().putLong(KEY_BINARY_STAMP, stamp).apply()
-                return target
-            } catch (e: IOException) {
-                Log.e(TAG, "Stockfish binary missing from assets/$STOCKFISH_ASSET", e)
-                tmp.delete()
-                return if (target.isFile && target.length() > 0) target else null
-            }
-        }
-
-        private fun installStamp(context: Context): Long = try {
-            val pm = context.packageManager
-            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(context.packageName, 0)
-            }
-            info.lastUpdateTime
-        } catch (e: PackageManager.NameNotFoundException) {
-            0L
-        }
     }
 
     // -------------------------------------------------------------------------------------
@@ -428,7 +349,7 @@ class AnalysisCoordinator(
 
     private fun initEngine() {
         if (engine != null) return
-        val binary = prepareStockfishBinary(appContext)
+        val binary = StockfishBinaryExtractor.extractBinary(appContext)
         if (binary == null) {
             postStatus("Stockfish binary not found")
             return
