@@ -155,6 +155,8 @@ class AnalysisCoordinator(
 
         /** Accessibility positions older than this are ignored in favour of vision. */
         private const val ACCESSIBILITY_MAX_AGE_MS = 2000L
+        /** Longer timeout while the chess app is still visible (avoids vision reading our own arrows). */
+        private const val ACCESSIBILITY_MAX_AGE_VISIBLE_MS = 30_000L
 
         /** Minimum number of accessibility-reported pieces for the data to be trusted. */
         private const val ACCESSIBILITY_MIN_PIECES = 3
@@ -470,7 +472,7 @@ class AnalysisCoordinator(
             // The accessibility squares are absolute, so the screen orientation (needed to draw
             // the arrows) must come from elsewhere: the accessibility service when it can tell,
             // otherwise a cross-check against this frame (see processAccessibilityPositions).
-            val reportedOrientation = AccessibilityData.userPlaysWhite ?: AccessibilityData.detectedWhiteAtBottom
+            val reportedOrientation = AccessibilityData.userPlaysWhite
             // A failed copy only costs the bounds refresh; previously known bounds are reused.
             val frame = copyBitmap(bitmap)
             val accepted = submit {
@@ -619,8 +621,10 @@ class AnalysisCoordinator(
      * otherwise null (the vision pipeline is used instead).
      */
     private fun freshAccessibilityPositions(): Map<String, Char>? {
-        if (!AccessibilityData.isRecent(ACCESSIBILITY_MAX_AGE_MS)) return null
-        val positions = AccessibilityData.detectedPositions ?: return null
+        val maxAge = if (AccessibilityData.targetPackageVisible) ACCESSIBILITY_MAX_AGE_VISIBLE_MS
+                     else ACCESSIBILITY_MAX_AGE_MS
+        if (!AccessibilityData.isRecent(maxAge)) return null
+        val positions = AccessibilityData.lastStablePositions ?: AccessibilityData.detectedPositions ?: return null
         return if (positions.size >= ACCESSIBILITY_MIN_PIECES) positions else null
     }
 
@@ -721,7 +725,7 @@ class AnalysisCoordinator(
     ) {
         if (reportedOrientation != null) {
             crossCheckContrary = 0
-            setOrientation(reportedOrientation, CONFIDENCE_HIGH, "accessibility service")
+            setOrientation(reportedOrientation, CONFIDENCE_HIGH, "accessibility service", absolute = true)
             return
         }
         if (board == null) return
@@ -735,7 +739,7 @@ class AnalysisCoordinator(
             if (crossCheckContrary < CROSS_CHECK_SWITCH_FRAMES) return
         }
         crossCheckContrary = 0
-        setOrientation(seen, CONFIDENCE_HIGH, "screen cross-check of accessibility data")
+        setOrientation(seen, CONFIDENCE_HIGH, "screen cross-check of accessibility data", absolute = true)
         crossCheckedPlacement = placement
     }
 
@@ -967,7 +971,7 @@ class AnalysisCoordinator(
      * orientation and the arrows on screen are drawn rotated. Tracking is then reset (it resyncs
      * from the next read) and the overlay cleared at once.
      */
-    private fun setOrientation(bottomIsWhite: Boolean, confidence: Int, reason: String) {
+    private fun setOrientation(bottomIsWhite: Boolean, confidence: Int, reason: String, absolute: Boolean = false) {
         val drawnBefore = whiteAtBottom ?: true
         val wasUnset = whiteAtBottom == null
         whiteAtBottom = bottomIsWhite
@@ -977,8 +981,15 @@ class AnalysisCoordinator(
             Log.i(TAG, "Board orientation changed: white at bottom = $bottomIsWhite ($reason)")
             crossCheckContrary = 0
             crossCheckedPlacement = null
-            resetTracking()
-            postOverlayClear()
+            if (absolute) {
+                // Accessibility placements are absolute (not rotated), so tracking state is still
+                // valid — just redraw the arrows with the new orientation.
+                val analyses = currentAnalyses
+                if (analyses != null) render() else postOverlayClear()
+            } else {
+                resetTracking()
+                postOverlayClear()
+            }
         } else if (wasUnset) {
             Log.i(TAG, "Board orientation: white at bottom = $bottomIsWhite ($reason)")
         }
@@ -1118,10 +1129,15 @@ class AnalysisCoordinator(
         EngineStats.movesAnalyzed++
         EngineStats.lastFen = newFen
         EngineStats.whiteAtBottom = whiteAtBottom
-        newAnalyses?.firstOrNull()?.let { best ->
+        val best = newAnalyses?.firstOrNull()
+        if (best != null) {
             EngineStats.currentDepth = best.depth
             EngineStats.currentEvalCp = best.eval
             EngineStats.currentMateIn = best.mate
+        } else {
+            EngineStats.currentDepth = 0
+            EngineStats.currentEvalCp = null
+            EngineStats.currentMateIn = null
         }
         render()
     }
@@ -1132,11 +1148,11 @@ class AnalysisCoordinator(
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
         if (whiteToMove != (whiteAtBottom ?: true)) {
-            // Opponent's turn: skip analysis, just track the position and hide arrows.
             previousFen = null
             previousAnalysis = null
             currentFen = fen
             currentAnalyses = null
+            lastKnownGoodFen = fen
             lastMove = null
             lastClassified = null
             postOverlayClear()
@@ -1154,10 +1170,15 @@ class AnalysisCoordinator(
         EngineStats.positionsSeen++
         EngineStats.lastFen = fen
         EngineStats.whiteAtBottom = whiteAtBottom
-        analyses?.firstOrNull()?.let { best ->
+        val best = analyses?.firstOrNull()
+        if (best != null) {
             EngineStats.currentDepth = best.depth
             EngineStats.currentEvalCp = best.eval
             EngineStats.currentMateIn = best.mate
+        } else {
+            EngineStats.currentDepth = 0
+            EngineStats.currentEvalCp = null
+            EngineStats.currentMateIn = null
         }
         render()
     }

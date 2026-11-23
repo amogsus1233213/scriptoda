@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
             "Board found — reading pieces...",
             "Board recognized",
             "Analyzing...",
+            "Engine is calculating...",
         )
     }
 

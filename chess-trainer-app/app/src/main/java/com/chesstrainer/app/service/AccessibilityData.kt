@@ -82,6 +82,8 @@ object AccessibilityData {
     fun onTargetLeft() {
         targetPackageVisible = false
         userPlaysWhite = null
+        detectedWhiteAtBottom = null
+        lastUpdateTime = 0L
     }
 
     fun isRecent(maxAgeMs: Long = 2000): Boolean {
