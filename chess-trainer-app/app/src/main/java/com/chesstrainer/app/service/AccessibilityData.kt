@@ -1,8 +1,17 @@
 package com.chesstrainer.app.service
 
+/**
+ * Board state published by [BoardAccessibilityService] for [AnalysisCoordinator]. It is written
+ * on the main thread and read from analysis threads.
+ */
 object AccessibilityData {
     @Volatile var lastViewDump: String = ""
     @Volatile var detectedPositions: Map<String, Char>? = null
+
+    /**
+     * Last time a read confirmed [detectedPositions], changed or not. Unchanged reads refresh it
+     * too (see [confirm]), so a position that stays on screen does not go stale in [isRecent].
+     */
     @Volatile var lastUpdateTime: Long = 0L
     @Volatile var targetPackageVisible: Boolean = false
 
@@ -11,6 +20,11 @@ object AccessibilityData {
      * service can tell; null when unknown. [AnalysisCoordinator] treats a non-null value as
      * authoritative over vision-based orientation detection, so it must be reset to null as soon
      * as it can no longer be vouched for (e.g. a new game starts or the chess app is left).
+     *
+     * [BoardAccessibilityService] sets it from the orientation read from the tree
+     * ([BoardPositionParser.ParseResult.whiteAtBottom]) once that has been the same on two
+     * consecutive reads. It assumes the user's side is drawn at the bottom, which is chess.com's
+     * default unless the board is flipped by hand.
      */
     @Volatile var userPlaysWhite: Boolean? = null
 
@@ -22,10 +36,52 @@ object AccessibilityData {
      */
     @Volatile var detectedWhiteAtBottom: Boolean? = null
 
+    /**
+     * Last positions that were read identically on at least two consecutive reads. Unlike
+     * [detectedPositions], this skips the in-between states seen while a piece animates or is
+     * dragged.
+     */
+    @Volatile var lastStablePositions: Map<String, Char>? = null
+        private set
+
+    /** How many times [detectedPositions] changed since the last [clear] (for debugging). */
+    @Volatile var positionChangeCount: Int = 0
+        private set
+
+    /**
+     * Publishes a read. [detectedPositions] is only replaced, and [positionChangeCount] only
+     * bumped, when the positions differ. For reads known to be unchanged, use [confirm].
+     */
+    @Synchronized
     fun update(positions: Map<String, Char>?, whiteAtBottom: Boolean? = null) {
+        if (positions != detectedPositions) {
+            detectedPositions = positions
+            positionChangeCount++
+        }
         detectedWhiteAtBottom = whiteAtBottom
-        detectedPositions = positions
         lastUpdateTime = System.currentTimeMillis()
+    }
+
+    /**
+     * Records a read that found [detectedPositions] unchanged. It keeps them fresh for
+     * [isRecent] and refreshes the orientation, which changes without the position changing
+     * when the board is flipped.
+     */
+    @Synchronized
+    fun confirm(whiteAtBottom: Boolean?) {
+        detectedWhiteAtBottom = whiteAtBottom
+        lastUpdateTime = System.currentTimeMillis()
+    }
+
+    /** Records [positions] as read identically on consecutive reads. */
+    fun markStable(positions: Map<String, Char>) {
+        lastStablePositions = positions
+    }
+
+    /** The chess app is no longer in front, so the side the user plays can't be vouched for. */
+    fun onTargetLeft() {
+        targetPackageVisible = false
+        userPlaysWhite = null
     }
 
     fun isRecent(maxAgeMs: Long = 2000): Boolean {
@@ -33,9 +89,12 @@ object AccessibilityData {
             System.currentTimeMillis() - lastUpdateTime < maxAgeMs
     }
 
+    @Synchronized
     fun clear() {
         detectedPositions = null
         detectedWhiteAtBottom = null
+        lastStablePositions = null
+        positionChangeCount = 0
         lastViewDump = ""
         lastUpdateTime = 0L
         targetPackageVisible = false
