@@ -45,9 +45,14 @@ object MoveCommentary {
         if (piece == EMPTY) return ""
 
         val moverIsWhite = piece.isUpperCase()
-        val captured = board[to].takeIf { it != EMPTY }
-        val isCapture = captured != null
         val kind = piece.lowercaseChar()
+        // En passant: a pawn moving diagonally onto an empty square captures the enemy pawn.
+        val isEnPassant = kind == 'p' && from % 8 != to % 8 && board[to] == EMPTY
+        val captured = when {
+            isEnPassant -> if (moverIsWhite) 'p' else 'P'
+            else -> board[to].takeIf { it != EMPTY }
+        }
+        val isCapture = captured != null
         val isCastle = kind == 'k' && isCastling(fromSquare, toSquare)
         val isPromotion = kind == 'p' && (to / 8 == 7 || to / 8 == 0)
 
@@ -342,7 +347,8 @@ object MoveCommentary {
 
     private val CAPTURE_LINES = arrayOf(
         "%s takes %s. Fair exchange.",
-        "Capture the %s. Clean and simple.",
+        // Args are (mover, captured); %2$s refers to the captured piece.
+        "Capture the %2\$s. Clean and simple.",
         "%s takes the %s. No drama, just chess.",
         "The %s claims the %s. Moving on.",
     )

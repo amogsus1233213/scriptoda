@@ -12,7 +12,6 @@ object AccessibilityStatus {
         val enabledServices = am.getEnabledAccessibilityServiceList(
             android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK
         )
-        val myService = "${context.packageName}/.service.BoardAccessibilityService"
         return enabledServices.any {
             it.resolveInfo?.serviceInfo?.let { si ->
                 "${si.packageName}/${si.name}" == "${context.packageName}/com.chesstrainer.app.service.BoardAccessibilityService"

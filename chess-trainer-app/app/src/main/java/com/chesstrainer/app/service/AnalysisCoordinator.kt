@@ -476,18 +476,25 @@ class AnalysisCoordinator(
         if (!processing.compareAndSet(false, true)) return
 
         // Check if accessibility data is available (higher accuracy than vision). When it is
-        // fresh and complete enough, the vision pipeline (frame copy + board detection) is
-        // skipped entirely for this frame.
+        // fresh and complete enough, piece recognition is skipped for this frame; the frame is
+        // still used to locate the board so the overlay has bounds to draw arrows in.
         val accessibilityPositions = freshAccessibilityPositions()
         if (accessibilityPositions != null) {
+            // A failed copy only costs the bounds refresh; previously known bounds are reused.
+            val frame = copyBitmap(bitmap)
             val accepted = submit {
                 try {
+                    if (frame != null) updateBoundsFromFrame(frame)
                     processAccessibilityPositions(accessibilityPositions)
                 } finally {
+                    frame?.recycle()
                     processing.set(false)
                 }
             }
-            if (!accepted) processing.set(false)
+            if (!accepted) {
+                frame?.recycle()
+                processing.set(false)
+            }
             return
         }
 
@@ -616,6 +623,24 @@ class AnalysisCoordinator(
         if (!AccessibilityData.isRecent(ACCESSIBILITY_MAX_AGE_MS)) return null
         val positions = AccessibilityData.detectedPositions ?: return null
         return if (positions.size >= ACCESSIBILITY_MIN_PIECES) positions else null
+    }
+
+    /**
+     * Locates the board in [bitmap] only to refresh the overlay bounds (no piece reading). Used on
+     * the accessibility path, where the position comes from accessibility data but the arrows still
+     * need to know where the board is on screen. If the board cannot be located in this frame, the
+     * last known bounds are kept.
+     */
+    private fun updateBoundsFromFrame(bitmap: Bitmap) {
+        if (!running.get()) return
+        val px = Pixels(bitmap)
+        val grid = try {
+            BoardLocator.locate(px)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Board location failed on accessibility frame", e)
+            null
+        } ?: return
+        updateBoardBounds(grid, px, bitmap)
     }
 
     /**

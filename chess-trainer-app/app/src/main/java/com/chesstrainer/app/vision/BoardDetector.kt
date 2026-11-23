@@ -1593,10 +1593,12 @@ class TemplateMatchingClassifier(private val source: () -> NeoTemplateSet?) {
                 lastWarnAt = now
                 Log.w(
                     TAG,
-                    "Median template NCC %.2f < %.2f over %d pieces: the board probably does not use the " +
-                        "\"neo\" piece set; falling back to the template-free classifier".format(
-                            med, NEO_MIN_MEDIAN_NCC, nccs.size,
-                        ),
+                    (
+                        "Median template NCC %.2f < %.2f over %d pieces: the board probably does not use the " +
+                            "\"neo\" piece set; falling back to the template-free classifier"
+                        ).format(
+                        med, NEO_MIN_MEDIAN_NCC, nccs.size,
+                    ),
                 )
             }
         }
