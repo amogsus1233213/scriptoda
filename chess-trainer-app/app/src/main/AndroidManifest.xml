@@ -30,9 +30,13 @@
             android:exported="false" />
 
         <service
-            android:name=".service.OverlayService"
+            android:name=".ui.OverlayService"
             android:foregroundServiceType="specialUse"
-            android:exported="false" />
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating chess coach overlay drawn over other apps" />
+        </service>
 
     </application>
 </manifest>
