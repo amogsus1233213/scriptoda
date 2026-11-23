@@ -613,6 +613,8 @@ class AnalysisCoordinator(
     private fun onBoardMissing() {
         candidatePlacement = null
         candidateCount = 0
+        candidateHistory.clear()
+        candidateFramesSinceStable = 0
         missedFrames++
         if (boardVisible && missedFrames >= MISSED_FRAMES_BEFORE_CLEAR) {
             boardVisible = false
