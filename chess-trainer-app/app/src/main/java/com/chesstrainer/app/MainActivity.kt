@@ -22,6 +22,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.chesstrainer.app.service.AccessibilityStatus
 import com.chesstrainer.app.service.ScreenCaptureService
 import com.chesstrainer.app.ui.OverlayService
 import com.google.android.material.button.MaterialButton
@@ -43,6 +44,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var startButton: MaterialButton
     private lateinit var stopButton: MaterialButton
     private lateinit var calibrateButton: MaterialButton
+    private lateinit var boardReaderStatusText: TextView
+    private lateinit var enableBoardReaderButton: MaterialButton
 
     private var running = false
     private var calibrationTimer: CountDownTimer? = null
@@ -90,6 +93,16 @@ class MainActivity : AppCompatActivity() {
         // The overlay may have been stopped from its notification while we were away.
         running = isServiceRunning(OverlayService::class.java)
         refreshUi()
+        updateBoardReaderStatus()
+    }
+
+    /** Reflects whether the board-reader accessibility service is enabled in system settings. */
+    private fun updateBoardReaderStatus() {
+        val enabled = AccessibilityStatus.isServiceEnabled(this)
+        boardReaderStatusText.text = if (enabled) "Board Reader: ON" else "Board Reader: OFF"
+        boardReaderStatusText.setTextColor(
+            ContextCompat.getColor(this, if (enabled) R.color.accent_green else R.color.accent_red)
+        )
     }
 
     /** getRunningServices is deprecated but still reports this app's own services. */
@@ -174,6 +187,18 @@ class MainActivity : AppCompatActivity() {
                 gravity = Gravity.CENTER_HORIZONTAL
             },
         )
+
+        boardReaderStatusText = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        root.addView(boardReaderStatusText, matchWrap().apply { topMargin = dp(32f) })
+
+        enableBoardReaderButton = button("Enable Board Reader", R.color.accent_blue) {
+            AccessibilityStatus.openAccessibilitySettings(this)
+        }
+        root.addView(enableBoardReaderButton, matchWrap().apply { topMargin = dp(12f) })
 
         val hint = TextView(this).apply {
             text = "Start the service, then open your chess app. The board is detected " +

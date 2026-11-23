@@ -14,6 +14,8 @@ import com.chesstrainer.app.engine.ClassifiedMove
 import com.chesstrainer.app.engine.MoveClassifier
 import com.chesstrainer.app.engine.MoveCommentary
 import com.chesstrainer.app.engine.StockfishEngine
+import com.chesstrainer.app.service.AccessibilityData
+import com.chesstrainer.app.service.FenConverter
 import com.chesstrainer.app.ui.MoveColors
 import com.chesstrainer.app.ui.OverlayService
 import com.chesstrainer.app.ui.SuggestedLine
@@ -117,6 +119,12 @@ class AnalysisCoordinator(
         private const val BOUNDS_EPSILON = 0.004f
 
         private const val WORKER_KEEP_ALIVE_SECONDS = 30L
+
+        /** Accessibility positions older than this are ignored in favour of vision. */
+        private const val ACCESSIBILITY_MAX_AGE_MS = 2000L
+
+        /** Minimum number of accessibility-reported pieces for the data to be trusted. */
+        private const val ACCESSIBILITY_MIN_PIECES = 3
 
         // User-facing status messages. Users should never need to know about "calibration".
         private const val STATUS_LOOKING = "Looking for chess board..."
@@ -466,6 +474,23 @@ class AnalysisCoordinator(
         }
 
         if (!processing.compareAndSet(false, true)) return
+
+        // Check if accessibility data is available (higher accuracy than vision). When it is
+        // fresh and complete enough, the vision pipeline (frame copy + board detection) is
+        // skipped entirely for this frame.
+        val accessibilityPositions = freshAccessibilityPositions()
+        if (accessibilityPositions != null) {
+            val accepted = submit {
+                try {
+                    processAccessibilityPositions(accessibilityPositions)
+                } finally {
+                    processing.set(false)
+                }
+            }
+            if (!accepted) processing.set(false)
+            return
+        }
+
         val copy = copyBitmap(bitmap)
         if (copy == null) {
             processing.set(false)
@@ -580,6 +605,60 @@ class AnalysisCoordinator(
         candidateHistory.clear()
         candidateFramesSinceStable = 0
         onPositionChanged(finalPlacement)
+    }
+
+    /**
+     * Returns a snapshot of the accessibility-provided piece positions if they are recent
+     * (< [ACCESSIBILITY_MAX_AGE_MS]) and contain at least [ACCESSIBILITY_MIN_PIECES] pieces,
+     * otherwise null (the vision pipeline is used instead).
+     */
+    private fun freshAccessibilityPositions(): Map<String, Char>? {
+        if (!AccessibilityData.isRecent(ACCESSIBILITY_MAX_AGE_MS)) return null
+        val positions = AccessibilityData.detectedPositions ?: return null
+        return if (positions.size >= ACCESSIBILITY_MIN_PIECES) positions else null
+    }
+
+    /**
+     * Accessibility counterpart of [processFrame]: converts the reported positions to a FEN and
+     * feeds its placement into the same move-tracking path ([onPositionChanged]) that sets
+     * [currentFen] for vision reads. Accessibility data is exact, so no multi-frame stability
+     * check is needed; an unchanged placement is simply ignored.
+     */
+    private fun processAccessibilityPositions(positions: Map<String, Char>) {
+        if (!running.get()) return
+        ensureTemplatesLoaded()
+
+        // Side to move: keep the tracked side if known, otherwise default to white. The actual
+        // mover is recovered by move inference in onPositionChanged once a move is diffed.
+        val whiteToMove = currentFen?.let { sideToMoveIsWhite(it) } ?: true
+        val fen = try {
+            FenConverter.positionsToFen(positions, whiteToMove)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Could not convert accessibility positions", e)
+            return
+        }
+        Log.d(TAG, "Using accessibility data: ${positions.size} pieces, FEN: $fen")
+
+        val placement = fen.substringBefore(' ')
+        if (parsePlacement(placement) == null) {
+            Log.w(TAG, "Ignoring malformed accessibility placement: $placement")
+            return
+        }
+
+        missedFrames = 0
+        if (!boardVisible) {
+            boardVisible = true
+            lastHintStatus = null
+            postStatus(STATUS_ANALYZING)
+        }
+
+        if (placement == stablePlacement) return
+        candidatePlacement = placement
+        candidateCount = STABLE_FRAMES
+        candidateHistory.clear()
+        candidateFramesSinceStable = 0
+        stablePlacement = placement
+        onPositionChanged(placement)
     }
 
     /**

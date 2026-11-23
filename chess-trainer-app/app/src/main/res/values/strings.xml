@@ -7,4 +7,5 @@
     <string name="status_running">Running</string>
     <string name="capture_channel">Screen Capture</string>
     <string name="overlay_channel">Chess Overlay</string>
+    <string name="accessibility_service_description">Reads on-screen content for position analysis</string>
 </resources>
