@@ -6,6 +6,14 @@ object AccessibilityData {
     @Volatile var lastUpdateTime: Long = 0L
     @Volatile var targetPackageVisible: Boolean = false
 
+    /**
+     * Whether the user plays white (white at the bottom of the board), when the accessibility
+     * service can tell; null when unknown. [AnalysisCoordinator] treats a non-null value as
+     * authoritative over vision-based orientation detection, so it must be reset to null as soon
+     * as it can no longer be vouched for (e.g. a new game starts or the chess app is left).
+     */
+    @Volatile var userPlaysWhite: Boolean? = null
+
     fun update(positions: Map<String, Char>?) {
         detectedPositions = positions
         lastUpdateTime = System.currentTimeMillis()
@@ -21,5 +29,6 @@ object AccessibilityData {
         lastViewDump = ""
         lastUpdateTime = 0L
         targetPackageVisible = false
+        userPlaysWhite = null
     }
 }

@@ -53,7 +53,9 @@ import kotlin.math.max
  *     (learnt silently whenever the starting position is on screen, or from an explicit
  *     [calibrate] call) they are tried first, as they are more accurate for the current theme.
  *  3. The piece placement must be read identically on [STABLE_FRAMES] consecutive frames before it
- *     is accepted (filters out piece animations and drags).
+ *     is accepted (filters out piece animations and drags). A placement differing from the last
+ *     successfully analysed one on more than [MAX_SQUARE_JUMP] squares needs [JUMP_STABLE_FRAMES]
+ *     identical reads instead, as it is most likely a misread.
  *  4. A new placement is diffed against the previous one to recover the move that was played,
  *     which also tells whose turn it is now. The move is classified with [MoveClassifier] and
  *     the new position is analysed by Stockfish.
@@ -94,6 +96,22 @@ class AnalysisCoordinator(
          * read placement is accepted by majority vote, tolerating noisy frames.
          */
         private const val MAX_FRAMES_BEFORE_MAJORITY = 6
+
+        /**
+         * Largest number of squares a vision read may differ from [lastKnownGoodFen] by and still
+         * be accepted after the normal stability check. One move changes 2-4 squares, and a couple
+         * of moves can be missed while the engine is busy, so this tolerates about two missed
+         * moves. Bigger jumps are usually misreads (piece animations, popups over the board).
+         */
+        private const val MAX_SQUARE_JUMP = 8
+
+        /**
+         * Consecutive identical reads needed to accept a placement that jumped more than
+         * [MAX_SQUARE_JUMP] squares (about 2 s at the default 2 fps). Real jumps (new game, another
+         * game opened, many moves missed during a long search) persist and get through; transient
+         * misreads do not. Without this, a real jump would be rejected forever.
+         */
+        private const val JUMP_STABLE_FRAMES = 4
 
         /**
          * Orientation hysteresis. Every read frame votes: a frame whose [Orientation.score]
@@ -200,6 +218,12 @@ class AnalysisCoordinator(
     private var currentFen: String? = null
     /** Multi-PV analysis of [currentFen], best line first. */
     private var currentAnalyses: List<AnalysisResult>? = null
+
+    /**
+     * Last FEN whose engine analysis succeeded. Vision reads that differ from it by more than
+     * [MAX_SQUARE_JUMP] squares are treated as likely misreads (see [isLargeJump]).
+     */
+    private var lastKnownGoodFen: String? = null
 
     private var lastMove: InferredMove? = null
     private var lastClassified: ClassifiedMove? = null
@@ -520,23 +544,31 @@ class AnalysisCoordinator(
             candidateHistory[placement] = (candidateHistory[placement] ?: 0) + 1
         }
 
-        val accepted = when {
+        // candidatePlacement == placement here, so candidateCount counts consecutive reads of it.
+        val finalPlacement = when {
             // Normal path: two identical reads in a row
-            candidateCount >= STABLE_FRAMES && placement != stablePlacement -> true
+            candidateCount >= STABLE_FRAMES && placement != stablePlacement -> placement
             // Majority vote: after MAX_FRAMES_BEFORE_MAJORITY frames, pick the most-read position
             candidateFramesSinceStable >= MAX_FRAMES_BEFORE_MAJORITY && candidateHistory.isNotEmpty() -> {
                 val best = candidateHistory.maxByOrNull { it.value }
-                if (best != null && best.key != stablePlacement && best.value >= 2) {
-                    candidatePlacement = best.key
-                    true
-                } else false
+                if (best != null && best.key != stablePlacement && best.value >= 2) best.key else null
             }
-            else -> false
+            else -> null
+        } ?: return
+
+        // A large jump from the last analysed position is likely a misread: accept it only once
+        // it is on screen now and was read identically on JUMP_STABLE_FRAMES frames in a row.
+        if (isLargeJump(finalPlacement)) {
+            if (finalPlacement != placement || candidateCount < JUMP_STABLE_FRAMES) {
+                Log.w(TAG, "Holding back position far from last known good (likely misread): $finalPlacement")
+                // Restart the majority vote so stale history does not re-pick it every frame.
+                candidateHistory.clear()
+                candidateFramesSinceStable = 0
+                return
+            }
+            Log.i(TAG, "Accepting large position change after $candidateCount stable reads")
         }
 
-        if (!accepted) return
-
-        val finalPlacement = candidatePlacement ?: return
         stablePlacement = finalPlacement
         candidateHistory.clear()
         candidateFramesSinceStable = 0
@@ -706,6 +738,19 @@ class AnalysisCoordinator(
         }
     }
 
+    /**
+     * True if [placement] differs from [lastKnownGoodFen] on more than [MAX_SQUARE_JUMP] squares.
+     * The starting position never counts as a jump: it is unambiguous and signals a new game.
+     */
+    private fun isLargeJump(placement: String): Boolean {
+        if (placement == START_PLACEMENT) return false
+        val last = lastKnownGoodFen?.let { parsePlacement(it.substringBefore(' ')) } ?: return false
+        val now = parsePlacement(placement) ?: return false
+        val diff = (0 until 64).count { now[it] != last[it] }
+        if (diff > MAX_SQUARE_JUMP) Log.d(TAG, "$diff squares differ from last known good position")
+        return diff > MAX_SQUARE_JUMP
+    }
+
     /** Rejects reads that cannot be a legal chess position. */
     private fun isPlausible(letters: Array<CharArray>): Boolean {
         var whiteKings = 0
@@ -738,10 +783,26 @@ class AnalysisCoordinator(
      * "moving backwards"); it must therefore be corrected quickly, yet one noisy frame must not
      * flip it. See [ORIENTATION_SWITCH_VOTES]. The starting position fixes it immediately.
      *
+     * When the accessibility service reports which side the user plays
+     * ([AccessibilityData.userPlaysWhite]), that is authoritative and vision-based detection is
+     * skipped.
+     *
      * When the orientation changes, all placements tracked so far were built with the wrong
      * orientation, so move tracking is reset and resyncs from the next stable read.
      */
     private fun resolveOrientation(letters: Array<CharArray>): Boolean {
+        // Trust the accessibility service's orientation when available.
+        AccessibilityData.userPlaysWhite?.let { accessWhite ->
+            if (whiteAtBottom != accessWhite) {
+                Log.i(TAG, "Orientation from accessibility: white at bottom = $accessWhite")
+                val old = whiteAtBottom
+                whiteAtBottom = accessWhite
+                orientationVotes = 0
+                if (old != null) resetTracking()
+            }
+            return accessWhite
+        }
+
         val score = Orientation.score(letters)
         val detected = score >= 0f
         val locked = whiteAtBottom
@@ -777,6 +838,8 @@ class AnalysisCoordinator(
         previousAnalysis = null
         currentFen = null
         currentAnalyses = null
+        // Placements read with another orientation are rotated, so they must not be compared.
+        lastKnownGoodFen = null
         lastMove = null
         lastClassified = null
         castlingRights = "KQkq"
@@ -878,6 +941,7 @@ class AnalysisCoordinator(
         previousAnalysis = beforeAnalysis
         currentFen = newFen
         currentAnalyses = newAnalyses
+        if (!newAnalyses.isNullOrEmpty()) lastKnownGoodFen = newFen
         lastMove = move
         lastClassified = classified
         render()
@@ -895,6 +959,7 @@ class AnalysisCoordinator(
         previousAnalysis = null
         currentFen = fen
         currentAnalyses = analyses
+        if (!analyses.isNullOrEmpty()) lastKnownGoodFen = fen
         lastMove = null
         lastClassified = null
         render()

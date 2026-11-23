@@ -42,7 +42,8 @@ class StockfishEngine(private val binaryPath: String) {
         /** Base value used to represent mate scores in centipawns. */
         const val MATE_SCORE = 100_000
 
-        private const val ANALYSIS_TIMEOUT_MS = 10_000L
+        /** Generous enough for deep searches (depth 21) on mobile hardware. */
+        private const val ANALYSIS_TIMEOUT_MS = 30_000L
         private const val HANDSHAKE_TIMEOUT_MS = 5_000L
         private const val READY_TIMEOUT_MS = 3_000L
         private const val STOP_DRAIN_TIMEOUT_MS = 1_000L
@@ -143,7 +144,7 @@ class StockfishEngine(private val binaryPath: String) {
      * the position after a move without computing its FEN.
      *
      * @return the analysis, or null if the engine could not be started, died during the
-     * search, or did not produce "bestmove" within 10 seconds.
+     * search, or did not produce "bestmove" within 30 seconds.
      */
     fun analyze(fen: String, depth: Int = 12, moves: List<String> = emptyList()): AnalysisResult? =
         analyzeMultiPv(fen, depth, 1, moves)?.firstOrNull()
