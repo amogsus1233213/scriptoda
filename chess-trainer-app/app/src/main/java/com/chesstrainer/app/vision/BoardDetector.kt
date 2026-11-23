@@ -1,11 +1,13 @@
 package com.chesstrainer.app.vision
 
 import android.graphics.Bitmap
+import android.util.Log
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 // ---------------------------------------------------------------------------------------------
 // Pixels
@@ -24,6 +26,9 @@ class Pixels(bitmap: Bitmap, targetMinSide: Int = 400) {
 
     private val luma: FloatArray
 
+    /** Box-averaged colour per pixel, packed as 0xRRGGBB (used for occupancy / colour tests). */
+    private val rgb: IntArray
+
     init {
         val src = if (bitmap.config == Bitmap.Config.HARDWARE) {
             bitmap.copy(Bitmap.Config.ARGB_8888, false)
@@ -40,8 +45,13 @@ class Pixels(bitmap: Bitmap, targetMinSide: Int = 400) {
         scale = width.toFloat() / sw
 
         // Box (area) downscale: every source pixel contributes to exactly one target pixel.
-        val sums = FloatArray(width * height)
-        val counts = IntArray(width * height)
+        // Channels are summed separately; luma is linear in RGB, so the luma of the averaged
+        // colour equals the average of the per-pixel lumas.
+        val n = width * height
+        val rSums = IntArray(n)
+        val gSums = IntArray(n)
+        val bSums = IntArray(n)
+        val counts = IntArray(n)
         val xMap = IntArray(sw) { min(width - 1, (it.toLong() * width / sw).toInt()) }
         val row = IntArray(sw)
         for (y in 0 until sh) {
@@ -49,15 +59,24 @@ class Pixels(bitmap: Bitmap, targetMinSide: Int = 400) {
             val base = min(height - 1, (y.toLong() * height / sh).toInt()) * width
             for (x in 0 until sw) {
                 val c = row[x]
-                val l = 0.299f * ((c shr 16) and 0xFF) +
-                    0.587f * ((c shr 8) and 0xFF) +
-                    0.114f * (c and 0xFF)
                 val i = base + xMap[x]
-                sums[i] += l
+                rSums[i] += (c shr 16) and 0xFF
+                gSums[i] += (c shr 8) and 0xFF
+                bSums[i] += c and 0xFF
                 counts[i]++
             }
         }
-        luma = FloatArray(width * height) { if (counts[it] > 0) sums[it] / counts[it] else 0f }
+        luma = FloatArray(n)
+        rgb = IntArray(n)
+        for (i in 0 until n) {
+            val cnt = counts[i]
+            if (cnt == 0) continue
+            val r = rSums[i].toFloat() / cnt
+            val g = gSums[i].toFloat() / cnt
+            val b = bSums[i].toFloat() / cnt
+            luma[i] = 0.299f * r + 0.587f * g + 0.114f * b
+            rgb[i] = (r.roundToInt() shl 16) or (g.roundToInt() shl 8) or b.roundToInt()
+        }
         if (src !== bitmap) src.recycle()
     }
 
@@ -66,6 +85,39 @@ class Pixels(bitmap: Bitmap, targetMinSide: Int = 400) {
         val cx = x.coerceIn(0, width - 1)
         val cy = y.coerceIn(0, height - 1)
         return luma[cy * width + cx]
+    }
+
+    /** Colour packed as 0xRRGGBB at integer coordinates; out-of-range coordinates are clamped. */
+    fun rgbAt(x: Int, y: Int): Int {
+        val cx = x.coerceIn(0, width - 1)
+        val cy = y.coerceIn(0, height - 1)
+        return rgb[cy * width + cx]
+    }
+
+    /**
+     * Bilinearly interpolated colour at fractional pixel-center coordinates. Writes R, G, B
+     * (0..255) into [out] at indices 0, 1, 2.
+     */
+    fun sampleRgb(fx: Float, fy: Float, out: FloatArray) {
+        val x = fx - 0.5f
+        val y = fy - 0.5f
+        val x0 = floor(x).toInt()
+        val y0 = floor(y).toInt()
+        val ax = x - x0
+        val ay = y - y0
+        val w00 = (1 - ax) * (1 - ay)
+        val w10 = ax * (1 - ay)
+        val w01 = (1 - ax) * ay
+        val w11 = ax * ay
+        val c00 = rgbAt(x0, y0)
+        val c10 = rgbAt(x0 + 1, y0)
+        val c01 = rgbAt(x0, y0 + 1)
+        val c11 = rgbAt(x0 + 1, y0 + 1)
+        for (k in 0 until 3) {
+            val sh = 16 - 8 * k
+            out[k] = w00 * ((c00 shr sh) and 0xFF) + w10 * ((c10 shr sh) and 0xFF) +
+                w01 * ((c01 shr sh) and 0xFF) + w11 * ((c11 shr sh) and 0xFF)
+        }
     }
 
     /** Bilinearly interpolated luma at fractional pixel-center coordinates. */
@@ -386,6 +438,152 @@ object CellReader {
         val n = sorted.size
         return if (n % 2 == 1) sorted[n / 2] else (sorted[n / 2 - 1] + sorted[n / 2]) / 2f
     }
+
+    // ---- wide sampling (template matching) ----------------------------------------------
+
+    /** Side of the wide (template-matching) sample grid. */
+    const val WIDE_SIZE = 32
+
+    /**
+     * Fraction of the cell covered by the wide sample (2%..98%). Wide enough to keep the king's
+     * cross, the bishop's tip and the base row, narrow enough to avoid grid-line bleed.
+     */
+    const val WIDE_FRACTION = 0.96f
+
+    /** Side of the change-detection thumbnail. */
+    const val THUMB_SIZE = 8
+
+    /**
+     * Samples cell ([r], [c]) over the central [fraction] of the square into a [size] x [size]
+     * colour grid (2x2 bilinear supersampling per bin), plus the square's background colour.
+     */
+    fun readWide(
+        px: Pixels,
+        grid: Grid,
+        r: Int,
+        c: Int,
+        size: Int = WIDE_SIZE,
+        fraction: Float = WIDE_FRACTION,
+    ): WideCell {
+        val margin = (1f - fraction) / 2f
+        val left = grid.x0 + (c + margin) * grid.cw
+        val top = grid.y0 + (r + margin) * grid.ch
+        val binW = fraction * grid.cw / size
+        val binH = fraction * grid.ch / size
+        val n = size * size
+        val red = FloatArray(n)
+        val green = FloatArray(n)
+        val blue = FloatArray(n)
+        val gray = FloatArray(n)
+        val tmp = FloatArray(3)
+        for (i in 0 until size) {
+            for (j in 0 until size) {
+                val cx = left + (j + 0.5f) * binW
+                val cy = top + (i + 0.5f) * binH
+                var sr = 0f
+                var sg = 0f
+                var sb = 0f
+                for (sy in 0..1) for (sx in 0..1) {
+                    px.sampleRgb(cx + (sx - 0.5f) * binW / 2f, cy + (sy - 0.5f) * binH / 2f, tmp)
+                    sr += tmp[0]
+                    sg += tmp[1]
+                    sb += tmp[2]
+                }
+                val k = i * size + j
+                red[k] = sr / 4f
+                green[k] = sg / 4f
+                blue[k] = sb / 4f
+                gray[k] = luma(red[k], green[k], blue[k])
+            }
+        }
+        val bg = backgroundRgb(px, grid, r, c)
+        return WideCell(size, red, green, blue, gray, bg[0], bg[1], bg[2])
+    }
+
+    /** [size] x [size] luma box averages over the wide window, for cheap frame-to-frame diffs. */
+    fun thumbnail(
+        px: Pixels,
+        grid: Grid,
+        r: Int,
+        c: Int,
+        size: Int = THUMB_SIZE,
+        fraction: Float = WIDE_FRACTION,
+    ): FloatArray {
+        val margin = (1f - fraction) / 2f
+        val left = grid.x0 + (c + margin) * grid.cw
+        val top = grid.y0 + (r + margin) * grid.ch
+        val binW = fraction * grid.cw / size
+        val binH = fraction * grid.ch / size
+        return FloatArray(size * size) { k ->
+            val i = k / size
+            val j = k % size
+            val x0 = left + j * binW
+            val y0 = top + i * binH
+            // Inclusive integer ranges in patchMean; shrink by a hair so bins do not overlap.
+            patchMean(px, x0, y0, x0 + binW - 0.01f, y0 + binH - 0.01f)
+        }
+    }
+
+    /**
+     * Background colour (R, G, B) from the four corner patches: the two corners with median luma
+     * are averaged, so a coordinate label in one corner (or two, on a1/h8) does not dominate.
+     */
+    internal fun backgroundRgb(px: Pixels, grid: Grid, r: Int, c: Int): FloatArray {
+        val left = grid.x0 + c * grid.cw
+        val top = grid.y0 + r * grid.ch
+        val right = left + grid.cw
+        val bottom = top + grid.ch
+        val dx0 = CORNER_INSET * grid.cw
+        val dx1 = (CORNER_INSET + CORNER_SIZE) * grid.cw
+        val dy0 = CORNER_INSET * grid.ch
+        val dy1 = (CORNER_INSET + CORNER_SIZE) * grid.ch
+        val corners = arrayOf(
+            patchMeanRgb(px, left + dx0, top + dy0, left + dx1, top + dy1),
+            patchMeanRgb(px, right - dx1, top + dy0, right - dx0, top + dy1),
+            patchMeanRgb(px, left + dx0, bottom - dy1, left + dx1, bottom - dy0),
+            patchMeanRgb(px, right - dx1, bottom - dy1, right - dx0, bottom - dy0),
+        )
+        corners.sortBy { luma(it[0], it[1], it[2]) }
+        return FloatArray(3) { k -> (corners[1][k] + corners[2][k]) / 2f }
+    }
+
+    private fun patchMeanRgb(px: Pixels, x0: Float, y0: Float, x1: Float, y1: Float): FloatArray {
+        val ix0 = floor(x0).toInt()
+        val iy0 = floor(y0).toInt()
+        val ix1 = max(ix0, floor(x1).toInt())
+        val iy1 = max(iy0, floor(y1).toInt())
+        var sr = 0f
+        var sg = 0f
+        var sb = 0f
+        var n = 0
+        for (y in iy0..iy1) for (x in ix0..ix1) {
+            val v = px.rgbAt(x, y)
+            sr += (v shr 16) and 0xFF
+            sg += (v shr 8) and 0xFF
+            sb += v and 0xFF
+            n++
+        }
+        return floatArrayOf(sr / n, sg / n, sb / n)
+    }
+
+    internal fun luma(r: Float, g: Float, b: Float): Float = 0.299f * r + 0.587f * g + 0.114f * b
+}
+
+/**
+ * Colour sample of (almost) a whole board square, for template matching. Arrays are
+ * [size] x [size], row-major, values 0..255. The bg* fields are the empty-square colour.
+ */
+class WideCell(
+    val size: Int,
+    val red: FloatArray,
+    val green: FloatArray,
+    val blue: FloatArray,
+    val gray: FloatArray,
+    val bgRed: Float,
+    val bgGreen: Float,
+    val bgBlue: Float,
+) {
+    val bgLuma: Float get() = CellReader.luma(bgRed, bgGreen, bgBlue)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -647,18 +845,40 @@ object TemplateFreeClassifier {
         val metrics: FloatArray,
         /** Set by [earlyClassify]: the type came from a hard rule and must not be re-guessed. */
         val locked: Boolean = false,
+        /** Colour comes from a [SquareOverride] and is not re-derived from the fill luma. */
+        val fixedColor: Boolean = false,
     )
 
+    /**
+     * Scale converting an NCC gap into the prototype-distance units used by the board-level
+     * checks: an NCC margin of 0.03 (the template matcher's acceptance gate) maps to 3, above
+     * [LOW_CONFIDENCE_MARGIN].
+     */
+    private const val NCC_SCORE_SCALE = 100f
+
+    /** Score gap used for an override that carries no per-type scores. */
+    private const val OVERRIDE_DEFAULT_GAP = 50f
+
     /** Returns letters[row][col] in screen order (row 0 at top), '.' for empty squares. */
-    fun classify(cells: List<Cell>): Array<CharArray> {
+    fun classify(cells: List<Cell>): Array<CharArray> = classify(cells, null)
+
+    /**
+     * Like [classify], but squares with a non-null entry in [overrides] (64 entries, screen
+     * order) take their occupancy, colour and type from it (e.g. a confident
+     * [TemplateMatchingClassifier] read). All other squares are read by this classifier, and the
+     * board-level sanity checks (king count, pawn count, side sizes, back-rank pawns) run over
+     * the combined result; override reads are treated as the most certain ones.
+     */
+    fun classify(cells: List<Cell>, overrides: Array<SquareOverride?>?): Array<CharArray> {
         require(cells.size == 64) { "Expected 64 cells, got ${cells.size}" }
+        require(overrides == null || overrides.size == 64) { "Expected 64 overrides" }
 
         // Occupancy, retried with stricter gates while the count is impossible (> 32 pieces).
         var level = 0
-        var readings = readAll(cells, level)
+        var readings = readAll(cells, level, overrides)
         while (readings.count { it != null } > MAX_TOTAL_PIECES && level < MAX_STRICTNESS_LEVEL) {
             level++
-            readings = readAll(cells, level)
+            readings = readAll(cells, level, overrides)
         }
         val occupied = readings.filterNotNull()
         // Still impossible, or too few pieces for a real position: the read is garbage.
@@ -666,9 +886,11 @@ object TemplateFreeClassifier {
             return Array(8) { CharArray(8) { '.' } }
         }
 
-        // Colour: split fill lumas into two clusters.
-        val threshold = colorThreshold(occupied.map { it.bodyLuma })
+        // Colour: split fill lumas into two clusters (override reads keep their colour, but
+        // their measured fill lumas still help the clustering).
+        val threshold = colorThreshold(occupied.map { it.bodyLuma }.filter { !it.isNaN() })
         for (rd in occupied) {
+            if (rd.fixedColor) continue
             rd.white = rd.bodyLuma > threshold
             rd.colorConfidence = abs(rd.bodyLuma - threshold)
         }
@@ -698,8 +920,46 @@ object TemplateFreeClassifier {
         return nearRowEdge && nearColEdge
     }
 
-    private fun readAll(cells: List<Cell>, strictness: Int): Array<Reading?> =
-        Array(64) { i -> readCell(cells[i], i / 8, strictness) }
+    private fun readAll(cells: List<Cell>, strictness: Int, overrides: Array<SquareOverride?>?): Array<Reading?> =
+        Array(64) { i ->
+            val o = overrides?.get(i)
+            if (o != null) fromOverride(cells[i], i / 8, o) else readCell(cells[i], i / 8, strictness)
+        }
+
+    /**
+     * Reading for a square decided externally. Shape metrics and fill luma are still measured
+     * (when this classifier sees a piece there) so relative-height checks of the other pieces
+     * stay meaningful; otherwise the type's prototype metrics stand in.
+     */
+    private fun fromOverride(cell: Cell, row: Int, o: SquareOverride): Reading? {
+        if (o.piece == '.') return null
+        val type = TYPE_CHARS.indexOf(o.piece.lowercaseChar())
+        if (type < 0) return readCell(cell, row)
+        val measured = readCell(cell, row)
+        val ncc = o.typeScores
+        val scores = FloatArray(TYPE_COUNT) { t ->
+            when {
+                ncc != null && t < ncc.size && !ncc[t].isNaN() -> (1f - ncc[t]) * NCC_SCORE_SCALE
+                t == type -> 0f
+                else -> OVERRIDE_DEFAULT_GAP
+            }
+        }
+        // The override's type must be the favourite whatever the per-type scores say.
+        var bestOther = Float.MAX_VALUE
+        for (t in 0 until TYPE_COUNT) if (t != type) bestOther = min(bestOther, scores[t])
+        scores[type] = min(scores[type], bestOther)
+        return Reading(
+            row,
+            white = o.piece.isUpperCase(),
+            colorConfidence = o.colorConfidence,
+            scores = scores,
+            type = type,
+            bodyLuma = measured?.bodyLuma ?: Float.NaN,
+            metrics = measured?.metrics ?: PROTO_MEAN[type].copyOf(),
+            locked = true,
+            fixedColor = true,
+        )
+    }
 
     /**
      * Returns null for an empty square. [strictness] > 0 tightens the occupancy gates only (the
@@ -1143,6 +1403,346 @@ object TemplateFreeClassifier {
 }
 
 // ---------------------------------------------------------------------------------------------
+// TemplateMatchingClassifier
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Externally decided content of one square, fed into [TemplateFreeClassifier.classify].
+ *
+ * @property piece FEN letter, or '.' for a square known to be empty.
+ * @property typeScores optional per-type similarity in [-1, 1] (index order p, n, b, r, q, k),
+ *   used when board-level checks must re-pick a type.
+ * @property colorConfidence how sure the colour is (higher = surer; TemplateFreeClassifier's own
+ *   reads are roughly 0..150).
+ */
+class SquareOverride(
+    val piece: Char,
+    val typeScores: FloatArray? = null,
+    val colorConfidence: Float = 1000f,
+)
+
+/**
+ * Pixel-level classifier for chess.com's "neo" piece set, using the reference PNGs provided by
+ * [NeoTemplateSet] (downloaded by [TemplateManager]).
+ *
+ * Per square (sampled over 96% of the cell, see [CellReader.readWide]):
+ *  1. **Occupancy / colour** from pixel statistics against the corner-sampled background colour:
+ *     empty if fewer than 3% of pixels differ from it by more than 60 (RGB distance); black if
+ *     more than 10% of pixels are dark (luma < min(100, background - 30)); white otherwise.
+ *     Pixels in the label corners are ignored.
+ *  2. **Type** by anchor-aligned normalized cross-correlation: the 32x32 grayscale square is
+ *     compared with each template of the detected colour, composited onto the square's
+ *     background, rendered at 5 scales and aligned on the piece's baseline and horizontal
+ *     centre (plus a +-1 px offset search at the best scale). The best NCC wins; the gap to the
+ *     runner-up type is the margin.
+ *  3. **Gating**: a type read is accepted only if NCC >= [MIN_NCC] and margin >= [MIN_MARGIN];
+ *     other occupied squares are left to the [TemplateFreeClassifier] (null override).
+ *
+ * Squares whose 8x8 luma thumbnail barely changed since the previous frame reuse the previous
+ * result, so a typical frame only re-matches the one or two squares of the last move.
+ *
+ * Thread-safe ([classify] is synchronized); keep one instance per frame stream.
+ */
+class TemplateMatchingClassifier(private val source: () -> NeoTemplateSet?) {
+
+    constructor(manager: TemplateManager) : this({ manager.templates() })
+
+    companion object {
+        private const val TAG = "TemplateMatching"
+
+        private const val T = CellReader.WIDE_SIZE
+
+        /** Template scales relative to the on-screen square. */
+        val SCALES = floatArrayOf(0.88f, 0.94f, 1.00f, 1.06f, 1.12f)
+
+        private const val TYPE_CHARS = "pnbrqk"
+
+        // Occupancy and colour.
+        private const val EMPTY_RGB_DISTANCE = 60f
+        private const val EMPTY_MAX_FRACTION = 0.03f
+        private const val DARK_MAX_LUMA = 100f
+        private const val DARK_BELOW_BACKGROUND = 30f
+        private const val BLACK_MIN_DARK_FRACTION = 0.10f
+
+        /** Offset search radius (pixels) around the anchor alignment at the best scale. */
+        private const val REFINE_RADIUS = 1
+
+        /** Side (in wide-sample pixels) of the corner patches ignored because of labels. */
+        private const val LABEL_CORNER = 6
+
+        // Confidence gating.
+        const val MIN_NCC = 0.6f
+        const val MIN_MARGIN = 0.03f
+        private const val NEO_MIN_MEDIAN_NCC = 0.5f
+        private const val MIN_SQUARES_FOR_SET_CHECK = 4
+        private const val WARN_INTERVAL_MS = 30_000L
+
+        /** Mean absolute thumbnail difference above which a square is re-matched. */
+        private const val CHANGE_THRESHOLD = 4f
+
+        /** Grid movement (fraction of a cell) that invalidates the change-detection cache. */
+        private const val GRID_SHIFT_TOLERANCE = 0.1f
+
+        /** Pixels that take part in statistics and NCC (everything but the label corners). */
+        private val VALID: BooleanArray = BooleanArray(T * T) { i ->
+            val y = i / T
+            val x = i % T
+            val nearX = x < LABEL_CORNER || x >= T - LABEL_CORNER
+            val nearY = y < LABEL_CORNER || y >= T - LABEL_CORNER
+            !(nearX && nearY)
+        }
+    }
+
+    /** Result for one square. [override] is null when the square must go to the fallback. */
+    private class SquareResult(val override: SquareOverride?, val bestNcc: Float)
+
+    private val lastThumbs = arrayOfNulls<FloatArray>(64)
+    private val lastResults = arrayOfNulls<SquareResult>(64)
+    private var lastSet: NeoTemplateSet? = null
+    private var lastGrid: Grid? = null
+    private var lastWarnAt = 0L
+
+    /** Median best NCC over the occupied squares of the last frame (NaN if none). */
+    @Volatile
+    var lastMedianNcc: Float = Float.NaN
+        private set
+
+    /**
+     * False when the last frame's median NCC was below 0.5, i.e. the user is probably not using
+     * the "neo" piece set; null if unknown.
+     */
+    @Volatile
+    var looksLikeNeoSet: Boolean? = null
+        private set
+
+    /** True once the templates are available. Calling this also (re)triggers their loading. */
+    val isReady: Boolean get() = source() != null
+
+    /** Drops the change-detection cache (e.g. after a theme change). */
+    @Synchronized
+    fun reset() {
+        lastThumbs.fill(null)
+        lastResults.fill(null)
+        lastGrid = null
+    }
+
+    /**
+     * Classifies all 64 squares (screen order). Returns null if the templates are not ready.
+     * Entries are '.' overrides for empty squares, piece overrides for confident matches, and
+     * null where the caller should fall back to another classifier.
+     */
+    @Synchronized
+    fun classify(px: Pixels, grid: Grid): Array<SquareOverride?>? {
+        val set = source() ?: return null
+        if (set !== lastSet || !sameGeometry(grid)) {
+            lastThumbs.fill(null)
+            lastResults.fill(null)
+            lastSet = set
+        }
+        lastGrid = grid
+
+        val out = arrayOfNulls<SquareOverride>(64)
+        val nccs = ArrayList<Float>(32)
+        for (r in 0 until 8) for (c in 0 until 8) {
+            val i = r * 8 + c
+            val thumb = CellReader.thumbnail(px, grid, r, c)
+            val prevThumb = lastThumbs[i]
+            val prev = lastResults[i]
+            val result = if (prev != null && prevThumb != null && meanAbsDiff(thumb, prevThumb) <= CHANGE_THRESHOLD) {
+                prev
+            } else {
+                matchSquare(CellReader.readWide(px, grid, r, c), set).also {
+                    lastThumbs[i] = thumb
+                    lastResults[i] = it
+                }
+            }
+            out[i] = result.override
+            if (!result.bestNcc.isNaN()) nccs.add(result.bestNcc)
+        }
+        checkPieceSet(nccs)
+        return out
+    }
+
+    private fun sameGeometry(g: Grid): Boolean {
+        val p = lastGrid ?: return false
+        val tol = GRID_SHIFT_TOLERANCE * max(g.cw, g.ch)
+        return abs(p.x0 - g.x0) <= tol && abs(p.y0 - g.y0) <= tol &&
+            abs(p.cw - g.cw) <= tol / 8f && abs(p.ch - g.ch) <= tol / 8f
+    }
+
+    private fun meanAbsDiff(a: FloatArray, b: FloatArray): Float {
+        if (a.size != b.size) return Float.MAX_VALUE
+        var s = 0f
+        for (k in a.indices) s += abs(a[k] - b[k])
+        return s / a.size
+    }
+
+    private fun checkPieceSet(nccs: List<Float>) {
+        if (nccs.size < MIN_SQUARES_FOR_SET_CHECK) {
+            lastMedianNcc = if (nccs.isEmpty()) Float.NaN else CellReader.median(nccs)
+            return
+        }
+        val med = CellReader.median(nccs)
+        lastMedianNcc = med
+        val neo = med >= NEO_MIN_MEDIAN_NCC
+        val was = looksLikeNeoSet
+        looksLikeNeoSet = neo
+        if (!neo) {
+            val now = System.currentTimeMillis()
+            if (was != false || now - lastWarnAt >= WARN_INTERVAL_MS) {
+                lastWarnAt = now
+                Log.w(
+                    TAG,
+                    "Median template NCC %.2f < %.2f over %d pieces: the board probably does not use the " +
+                        "\"neo\" piece set; falling back to the template-free classifier".format(
+                            med, NEO_MIN_MEDIAN_NCC, nccs.size,
+                        ),
+                )
+            }
+        }
+    }
+
+    private fun matchSquare(cell: WideCell, set: NeoTemplateSet): SquareResult {
+        val n = T * T
+        if (cell.size != T) return SquareResult(null, Float.NaN)
+        val bgR = cell.bgRed
+        val bgG = cell.bgGreen
+        val bgB = cell.bgBlue
+        val bgL = cell.bgLuma
+        val gray = cell.gray
+
+        // 1. Occupancy and colour.
+        val diffSq = EMPTY_RGB_DISTANCE * EMPTY_RGB_DISTANCE
+        val darkThr = min(DARK_MAX_LUMA, bgL - DARK_BELOW_BACKGROUND)
+        var counted = 0
+        var differing = 0
+        var dark = 0
+        for (k in 0 until n) {
+            if (!VALID[k]) continue
+            counted++
+            val dr = cell.red[k] - bgR
+            val dg = cell.green[k] - bgG
+            val db = cell.blue[k] - bgB
+            if (dr * dr + dg * dg + db * db > diffSq) differing++
+            if (gray[k] < darkThr) dark++
+        }
+        if (counted == 0) return SquareResult(null, Float.NaN)
+        if (differing < EMPTY_MAX_FRACTION * counted) return SquareResult(SquareOverride('.'), Float.NaN)
+        val darkFraction = dark.toFloat() / counted
+        val white = darkFraction <= BLACK_MIN_DARK_FRACTION
+        val colorConfidence = 200f + abs(darkFraction - BLACK_MIN_DARK_FRACTION) * 1000f
+
+        // 2. Anchor of the captured piece and statistics of the captured square.
+        val anchor = PieceAnchor.find(gray, T, T, bgL, VALID) ?: return SquareResult(null, Float.NaN)
+        var sum = 0.0
+        var sumSq = 0.0
+        for (k in 0 until n) {
+            if (!VALID[k]) continue
+            val v = gray[k].toDouble()
+            sum += v
+            sumSq += v * v
+        }
+        val meanA = sum / counted
+        val varA = sumSq / counted - meanA * meanA
+        if (varA <= 1e-6) return SquareResult(null, Float.NaN)
+        val stdA = sqrt(varA)
+
+        // 3. Best NCC per type over all scales.
+        val bank = set.composited(white, bgL)
+        val typeNcc = FloatArray(TYPE_CHARS.length) { Float.NaN }
+        for (t in TYPE_CHARS.indices) {
+            var best = Float.NEGATIVE_INFINITY
+            var bestTpl: CompositedTemplate? = null
+            var bestDx = 0
+            var bestDy = 0
+            for (tpl in bank.templates[t]) {
+                if (tpl == null) continue
+                val dx = (anchor.cx - tpl.anchor.cx).roundToInt()
+                val dy = anchor.bottom - tpl.anchor.bottom
+                val v = ncc(gray, meanA, stdA, counted, tpl, dx, dy, bank.background)
+                if (v > best) {
+                    best = v
+                    bestTpl = tpl
+                    bestDx = dx
+                    bestDy = dy
+                }
+            }
+            // The anchor is quantized to whole pixels; a +-1 px search at the best scale
+            // recovers thin outlines (white pieces on light squares) that are half a pixel off.
+            if (bestTpl != null) {
+                for (ddy in -REFINE_RADIUS..REFINE_RADIUS) for (ddx in -REFINE_RADIUS..REFINE_RADIUS) {
+                    if (ddx == 0 && ddy == 0) continue
+                    val v = ncc(gray, meanA, stdA, counted, bestTpl, bestDx + ddx, bestDy + ddy, bank.background)
+                    if (v > best) best = v
+                }
+                typeNcc[t] = best
+            }
+        }
+
+        var bestT = -1
+        var secondNcc = -1f
+        for (t in typeNcc.indices) {
+            val v = typeNcc[t]
+            if (v.isNaN()) continue
+            if (bestT < 0 || v > typeNcc[bestT]) {
+                if (bestT >= 0) secondNcc = max(secondNcc, typeNcc[bestT])
+                bestT = t
+            } else {
+                secondNcc = max(secondNcc, v)
+            }
+        }
+        if (bestT < 0) return SquareResult(null, Float.NaN)
+        val bestNcc = typeNcc[bestT]
+        val margin = bestNcc - secondNcc
+
+        // 4. Gate.
+        if (bestNcc < MIN_NCC || margin < MIN_MARGIN) return SquareResult(null, bestNcc)
+        val letter = TYPE_CHARS[bestT].let { if (white) it.uppercaseChar() else it }
+        return SquareResult(SquareOverride(letter, typeNcc, colorConfidence), bestNcc)
+    }
+
+    /**
+     * NCC between the captured square [a] and a T x T canvas filled with [background] onto which
+     * [tpl] is pasted at offset ([dx], [dy]). Only [VALID] pixels take part.
+     */
+    private fun ncc(
+        a: FloatArray,
+        meanA: Double,
+        stdA: Double,
+        count: Int,
+        tpl: CompositedTemplate,
+        dx: Int,
+        dy: Int,
+        background: Float,
+    ): Float {
+        val s = tpl.size
+        val g = tpl.gray
+        var sb = 0.0
+        var sbb = 0.0
+        var sab = 0.0
+        for (y in 0 until T) {
+            val ty = y - dy
+            val rowInside = ty in 0 until s
+            val rowBase = ty * s
+            for (x in 0 until T) {
+                val k = y * T + x
+                if (!VALID[k]) continue
+                val tx = x - dx
+                val v = if (rowInside && tx >= 0 && tx < s) g[rowBase + tx] else background
+                sb += v
+                sbb += v * v
+                sab += a[k] * v
+            }
+        }
+        val meanB = sb / count
+        val varB = sbb / count - meanB * meanB
+        if (varB <= 1e-6) return 0f
+        val cov = sab / count - meanA * meanB
+        return (cov / (stdA * sqrt(varB))).toFloat().coerceIn(-1f, 1f)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Calibrator
 // ---------------------------------------------------------------------------------------------
 
@@ -1332,10 +1932,14 @@ object Fen {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Entry point: screenshot in, FEN out. Uses [templates] when given, otherwise the
- * [TemplateFreeClassifier], so no setup is required.
+ * Entry point: screenshot in, FEN out. Uses the [matcher] first when it is ready (confident
+ * squares from it, the rest from the [TemplateFreeClassifier]), then [templates] when given,
+ * otherwise the [TemplateFreeClassifier] alone, so no setup is required.
  */
-class ChessScreenReader(private val templates: Templates? = null) {
+class ChessScreenReader(
+    private val templates: Templates? = null,
+    private val matcher: TemplateMatchingClassifier? = null,
+) {
 
     /** Returns the FEN of the board in [bitmap], or null if no board was found. */
     fun read(bitmap: Bitmap, whiteToMove: Boolean = true): String? {
@@ -1343,7 +1947,12 @@ class ChessScreenReader(private val templates: Templates? = null) {
         val grid = BoardLocator.locate(px) ?: return null
         val cells = CellReader.read(px, grid)
         val tpl = templates
-        val letters = if (tpl != null) Classifier.classify(cells, tpl) else TemplateFreeClassifier.classify(cells)
+        val overrides = matcher?.takeIf { it.isReady }?.classify(px, grid)
+        val letters = when {
+            overrides != null -> TemplateFreeClassifier.classify(cells, overrides)
+            tpl != null -> Classifier.classify(cells, tpl)
+            else -> TemplateFreeClassifier.classify(cells)
+        }
         val whiteBottom = Orientation.whiteAtBottom(letters)
         return Fen.build(letters, whiteBottom, whiteToMove)
     }

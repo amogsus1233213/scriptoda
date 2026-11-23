@@ -28,6 +28,8 @@ import com.chesstrainer.app.vision.Grid
 import com.chesstrainer.app.vision.Orientation
 import com.chesstrainer.app.vision.Pixels
 import com.chesstrainer.app.vision.TemplateFreeClassifier
+import com.chesstrainer.app.vision.TemplateManager
+import com.chesstrainer.app.vision.TemplateMatchingClassifier
 import com.chesstrainer.app.vision.Templates
 import java.io.File
 import java.io.FileOutputStream
@@ -218,6 +220,12 @@ class AnalysisCoordinator(
         allowCoreThreadTimeOut(true)
     }
 
+    /** Reference piece images for template matching; downloaded in the background. */
+    private val templateManager = TemplateManager.getInstance(appContext)
+
+    /** Highest-priority piece reader once [templateManager] is ready. Worker thread only. */
+    private val templateMatcher = TemplateMatchingClassifier(templateManager)
+
     private val running = AtomicBoolean(false)
     private val processing = AtomicBoolean(false)
     private val calibrationRequested = AtomicBoolean(false)
@@ -276,6 +284,8 @@ class AnalysisCoordinator(
     /** Prepares the engine, loads saved templates and starts consuming screen frames. */
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        // Non-blocking: fetches/loads the piece templates on its own background thread.
+        templateManager.ensureLoaded()
         submit {
             resetGameState()
             ensureTemplatesLoaded()
@@ -521,7 +531,7 @@ class AnalysisCoordinator(
         // Optional accuracy boost: silently learn templates when the starting position shows up.
         if (templates == null) learnTemplatesFromStartPosition(cells)
 
-        val letters = readLetters(cells)
+        val letters = readLetters(px, grid, cells)
         if (letters == null) {
             if (!boardVisible) postHintStatus(STATUS_READING)
             return
@@ -573,13 +583,26 @@ class AnalysisCoordinator(
     }
 
     /**
-     * Reads the piece letters of a frame. Templates (if any) are tried first because they match
-     * the exact theme; if they are missing or give an impossible position (e.g. the user changed
-     * the piece set since they were learnt) the template-free classifier is used.
+     * Reads the piece letters of a frame. Order of preference:
+     *  1. Template matching against the downloaded "neo" pieces (once available): confident
+     *     squares come from it, uncertain ones from the template-free classifier, and the
+     *     board-level sanity checks run over the combination.
+     *  2. Learnt templates (if any), as they match the exact theme.
+     *  3. The template-free classifier alone.
+     * A stage that gives an impossible position is skipped.
      *
      * @return screen-ordered letters of a plausible position, or null if none could be read.
      */
-    private fun readLetters(cells: List<Cell>): Array<CharArray>? {
+    private fun readLetters(px: Pixels, grid: Grid, cells: List<Cell>): Array<CharArray>? {
+        if (templateMatcher.isReady) {
+            val hybrid = try {
+                templateMatcher.classify(px, grid)?.let { TemplateFreeClassifier.classify(cells, it) }
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Template matching failed", e)
+                null
+            }
+            if (hybrid != null && isPlausible(hybrid)) return hybrid
+        }
         val tpl = templates
         if (tpl != null) {
             val byTemplate = try {
