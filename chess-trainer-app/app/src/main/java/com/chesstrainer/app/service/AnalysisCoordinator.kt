@@ -74,7 +74,7 @@ class AnalysisCoordinator(
     companion object {
         private const val TAG = "AnalysisCoordinator"
 
-        const val DEFAULT_DEPTH = 15
+        const val DEFAULT_DEPTH = 18
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 3
@@ -1237,18 +1237,8 @@ class AnalysisCoordinator(
             val label: String
             val color: Int
             when {
-                rank == 1 && classified != null && usersTurn -> {
-                    // On user's turn, show classification of opponent's last move
-                    label = classified.classification.displayName
-                    color = MoveColors.forLabel(label)
-                }
-                rank == 1 && classified != null && !usersTurn -> {
-                    // On opponent's turn, show classification of user's last move
-                    label = classified.classification.displayName
-                    color = MoveColors.forLabel(label)
-                }
                 rank == 1 -> {
-                    label = if (usersTurn) "Best move" else "Best reply"
+                    label = "Best move"
                     color = MoveColors.BEST
                 }
                 else -> {
