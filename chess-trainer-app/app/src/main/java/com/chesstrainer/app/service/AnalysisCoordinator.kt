@@ -74,7 +74,7 @@ class AnalysisCoordinator(
     companion object {
         private const val TAG = "AnalysisCoordinator"
 
-        const val DEFAULT_DEPTH = 21
+        const val DEFAULT_DEPTH = 15
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 3
@@ -1116,6 +1116,7 @@ class AnalysisCoordinator(
             postOverlayClear()
             return
         }
+        postOverlayThinking()
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
 
@@ -1158,6 +1159,7 @@ class AnalysisCoordinator(
             postOverlayClear()
             return
         }
+        postOverlayThinking()
         val analyses = analyzeMulti(fen)
         if (!running.get()) return
         previousFen = null
@@ -1319,6 +1321,10 @@ class AnalysisCoordinator(
 
     private fun postOverlayClear() {
         mainHandler.post { OverlayService.instance?.clearSuggestion() }
+    }
+
+    private fun postOverlayThinking() {
+        mainHandler.post { OverlayService.instance?.showThinking() }
     }
 
     /**

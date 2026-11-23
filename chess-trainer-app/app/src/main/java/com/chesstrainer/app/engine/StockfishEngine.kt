@@ -42,8 +42,7 @@ class StockfishEngine(private val binaryPath: String) {
         /** Base value used to represent mate scores in centipawns. */
         const val MATE_SCORE = 100_000
 
-        /** Generous enough for deep searches (depth 21) on mobile hardware. */
-        private const val ANALYSIS_TIMEOUT_MS = 15_000L
+        private const val ANALYSIS_TIMEOUT_MS = 10_000L
         private const val HANDSHAKE_TIMEOUT_MS = 5_000L
         private const val READY_TIMEOUT_MS = 3_000L
         private const val STOP_DRAIN_TIMEOUT_MS = 1_000L

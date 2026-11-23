@@ -253,6 +253,15 @@ class OverlayService : Service() {
         }
     }
 
+    /** Shows "Engine is calculating..." in the panel without clearing arrows. */
+    fun showThinking() {
+        mainHandler.post {
+            val view = commentaryView ?: return@post
+            view.text = THINKING_TEXT
+            panelRoot?.post { clampAndUpdate() }
+        }
+    }
+
     /** Clears all arrows and resets the panel to its waiting state. */
     fun clearSuggestion() {
         mainHandler.post {
