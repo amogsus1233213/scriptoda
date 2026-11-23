@@ -269,6 +269,12 @@ class OverlayService : Service() {
         }
     }
 
+    fun clearOpponentBadge() {
+        mainHandler.post {
+            arrowView?.clearOpponentBadge()
+        }
+    }
+
     /** Clears all arrows and resets the panel to its waiting state. */
     fun clearSuggestion() {
         mainHandler.post {
@@ -826,14 +832,17 @@ class ArrowView(
             .map { it.copy(from = it.from.lowercase(Locale.ROOT), to = it.to.lowercase(Locale.ROOT)) }
             .sortedBy { it.rank }
             .take(MAX_ARROWS)
-        // New arrows mean the user's turn analysis arrived; the opponent badge is no longer needed.
-        opBadgeSquare = null
-        opBadgeLabel = null
         invalidate()
     }
 
     fun clearArrows() {
         arrows = emptyList()
+        opBadgeSquare = null
+        opBadgeLabel = null
+        invalidate()
+    }
+
+    fun clearOpponentBadge() {
         opBadgeSquare = null
         opBadgeLabel = null
         invalidate()
@@ -854,13 +863,16 @@ class ArrowView(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (arrows.isEmpty()) return
+        val hasArrows = arrows.isNotEmpty()
+        val hasBadge = opBadgeSquare != null
+        if (!hasArrows && !hasBadge) return
         val board = boardRectInView() ?: return
         val square = board.width() / 8f
-        // Worst rank first so the best arrow (and its badge) ends up on top.
-        val drawOrder = arrows.sortedByDescending { it.rank }
-        for (arrow in drawOrder) drawArrow(canvas, arrow, board, square)
-        for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
+        if (hasArrows) {
+            val drawOrder = arrows.sortedByDescending { it.rank }
+            for (arrow in drawOrder) drawArrow(canvas, arrow, board, square)
+            for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
+        }
         drawOpponentBadge(canvas, board, square)
     }
 

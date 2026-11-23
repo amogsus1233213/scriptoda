@@ -1119,6 +1119,7 @@ class AnalysisCoordinator(
             }
             return
         }
+        postClearOpponentBadge()
         postOverlayThinking()
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
@@ -1162,6 +1163,7 @@ class AnalysisCoordinator(
             postOverlayClear()
             return
         }
+        postClearOpponentBadge()
         postOverlayThinking()
         val analyses = analyzeMulti(fen)
         if (!running.get()) return
@@ -1318,6 +1320,10 @@ class AnalysisCoordinator(
 
     private fun postOpponentBadge(square: String, label: String, flipped: Boolean) {
         mainHandler.post { OverlayService.instance?.showOpponentBadge(square, label, flipped) }
+    }
+
+    private fun postClearOpponentBadge() {
+        mainHandler.post { OverlayService.instance?.clearOpponentBadge() }
     }
 
     private fun postOverlayThinking() {
