@@ -11,9 +11,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -22,7 +25,9 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.chesstrainer.app.service.AccessibilityData
 import com.chesstrainer.app.service.AccessibilityStatus
+import com.chesstrainer.app.service.EngineStats
 import com.chesstrainer.app.service.ScreenCaptureService
 import com.chesstrainer.app.ui.OverlayService
 import com.google.android.material.button.MaterialButton
@@ -39,6 +44,12 @@ class MainActivity : AppCompatActivity() {
         private const val CALIBRATE_DELAY_MS = 5_000L
         private const val KEY_RUNNING = "running"
         private const val KEY_BOARD_FOUND = "board_found"
+        private const val KEY_SELECTED_TAB = "selected_tab"
+
+        private const val TAB_CONTROLS = 0
+        private const val TAB_STATS = 1
+        private const val STATS_REFRESH_MS = 1_000L
+        private const val FEN_MAX_CHARS = 40
 
         /**
          * AnalysisCoordinator status messages that reveal whether a board is on screen. They
@@ -62,6 +73,27 @@ class MainActivity : AppCompatActivity() {
     private lateinit var captureStatusText: TextView
     private lateinit var engineStatusText: TextView
     private lateinit var boardStatusText: TextView
+
+    private lateinit var controlsTabButton: MaterialButton
+    private lateinit var statsTabButton: MaterialButton
+    private lateinit var controlsContainer: LinearLayout
+    private lateinit var statsContainer: LinearLayout
+    private lateinit var statsMovesText: TextView
+    private lateinit var statsDepthText: TextView
+    private lateinit var statsFenText: TextView
+    private lateinit var statsEvalText: TextView
+    private lateinit var statsOrientationText: TextView
+    private lateinit var statsAccessibilityText: TextView
+    private lateinit var statsPositionsText: TextView
+
+    private var selectedTab = TAB_CONTROLS
+    private val statsHandler = Handler(Looper.getMainLooper())
+    private val statsRefresher = object : Runnable {
+        override fun run() {
+            updateStats()
+            statsHandler.postDelayed(this, STATS_REFRESH_MS)
+        }
+    }
 
     private var running = false
     private var calibrationTimer: CountDownTimer? = null
@@ -104,6 +136,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         running = savedInstanceState?.getBoolean(KEY_RUNNING) ?: false
         boardFound = savedInstanceState?.getBoolean(KEY_BOARD_FOUND) ?: false
+        selectedTab = savedInstanceState?.getInt(KEY_SELECTED_TAB) ?: TAB_CONTROLS
         setContentView(buildContent())
         refreshUi()
     }
@@ -118,6 +151,13 @@ class MainActivity : AppCompatActivity() {
         if (coordinator.isRunning()) attachCoordinatorListeners()
         refreshUi()
         updateAllStatuses()
+        // Also (re)starts the 1 s stats refresh when the Stats tab is showing.
+        selectTab(selectedTab)
+    }
+
+    override fun onPause() {
+        stopStatsRefresh()
+        super.onPause()
     }
 
     /** Refreshes every row of the System Status section plus the Board Reader status. */
@@ -177,11 +217,13 @@ class MainActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
         outState.putBoolean(KEY_RUNNING, running)
         outState.putBoolean(KEY_BOARD_FOUND, boardFound)
+        outState.putInt(KEY_SELECTED_TAB, selectedTab)
     }
 
     override fun onDestroy() {
         calibrationTimer?.cancel()
         calibrationTimer = null
+        stopStatsRefresh()
         super.onDestroy()
     }
 
@@ -217,6 +259,30 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(subtitle, matchWrap().apply { topMargin = dp(4f) })
 
+        // Tab bar: two buttons that toggle which content container is visible.
+        controlsTabButton = tabButton("Controls") { selectTab(TAB_CONTROLS) }
+        statsTabButton = tabButton("Stats") { selectTab(TAB_STATS) }
+        val tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(controlsTabButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6f)
+            })
+            addView(statsTabButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(6f)
+            })
+        }
+        root.addView(tabBar, matchWrap().apply { topMargin = dp(24f) })
+
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        controlsContainer = controls
+        root.addView(controls, matchWrap())
+
+        statsContainer = buildStatsContent()
+        root.addView(statsContainer, matchWrap())
+
         statusText = TextView(this).apply {
             setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
@@ -225,13 +291,13 @@ class MainActivity : AppCompatActivity() {
             setPadding(p, p, p, p)
             setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.surface))
         }
-        root.addView(statusText, matchWrap().apply { topMargin = dp(32f) })
+        controls.addView(statusText, matchWrap().apply { topMargin = dp(32f) })
 
         startButton = button(getString(R.string.start), R.color.accent_green) { onStartClicked() }
-        root.addView(startButton, matchWrap().apply { topMargin = dp(32f) })
+        controls.addView(startButton, matchWrap().apply { topMargin = dp(32f) })
 
         stopButton = button(getString(R.string.stop), R.color.accent_red) { onStopClicked() }
-        root.addView(stopButton, matchWrap().apply { topMargin = dp(12f) })
+        controls.addView(stopButton, matchWrap().apply { topMargin = dp(12f) })
 
         // Secondary fallback: calibration normally happens automatically.
         calibrateButton = button("Re-calibrate", R.color.accent_blue) { onCalibrateClicked() }.apply {
@@ -239,7 +305,7 @@ class MainActivity : AppCompatActivity() {
             minHeight = dp(40f)
             minimumHeight = dp(40f)
         }
-        root.addView(
+        controls.addView(
             calibrateButton,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -255,12 +321,12 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         }
-        root.addView(boardReaderStatusText, matchWrap().apply { topMargin = dp(32f) })
+        controls.addView(boardReaderStatusText, matchWrap().apply { topMargin = dp(32f) })
 
         enableBoardReaderButton = button("Enable Board Reader", R.color.accent_blue) {
             AccessibilityStatus.openAccessibilitySettings(this)
         }
-        root.addView(enableBoardReaderButton, matchWrap().apply { topMargin = dp(12f) })
+        controls.addView(enableBoardReaderButton, matchWrap().apply { topMargin = dp(12f) })
 
         // Diagnostics: one colour-coded row per component (green = working, red = off/broken,
         // yellow = warning). Filled in by updateAllStatuses().
@@ -271,7 +337,7 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         }
-        root.addView(statusHeader, matchWrap().apply { topMargin = dp(32f) })
+        controls.addView(statusHeader, matchWrap().apply { topMargin = dp(32f) })
 
         overlayStatusText = statusRow("Overlay Permission")
         captureStatusText = statusRow("Screen Capture")
@@ -285,7 +351,7 @@ class MainActivity : AppCompatActivity() {
             listOf(overlayStatusText, captureStatusText, engineStatusText, boardStatusText)
                 .forEach { addView(it, matchWrap()) }
         }
-        root.addView(statusPanel, matchWrap().apply { topMargin = dp(12f) })
+        controls.addView(statusPanel, matchWrap().apply { topMargin = dp(12f) })
 
         val hint = TextView(this).apply {
             text = "Start the service, then open your chess app. The board is detected " +
@@ -295,7 +361,7 @@ class MainActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             gravity = Gravity.CENTER
         }
-        root.addView(hint, matchWrap().apply { topMargin = dp(16f) })
+        controls.addView(hint, matchWrap().apply { topMargin = dp(16f) })
 
         return ScrollView(this).apply {
             isFillViewport = true
@@ -303,6 +369,137 @@ class MainActivity : AppCompatActivity() {
             addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
     }
+
+    /** Content of the Stats tab: one row per live statistic, filled in by [updateStats]. */
+    private fun buildStatsContent(): LinearLayout {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+
+        val header = TextView(this).apply {
+            text = "Live Game Stats"
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+        container.addView(header, matchWrap().apply { topMargin = dp(32f) })
+
+        statsMovesText = statusRow("Moves Analyzed")
+        statsDepthText = statusRow("Engine Depth")
+        statsFenText = statusRow("Last Position")
+        statsEvalText = statusRow("Evaluation")
+        statsOrientationText = statusRow("Board Orientation")
+        statsAccessibilityText = statusRow("Accessibility Data")
+        statsPositionsText = statusRow("Positions Seen")
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = dp(4f)
+            setPadding(0, p, 0, p)
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.surface))
+            listOf(
+                statsMovesText, statsDepthText, statsFenText, statsEvalText,
+                statsOrientationText, statsAccessibilityText, statsPositionsText,
+            ).forEach { addView(it, matchWrap()) }
+        }
+        container.addView(panel, matchWrap().apply { topMargin = dp(12f) })
+
+        val hint = TextView(this).apply {
+            text = "Stats refresh every second while this tab is open."
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            gravity = Gravity.CENTER
+        }
+        container.addView(hint, matchWrap().apply { topMargin = dp(16f) })
+        return container
+    }
+
+    private fun tabButton(label: String, onClick: () -> Unit) = MaterialButton(this).apply {
+        text = label
+        isAllCaps = false
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        cornerRadius = dp(10f)
+        minHeight = dp(48f)
+        setOnClickListener { onClick() }
+    }
+
+    private fun selectTab(tab: Int) {
+        selectedTab = tab
+        val showStats = tab == TAB_STATS
+        controlsContainer.visibility = if (showStats) View.GONE else View.VISIBLE
+        statsContainer.visibility = if (showStats) View.VISIBLE else View.GONE
+        styleTabButton(controlsTabButton, active = !showStats)
+        styleTabButton(statsTabButton, active = showStats)
+        if (showStats) startStatsRefresh() else stopStatsRefresh()
+    }
+
+    private fun styleTabButton(button: MaterialButton, active: Boolean) {
+        button.backgroundTintList = ContextCompat.getColorStateList(
+            this, if (active) R.color.accent_blue else R.color.surface
+        )
+        button.setTextColor(
+            if (active) Color.WHITE else ContextCompat.getColor(this, R.color.text_secondary)
+        )
+        button.typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+    }
+
+    private fun startStatsRefresh() {
+        statsHandler.removeCallbacks(statsRefresher)
+        statsHandler.post(statsRefresher)
+    }
+
+    private fun stopStatsRefresh() {
+        statsHandler.removeCallbacks(statsRefresher)
+    }
+
+    /** Fills the Stats tab rows from [EngineStats] and [AccessibilityData]. */
+    private fun updateStats() {
+        val primary = ContextCompat.getColor(this, R.color.text_primary)
+        val secondary = ContextCompat.getColor(this, R.color.text_secondary)
+
+        statsMovesText.text = "Moves Analyzed: ${EngineStats.movesAnalyzed}"
+        statsMovesText.setTextColor(primary)
+
+        val depth = EngineStats.currentDepth
+        statsDepthText.text = "Engine Depth: ${if (depth > 0) depth.toString() else "—"}"
+        statsDepthText.setTextColor(if (depth > 0) primary else secondary)
+
+        val fen = EngineStats.lastFen
+        statsFenText.text = "Last Position: ${fen?.let { truncate(it, FEN_MAX_CHARS) } ?: "—"}"
+        statsFenText.setTextColor(if (fen != null) primary else secondary)
+
+        val mate = EngineStats.currentMateIn
+        val cp = EngineStats.currentEvalCp
+        val evalLabel = when {
+            mate != null -> "Mate in $mate"
+            cp != null -> "${if (cp > 0) "+" else ""}$cp cp"
+            else -> "—"
+        }
+        statsEvalText.text = "Evaluation: $evalLabel"
+        statsEvalText.setTextColor(if (mate != null || cp != null) primary else secondary)
+
+        val whiteAtBottom = EngineStats.whiteAtBottom ?: AccessibilityData.detectedWhiteAtBottom
+        statsOrientationText.text = "Board Orientation: " + when (whiteAtBottom) {
+            true -> "White at bottom"
+            false -> "Black at bottom"
+            null -> "Unknown"
+        }
+        statsOrientationText.setTextColor(if (whiteAtBottom != null) primary else secondary)
+
+        val accessibilityOk = AccessibilityData.isRecent()
+        statsAccessibilityText.text =
+            if (accessibilityOk) "Accessibility Data: AVAILABLE" else "Accessibility Data: NOT AVAILABLE"
+        statsAccessibilityText.setTextColor(
+            ContextCompat.getColor(this, if (accessibilityOk) R.color.accent_green else R.color.accent_red)
+        )
+
+        statsPositionsText.text = "Positions Seen: ${EngineStats.positionsSeen}"
+        statsPositionsText.setTextColor(primary)
+    }
+
+    private fun truncate(text: String, max: Int): String =
+        if (text.length <= max) text else text.take(max - 1) + "…"
 
     /** A System Status row; [label] is shown until [updateAllStatuses] fills in the state. */
     private fun statusRow(label: String): TextView = TextView(this).apply {

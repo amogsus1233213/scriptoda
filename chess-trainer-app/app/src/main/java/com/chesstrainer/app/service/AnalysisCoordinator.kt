@@ -77,7 +77,7 @@ class AnalysisCoordinator(
         const val DEFAULT_DEPTH = 21
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
-        private const val NUM_LINES = 5
+        private const val NUM_LINES = 3
 
         /**
          * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
@@ -163,7 +163,7 @@ class AnalysisCoordinator(
         private const val STATUS_LOOKING = "Looking for chess board..."
         private const val STATUS_READING = "Board found — reading pieces..."
         private const val STATUS_RECOGNIZED = "Board recognized"
-        private const val STATUS_ANALYZING = "Analyzing..."
+        private const val STATUS_ANALYZING = "Engine is calculating..."
 
         private const val START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"
         private const val EMPTY = '.'
@@ -1091,6 +1091,20 @@ class AnalysisCoordinator(
         castlingRights = updatedCastlingRights(castlingRights, move, after)
         if (!move.white) fullMoveNumber++
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
+        val newWhiteToMove = !move.white
+        if (newWhiteToMove != userIsWhite) {
+            // Opponent's turn: skip multi-PV analysis, just track the position and hide arrows.
+            previousFen = beforeFen
+            previousAnalysis = beforeAnalysis
+            currentFen = newFen
+            currentAnalyses = null
+            // The move was inferred from a legal transition, so keep the jump-check reference fresh.
+            lastKnownGoodFen = newFen
+            lastMove = move
+            lastClassified = classified
+            postOverlayClear()
+            return
+        }
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
 
@@ -1110,6 +1124,17 @@ class AnalysisCoordinator(
         castlingRights = castlingFromPlacement(board)
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
+        if (whiteToMove != (whiteAtBottom ?: true)) {
+            // Opponent's turn: skip analysis, just track the position and hide arrows.
+            previousFen = null
+            previousAnalysis = null
+            currentFen = fen
+            currentAnalyses = null
+            lastMove = null
+            lastClassified = null
+            postOverlayClear()
+            return
+        }
         val analyses = analyzeMulti(fen)
         if (!running.get()) return
         previousFen = null

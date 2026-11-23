@@ -136,8 +136,8 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.chesstrainer.app.action.STOP_OVERLAY"
         private const val CHANNEL_ID = "chess_overlay"
         private const val NOTIFICATION_ID = 2002
-        private const val WAITING_TEXT = "Mittens is waiting for a move..."
-        private const val THINKING_TEXT = "Mittens is thinking..."
+        private const val WAITING_TEXT = "Engine is waiting for a move..."
+        private const val THINKING_TEXT = "Engine is calculating..."
 
         /** Currently running service instance, or null if the overlay is not shown. */
         @Volatile
