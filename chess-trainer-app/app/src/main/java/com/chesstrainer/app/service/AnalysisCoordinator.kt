@@ -231,6 +231,11 @@ class AnalysisCoordinator(
      * FEN does not depend on it).
      */
     private var whiteAtBottom: Boolean? = null
+    /**
+     * Last non-null value of [whiteAtBottom] before a reset. Used as a better fallback than
+     * hardcoded `true` when orientation is temporarily unknown (e.g. right after [resetGameState]).
+     */
+    private var lastKnownOrientation: Boolean? = null
     private var orientationVotes = 0
     /** How [whiteAtBottom] was obtained: one of the CONFIDENCE_* constants. */
     private var orientationConfidence = CONFIDENCE_LOW
@@ -238,6 +243,13 @@ class AnalysisCoordinator(
     private var crossCheckContrary = 0
     /** Accessibility placement whose cross-check last confirmed [whiteAtBottom]. */
     private var crossCheckedPlacement: String? = null
+    /**
+     * Counter for consecutive moves inferred as being from the same side. If this exceeds 2 it
+     * suggests the orientation may be wrong (two white moves in a row without a black move, etc.).
+     */
+    private var consecutiveSameSideMoves = 0
+    /** Side of the last inferred move (true = white). */
+    private var lastInferredMoverWasWhite: Boolean? = null
 
     private var candidatePlacement: String? = null
     private var candidateCount = 0
@@ -972,9 +984,10 @@ class AnalysisCoordinator(
      * from the next read) and the overlay cleared at once.
      */
     private fun setOrientation(bottomIsWhite: Boolean, confidence: Int, reason: String, absolute: Boolean = false) {
-        val drawnBefore = whiteAtBottom ?: true
+        val drawnBefore = whiteAtBottom ?: lastKnownOrientation ?: true
         val wasUnset = whiteAtBottom == null
         whiteAtBottom = bottomIsWhite
+        lastKnownOrientation = bottomIsWhite
         orientationConfidence = confidence
         orientationVotes = 0
         if (drawnBefore != bottomIsWhite) {
@@ -1044,7 +1057,8 @@ class AnalysisCoordinator(
 
     private fun onPositionChanged(placement: String) {
         EngineStats.positionsSeen++
-        val userIsWhite = whiteAtBottom ?: true
+        val orientationKnown = whiteAtBottom != null
+        val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val prevFen = currentFen
         val after = parsePlacement(placement) ?: return
 
@@ -1056,7 +1070,42 @@ class AnalysisCoordinator(
         }
 
         if (move == null) {
+            if (!orientationKnown) {
+                // Orientation unknown — track the position silently without classifying.
+                currentFen = composeFen(
+                    placement,
+                    if (placement == START_PLACEMENT) true else userIsWhite,
+                    castlingFromPlacement(after), null, 1,
+                )
+                return
+            }
             resyncTo(placement, after, if (placement == START_PLACEMENT) true else userIsWhite)
+            return
+        }
+
+        // --- Cross-validate with move inference: same-side-moves sanity check ---
+        if (lastInferredMoverWasWhite == move.white) {
+            consecutiveSameSideMoves++
+            if (consecutiveSameSideMoves >= 2) {
+                Log.w(TAG, "Orientation suspect: ${consecutiveSameSideMoves + 1} consecutive " +
+                    "${if (move.white) "white" else "black"} moves inferred")
+            }
+        } else {
+            consecutiveSameSideMoves = 0
+        }
+        lastInferredMoverWasWhite = move.white
+
+        // --- Don't classify when orientation is unknown ---
+        if (!orientationKnown) {
+            // Track position and inferred move, but don't post badges or analyse.
+            if (prevFen == null) return
+            castlingRights = updatedCastlingRights(castlingRights, move, after)
+            if (!move.white) fullMoveNumber++
+            currentFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
+            lastKnownGoodFen = currentFen
+            lastMove = move
+            lastClassified = null
+            Log.d(TAG, "Orientation unknown — deferring move classification for ${move.uci}")
             return
         }
 
@@ -1103,7 +1152,21 @@ class AnalysisCoordinator(
         if (!move.white) fullMoveNumber++
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
         val newWhiteToMove = !move.white
-        if (newWhiteToMove != userIsWhite) {
+
+        // --- Hardened opponent-turn detection ---
+        // Primary check: whose turn is it now vs. which side the user plays.
+        val turnBasedOpponent = newWhiteToMove != userIsWhite
+        // Cross-check: the inferred mover should be the opponent if it's now the user's turn.
+        val moveBasedOpponent = move.white != userIsWhite
+        if (turnBasedOpponent != moveBasedOpponent) {
+            Log.w(TAG, "Opponent-turn cross-check mismatch: turnBased=$turnBasedOpponent, " +
+                "moveBased=$moveBasedOpponent, move.white=${move.white}, userIsWhite=$userIsWhite")
+        }
+        // Use the move-inference-based check as the authoritative signal: if the mover was the
+        // opponent, treat this as the opponent's turn regardless of turn parity.
+        val isOpponentTurn = moveBasedOpponent
+
+        if (isOpponentTurn) {
             // Opponent's turn: skip multi-PV analysis, just track the position and hide arrows.
             previousFen = beforeFen
             previousAnalysis = beforeAnalysis
@@ -1152,7 +1215,7 @@ class AnalysisCoordinator(
         castlingRights = castlingFromPlacement(board)
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
-        if (whiteToMove != (whiteAtBottom ?: true)) {
+        if (whiteToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
             previousFen = null
             previousAnalysis = null
             currentFen = fen
@@ -1191,11 +1254,14 @@ class AnalysisCoordinator(
     }
 
     private fun resetGameState() {
+        if (whiteAtBottom != null) lastKnownOrientation = whiteAtBottom
         whiteAtBottom = null
         orientationVotes = 0
         orientationConfidence = CONFIDENCE_LOW
         crossCheckContrary = 0
         crossCheckedPlacement = null
+        consecutiveSameSideMoves = 0
+        lastInferredMoverWasWhite = null
         missedFrames = 0
         boardVisible = false
         resetTracking()
@@ -1218,7 +1284,7 @@ class AnalysisCoordinator(
         // On chess.com the user's pieces are at the bottom. The FEN (and so every engine move) is
         // in absolute squares; flipped maps them onto a board drawn with black at the bottom.
         // This is only right if whiteAtBottom describes the real screen, on both input paths.
-        val userIsWhite = whiteAtBottom ?: true
+        val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val flipped = !userIsWhite
         val usersTurn = whiteToMove == userIsWhite
         val classified = lastClassified
