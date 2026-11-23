@@ -19,6 +19,7 @@ import android.graphics.Point
 import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.os.Build
@@ -37,11 +38,14 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.chesstrainer.app.R
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -88,6 +92,21 @@ object MoveColors {
         "blunder" -> "??"
         else -> "·"
     }
+
+    /** Maps a classification label (case-insensitive) to its chess.com-style icon drawable. */
+    fun drawableResForLabel(label: String): Int = when (label.trim().lowercase(Locale.ROOT)) {
+        "brilliant" -> R.drawable.ic_move_brilliant
+        "great" -> R.drawable.ic_move_great
+        "best", "best move", "best reply" -> R.drawable.ic_move_best
+        "excellent" -> R.drawable.ic_move_excellent
+        "good" -> R.drawable.ic_move_good
+        "book" -> R.drawable.ic_move_book
+        "inaccuracy" -> R.drawable.ic_move_inaccuracy
+        "mistake" -> R.drawable.ic_move_mistake
+        "miss" -> R.drawable.ic_move_miss
+        "blunder" -> R.drawable.ic_move_blunder
+        else -> R.drawable.ic_move_best
+    }
 }
 
 /** A single engine-suggested line shown on the overlay. */
@@ -99,6 +118,7 @@ data class SuggestedLine(
     val label: String,       // "Best", "Good", "Inaccuracy", etc.
     val labelColor: Int,
     val rank: Int,           // 1 = best move, 2 = second best, 3 = third best
+    val commentary: String = "", // short coach comment, only shown for the best line
 )
 
 private fun Context.dp(value: Float): Float =
@@ -142,6 +162,9 @@ class OverlayService : Service() {
     private lateinit var contentLayout: LinearLayout
     private lateinit var linesContainer: LinearLayout
     private lateinit var evalBar: EvalBarView
+
+    /** Coach commentary bubble below the move rows; created lazily and reused. */
+    private var commentaryView: TextView? = null
 
     private var expanded = false
     private var lastScreen = Point()
@@ -440,7 +463,7 @@ class OverlayService : Service() {
         val lines = currentLines
         linesContainer.removeAllViews()
         if (lines.isEmpty()) {
-            linesContainer.addView(buildLineRow(MoveColors.NEUTRAL, "·", "Waiting", "—", isBest = true), rowParams())
+            linesContainer.addView(buildLineRow(MoveColors.NEUTRAL, null, "Waiting", "—", isBest = true), rowParams())
             evalBar.setEvaluation(0, null, false)
             arrowView?.clearArrows()
             panelRoot?.post { clampAndUpdate() }
@@ -452,12 +475,28 @@ class OverlayService : Service() {
             linesContainer.addView(
                 buildLineRow(
                     color = line.labelColor,
-                    symbol = MoveColors.symbolForLabel(line.label),
+                    label = line.label,
                     move = "${line.from} → ${line.to}",
                     eval = formatEval(line.evalCp, line.mateIn),
                     isBest = index == 0,
                 ),
                 rowParams(),
+            )
+        }
+
+        // Coach commentary for the best line, below the move rows (rows are rebuilt each render,
+        // so the reused bubble is simply re-appended at the end).
+        val commentary = lines.first().commentary
+        if (commentary.isNotEmpty()) {
+            val view = commentaryView ?: buildCommentaryView().also { commentaryView = it }
+            view.text = commentary
+            (view.parent as? ViewGroup)?.removeView(view)
+            linesContainer.addView(
+                view,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = uiContext.dpInt(6f) },
             )
         }
 
@@ -472,15 +511,34 @@ class OverlayService : Service() {
         panelRoot?.post { clampAndUpdate() }
     }
 
+    private fun buildCommentaryView(): TextView {
+        val ctx = uiContext
+        return TextView(ctx).apply {
+            setTextColor(Color.parseColor("#E8E8E8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = Typeface.defaultFromStyle(Typeface.ITALIC)
+            // Keep the panel compact: wrap instead of widening it, at most two lines.
+            maxWidth = ctx.dpInt(220f)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            val h = ctx.dpInt(8f)
+            setPadding(h, ctx.dpInt(6f), h, ctx.dpInt(4f))
+            background = roundedBackground(Color.parseColor("#33FFFFFF"), 8f)
+        }
+    }
+
     private fun rowParams() = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT,
     )
 
-    /** One panel row: colored dot, classification symbol, move text, eval. */
+    /**
+     * One panel row: classification icon, move text, eval.
+     * A null [label] (waiting state) shows a plain dot in [color] instead of an icon.
+     */
     private fun buildLineRow(
         color: Int,
-        symbol: String,
+        label: String?,
         move: String,
         eval: String,
         isBest: Boolean,
@@ -493,28 +551,30 @@ class OverlayService : Service() {
             setPadding(0, v, 0, v)
         }
 
-        val dotSize = ctx.dpInt(10f)
-        val dot = View(ctx).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(color)
+        if (label != null) {
+            val iconSize = ctx.dpInt(if (isBest) 18f else 14f)
+            val iconView = ImageView(ctx).apply {
+                setImageResource(MoveColors.drawableResForLabel(label))
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                contentDescription = label
             }
+            row.addView(iconView, LinearLayout.LayoutParams(iconSize, iconSize).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                marginEnd = ctx.dpInt(6f)
+            })
+        } else {
+            val dotSize = ctx.dpInt(10f)
+            val dot = View(ctx).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(color)
+                }
+            }
+            row.addView(dot, LinearLayout.LayoutParams(dotSize, dotSize).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                marginEnd = ctx.dpInt(6f)
+            })
         }
-        row.addView(dot, LinearLayout.LayoutParams(dotSize, dotSize).apply {
-            marginEnd = ctx.dpInt(6f)
-        })
-
-        val symbolView = TextView(ctx).apply {
-            text = symbol
-            setTextColor(color)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBest) 15f else 13f)
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            minWidth = ctx.dpInt(20f)
-        }
-        row.addView(symbolView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            marginEnd = ctx.dpInt(6f)
-        })
 
         val moveView = TextView(ctx).apply {
             text = move
@@ -876,16 +936,8 @@ class ArrowView(
     }
     private val layerBounds = RectF()
 
-    private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val badgeRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        color = Color.argb(230, 255, 255, 255)
-    }
-    private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        textAlign = Paint.Align.CENTER
-        typeface = Typeface.DEFAULT_BOLD
-    }
+    /** Classification icons keyed by drawable resource id, loaded lazily on first use. */
+    private val drawableCache = HashMap<Int, Drawable?>()
     private val headPath = Path()
     private val location = IntArray(2)
     private val density = context.resources.displayMetrics.density
@@ -978,28 +1030,28 @@ class ArrowView(
         canvas.drawPath(headPath, headPaint)
     }
 
+    private fun getCachedDrawable(resId: Int): Drawable? =
+        drawableCache.getOrPut(resId) { AppCompatResources.getDrawable(context, resId)?.mutate() }
+
     /**
-     * Draws the classification badge at the top-right corner of the destination square, clear of
-     * the arrowhead. The badge keeps the classification color so the label stays meaningful.
+     * Draws the classification icon at the top-right corner of the destination square, clear of
+     * the arrowhead. The icon keeps the classification look so the label stays meaningful.
      */
     private fun drawBadge(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
         val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
         val style = styleFor(arrow.rank)
-        val radius = style.badgeDp * density / 2f
+        val sizePx = (style.badgeDp * density).roundToInt()
+        if (sizePx <= 0) return
+        val half = sizePx / 2f
         val offset = square * 0.45f
-        val cx = (end.x + offset).coerceIn(radius, max(radius, width - radius))
-        val cy = (end.y - offset).coerceIn(radius, max(radius, height - radius))
+        val cx = (end.x + offset).coerceIn(half, max(half, width - half))
+        val cy = (end.y - offset).coerceIn(half, max(half, height - half))
 
-        badgePaint.color = withAlpha(arrow.color, 255)
-        canvas.drawCircle(cx, cy, radius, badgePaint)
-        badgeRingPaint.strokeWidth = max(1f, density * if (arrow.rank <= 1) 1.5f else 1f)
-        canvas.drawCircle(cx, cy, radius, badgeRingPaint)
-
-        val symbol = MoveColors.symbolForLabel(arrow.label)
-        badgeTextPaint.textSize = radius * 2f * if (symbol.length >= 2) 0.52f else 0.66f
-        val fm = badgeTextPaint.fontMetrics
-        val baseline = cy - (fm.ascent + fm.descent) / 2f
-        canvas.drawText(symbol, cx, baseline, badgeTextPaint)
+        val drawable = getCachedDrawable(MoveColors.drawableResForLabel(arrow.label)) ?: return
+        val left = (cx - half).roundToInt()
+        val top = (cy - half).roundToInt()
+        drawable.setBounds(left, top, left + sizePx, top + sizePx)
+        drawable.draw(canvas)
     }
 
     /** Applies [alpha] (255 for all arrow styles, i.e. fully opaque) to [color]'s RGB. */

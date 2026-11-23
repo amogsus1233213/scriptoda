@@ -12,6 +12,7 @@ import android.util.Log
 import com.chesstrainer.app.engine.AnalysisResult
 import com.chesstrainer.app.engine.ClassifiedMove
 import com.chesstrainer.app.engine.MoveClassifier
+import com.chesstrainer.app.engine.MoveCommentary
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.ui.MoveColors
 import com.chesstrainer.app.ui.OverlayService
@@ -908,12 +909,32 @@ class AnalysisCoordinator(
                 }
             }
             SuggestedLineData(move.substring(0, 2), move.substring(2, 4), evalCp, mateIn, label, color, rank)
-        }
+        }.toMutableList()
 
         if (suggestions.isEmpty()) {
             postOverlayClear()
             return
         }
+
+        val best = suggestions[0]
+        val commentary = try {
+            MoveCommentary.generate(
+                fromSquare = best.from,
+                toSquare = best.to,
+                label = best.label,
+                evalCp = best.evalCp,
+                // SuggestedLineData holds mate from white's POV; commentary wants side to move's.
+                mateIn = best.mateIn?.let { it * sign },
+                fen = fen,
+                isUsersTurn = usersTurn,
+                rank = 1,
+            )
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Commentary failed for $fen", e)
+            ""
+        }
+        suggestions[0] = best.copy(commentary = commentary)
+
         postMultiSuggestion(suggestions, flipped)
     }
 
@@ -932,6 +953,7 @@ class AnalysisCoordinator(
                         label = s.label,
                         labelColor = s.labelColor,
                         rank = s.rank,
+                        commentary = s.commentary,
                     )
                 }
                 overlay.showMultiSuggestion(lines, flipped)
@@ -1103,6 +1125,8 @@ class AnalysisCoordinator(
         val label: String,
         val labelColor: Int,
         val rank: Int,
+        /** Short coach commentary; only set on the best line. */
+        val commentary: String = "",
     )
 
     private data class InferredMove(
