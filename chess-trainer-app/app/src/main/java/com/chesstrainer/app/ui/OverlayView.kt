@@ -808,7 +808,10 @@ class ArrowView(
     private val screenSizeProvider: () -> Point,
 ) : View(context) {
 
-    /** Visual parameters per rank; sizes are fractions of the square size, badge in dp. */
+    /**
+     * Visual parameters per rank; sizes are fractions of the square size, badge in dp.
+     * All ranks are fully opaque: hierarchy comes from thickness and color, never transparency.
+     */
     private data class ArrowStyle(
         val alpha: Int,
         val shaftFactor: Float,
@@ -819,14 +822,31 @@ class ArrowView(
 
     private companion object {
         const val MAX_ARROWS = 3
-        val STYLE_RANK_1 = ArrowStyle(220, 0.20f, 0.50f, 0.32f, 20f)
-        val STYLE_RANK_2 = ArrowStyle(140, 0.14f, 0.42f, 0.25f, 16f)
-        val STYLE_RANK_3 = ArrowStyle(90, 0.10f, 0.36f, 0.20f, 14f)
+        val STYLE_RANK_1 = ArrowStyle(255, 0.24f, 0.55f, 0.36f, 24f)  // Best: opaque, thick
+        val STYLE_RANK_2 = ArrowStyle(255, 0.12f, 0.40f, 0.22f, 16f)  // 2nd: opaque, thin
+        val STYLE_RANK_3 = ArrowStyle(255, 0.08f, 0.32f, 0.16f, 14f)  // 3rd: opaque, very thin
+
+        /** Muted steel blue for the second-best arrow. */
+        val COLOR_RANK_2 = Color.parseColor("#6B8EB5")
+        /** Muted warm gray for the third-best arrow. */
+        val COLOR_RANK_3 = Color.parseColor("#8B8680")
+
+        /** Alpha of the dark outline drawn behind every arrow. */
+        const val BORDER_ALPHA = 100
+        /** Total extra width of the outline (split evenly on both sides of the arrow), in dp. */
+        const val BORDER_EXTRA_DP = 3f
 
         fun styleFor(rank: Int): ArrowStyle = when {
             rank <= 1 -> STYLE_RANK_1
             rank == 2 -> STYLE_RANK_2
             else -> STYLE_RANK_3
+        }
+
+        /** Best move keeps its classification color; alternatives use fixed muted colors. */
+        fun arrowColorForRank(rank: Int, classColor: Int): Int = when {
+            rank <= 1 -> classColor
+            rank == 2 -> COLOR_RANK_2
+            else -> COLOR_RANK_3
         }
     }
 
@@ -840,6 +860,22 @@ class ArrowView(
         strokeCap = Paint.Cap.ROUND
     }
     private val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    // Outline paints are opaque black; the translucency (BORDER_ALPHA) is applied once via a
+    // layer so overlapping shaft/head outlines don't darken where they meet.
+    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        color = Color.BLACK
+    }
+    private val borderHeadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        // Fill + stroke grows the triangle outward by half the stroke width on every edge.
+        style = Paint.Style.FILL_AND_STROKE
+        strokeJoin = Paint.Join.ROUND
+        color = Color.BLACK
+    }
+    private val layerBounds = RectF()
+
     private val badgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val badgeRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -899,7 +935,7 @@ class ArrowView(
         if (length < 1f) return
 
         val style = styleFor(arrow.rank)
-        val color = withAlpha(arrow.color, style.alpha)
+        val color = withAlpha(arrowColorForRank(arrow.rank, arrow.color), style.alpha)
         shaftPaint.color = color
         headPaint.color = color
 
@@ -910,8 +946,11 @@ class ArrowView(
         val baseX = end.x - headLength * cos(angle)
         val baseY = end.y - headLength * sin(angle)
 
-        shaftPaint.strokeWidth = square * style.shaftFactor
-        canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
+        val shaftWidth = square * style.shaftFactor
+        val borderExtra = BORDER_EXTRA_DP * density
+        shaftPaint.strokeWidth = shaftWidth
+        borderPaint.strokeWidth = shaftWidth + borderExtra
+        borderHeadPaint.strokeWidth = borderExtra
 
         val perpX = -sin(angle) * headHalfWidth
         val perpY = cos(angle) * headHalfWidth
@@ -920,15 +959,34 @@ class ArrowView(
         headPath.lineTo(baseX + perpX, baseY + perpY)
         headPath.lineTo(baseX - perpX, baseY - perpY)
         headPath.close()
+
+        // 1-2. Dark outline (shaft + head) in a single translucent layer, bounded to this arrow.
+        val pad = max(headHalfWidth, shaftWidth) + borderExtra * 2f
+        layerBounds.set(
+            min(start.x, end.x) - pad,
+            min(start.y, end.y) - pad,
+            max(start.x, end.x) + pad,
+            max(start.y, end.y) + pad,
+        )
+        val saveCount = canvas.saveLayerAlpha(layerBounds, BORDER_ALPHA)
+        canvas.drawLine(start.x, start.y, baseX, baseY, borderPaint)
+        canvas.drawPath(headPath, borderHeadPaint)
+        canvas.restoreToCount(saveCount)
+
+        // 3-4. Solid colored shaft and arrowhead on top.
+        canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
         canvas.drawPath(headPath, headPaint)
     }
 
-    /** Draws the classification badge above-right of the destination square center. */
+    /**
+     * Draws the classification badge at the top-right corner of the destination square, clear of
+     * the arrowhead. The badge keeps the classification color so the label stays meaningful.
+     */
     private fun drawBadge(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
         val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
         val style = styleFor(arrow.rank)
         val radius = style.badgeDp * density / 2f
-        val offset = square * 0.32f
+        val offset = square * 0.45f
         val cx = (end.x + offset).coerceIn(radius, max(radius, width - radius))
         val cy = (end.y - offset).coerceIn(radius, max(radius, height - radius))
 
@@ -944,6 +1002,7 @@ class ArrowView(
         canvas.drawText(symbol, cx, baseline, badgeTextPaint)
     }
 
+    /** Applies [alpha] (255 for all arrow styles, i.e. fully opaque) to [color]'s RGB. */
     private fun withAlpha(color: Int, alpha: Int): Int =
         Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
 
