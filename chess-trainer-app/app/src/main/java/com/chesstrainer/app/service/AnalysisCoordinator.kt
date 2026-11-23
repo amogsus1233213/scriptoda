@@ -1033,6 +1033,7 @@ class AnalysisCoordinator(
 
     private fun onPositionChanged(placement: String) {
         postOverlayClear()  // Clear arrows immediately on any position change
+        EngineStats.positionsSeen++
         val userIsWhite = whiteAtBottom ?: true
         val prevFen = currentFen
         val after = parsePlacement(placement) ?: return
@@ -1115,6 +1116,14 @@ class AnalysisCoordinator(
         if (!newAnalyses.isNullOrEmpty()) lastKnownGoodFen = newFen
         lastMove = move
         lastClassified = classified
+        EngineStats.movesAnalyzed++
+        EngineStats.lastFen = newFen
+        EngineStats.whiteAtBottom = whiteAtBottom
+        newAnalyses?.firstOrNull()?.let { best ->
+            EngineStats.currentDepth = best.depth
+            EngineStats.currentEvalCp = best.eval
+            EngineStats.currentMateIn = best.mate
+        }
         render()
     }
 
@@ -1144,6 +1153,14 @@ class AnalysisCoordinator(
         if (!analyses.isNullOrEmpty()) lastKnownGoodFen = fen
         lastMove = null
         lastClassified = null
+        EngineStats.positionsSeen++
+        EngineStats.lastFen = fen
+        EngineStats.whiteAtBottom = whiteAtBottom
+        analyses?.firstOrNull()?.let { best ->
+            EngineStats.currentDepth = best.depth
+            EngineStats.currentEvalCp = best.eval
+            EngineStats.currentMateIn = best.mate
+        }
         render()
     }
 
@@ -1156,6 +1173,7 @@ class AnalysisCoordinator(
         missedFrames = 0
         boardVisible = false
         resetTracking()
+        EngineStats.clear()
     }
 
     // -------------------------------------------------------------------------------------
