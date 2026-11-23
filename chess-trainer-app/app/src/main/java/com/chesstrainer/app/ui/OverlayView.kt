@@ -56,6 +56,7 @@ import kotlin.math.sin
 
 /** Colors used for move classification badges and arrows. */
 object MoveColors {
+    val BRILLIANT = Color.parseColor("#1BACA6")  // cyan/teal for brilliant moves
     val BEST = Color.parseColor("#96BC4B")
     val GOOD = Color.parseColor("#7FA650")
     val GREAT = Color.parseColor("#5BAAEF")
@@ -66,7 +67,8 @@ object MoveColors {
 
     /** Maps a classification label (case-insensitive) to its color. */
     fun forLabel(label: String): Int = when (label.trim().lowercase(Locale.ROOT)) {
-        "best", "brilliant" -> BEST
+        "brilliant" -> BRILLIANT
+        "best", "best move", "best reply" -> BEST
         "good", "excellent" -> GOOD
         "great" -> GREAT
         "inaccuracy" -> INACCURACY
@@ -723,7 +725,7 @@ class ArrowView(
 
     /**
      * Visual parameters per rank; sizes are fractions of the square size, badge in dp.
-     * All ranks are fully opaque: hierarchy comes from thickness and color, never transparency.
+     * All ranks share the same geometry; the best move stands out only by being fully opaque.
      */
     private data class ArrowStyle(
         val alpha: Int,
@@ -735,20 +737,11 @@ class ArrowView(
 
     private companion object {
         const val MAX_ARROWS = 5
-        val STYLE_RANK_1 = ArrowStyle(255, 0.24f, 0.55f, 0.36f, 24f)  // Best: opaque, thick
-        val STYLE_RANK_2 = ArrowStyle(255, 0.12f, 0.40f, 0.22f, 16f)  // 2nd: opaque, thin
-        val STYLE_RANK_3 = ArrowStyle(255, 0.08f, 0.32f, 0.16f, 14f)  // 3rd: opaque, very thin
-        val STYLE_RANK_4 = ArrowStyle(255, 0.06f, 0.26f, 0.13f, 12f)  // 4th: hairline
-        val STYLE_RANK_5 = ArrowStyle(255, 0.04f, 0.22f, 0.11f, 10f)  // 5th: thinnest
-
-        /** Muted steel blue for the second-best arrow. */
-        val COLOR_RANK_2 = Color.parseColor("#6B8EB5")
-        /** Muted warm gray for the third-best arrow. */
-        val COLOR_RANK_3 = Color.parseColor("#8B8680")
-        /** Muted olive for the fourth-best arrow. */
-        val COLOR_RANK_4 = Color.parseColor("#7A7A6B")
-        /** Muted gray for the fifth-best arrow. */
-        val COLOR_RANK_5 = Color.parseColor("#6B6B6B")
+        val STYLE_RANK_1 = ArrowStyle(255, 0.14f, 0.40f, 0.22f, 22f)  // Best: fully opaque
+        val STYLE_RANK_2 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
+        val STYLE_RANK_3 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
+        val STYLE_RANK_4 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
+        val STYLE_RANK_5 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
 
         /** Alpha of the dark outline drawn behind every arrow. */
         const val BORDER_ALPHA = 100
@@ -763,14 +756,9 @@ class ArrowView(
             else -> STYLE_RANK_5
         }
 
-        /** Best move keeps its classification color; alternatives use fixed muted colors. */
-        fun arrowColorForRank(rank: Int, classColor: Int): Int = when {
-            rank <= 1 -> classColor
-            rank == 2 -> COLOR_RANK_2
-            rank == 3 -> COLOR_RANK_3
-            rank == 4 -> COLOR_RANK_4
-            else -> COLOR_RANK_5
-        }
+        /** Every arrow uses its own classification color, regardless of rank. */
+        @Suppress("UNUSED_PARAMETER")
+        fun arrowColorForRank(rank: Int, classColor: Int): Int = classColor
     }
 
     private var portraitBounds: RectF? = null
@@ -917,7 +905,7 @@ class ArrowView(
         drawable.draw(canvas)
     }
 
-    /** Applies [alpha] (255 for all arrow styles, i.e. fully opaque) to [color]'s RGB. */
+    /** Applies [alpha] (255 for the best move, 200 for alternatives) to [color]'s RGB. */
     private fun withAlpha(color: Int, alpha: Int): Int =
         Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
 

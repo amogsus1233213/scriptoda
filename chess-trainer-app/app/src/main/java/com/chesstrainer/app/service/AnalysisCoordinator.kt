@@ -812,6 +812,7 @@ class AnalysisCoordinator(
     // -------------------------------------------------------------------------------------
 
     private fun onPositionChanged(placement: String) {
+        postOverlayClear()  // Clear arrows immediately on any position change
         val userIsWhite = whiteAtBottom ?: true
         val prevFen = currentFen
         val after = parsePlacement(placement) ?: return
@@ -884,6 +885,7 @@ class AnalysisCoordinator(
 
     /** Starts tracking from [placement] without a known previous move. */
     private fun resyncTo(placement: String, board: CharArray, whiteToMove: Boolean) {
+        postOverlayClear()  // Clear arrows immediately
         castlingRights = castlingFromPlacement(board)
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
@@ -943,7 +945,13 @@ class AnalysisCoordinator(
             val label: String
             val color: Int
             when {
-                rank == 1 && classified != null -> {
+                rank == 1 && classified != null && usersTurn -> {
+                    // On user's turn, show classification of opponent's last move
+                    label = classified.classification.displayName
+                    color = MoveColors.forLabel(label)
+                }
+                rank == 1 && classified != null && !usersTurn -> {
+                    // On opponent's turn, show classification of user's last move
                     label = classified.classification.displayName
                     color = MoveColors.forLabel(label)
                 }
