@@ -66,11 +66,15 @@ class BoardAccessibilityService : AccessibilityService() {
             val result = BoardPositionParser.parse(nodes)
 
             if (result.positions != null && result.positions.isNotEmpty()) {
-                Log.i(TAG, "Found ${result.boardNodesFound} board nodes, ${result.positions.size} positions")
-                AccessibilityData.update(result.positions)
+                Log.i(
+                    TAG,
+                    "Found ${result.boardNodesFound} board nodes, ${result.positions.size} positions, " +
+                        "white at bottom = ${result.whiteAtBottom}",
+                )
+                AccessibilityData.update(result.positions, result.whiteAtBottom)
             } else if (result.fen != null) {
                 Log.i(TAG, "Found FEN: ${result.fen}")
-                AccessibilityData.update(result.positions)
+                AccessibilityData.update(result.positions, result.whiteAtBottom)
             } else {
                 Log.d(TAG, "No board data in ${result.nodeCount} nodes")
             }

@@ -114,14 +114,36 @@ class AnalysisCoordinator(
         private const val JUMP_STABLE_FRAMES = 4
 
         /**
-         * Orientation hysteresis. Every read frame votes: a frame whose [Orientation.score]
-         * contradicts the locked orientation adds 2 votes when the evidence is strong
+         * Orientation hysteresis for the vision heuristic ([Orientation.score]). A frame whose
+         * score contradicts the locked orientation adds 2 votes when the evidence is strong
          * (|score| >= [STRONG_ORIENTATION_SCORE]) and 1 when weak; an agreeing frame resets the
-         * count. The orientation switches at [ORIENTATION_SWITCH_VOTES], i.e. after 2 strong or 4
-         * weak contrary frames in a row.
+         * count; a frame with |score| < [MIN_ORIENTATION_SCORE] carries no evidence and neither
+         * votes nor resets. The votes needed to switch depend on how the current lock was
+         * obtained ([ORIENTATION_SWITCH_VOTES], indexed by [orientationConfidence]): a lock from a
+         * single weak read is overturned by one strong contrary frame, a heuristic lock by 2 strong
+         * (or 4 weak) frames, and a lock from hard evidence (starting position, accessibility data,
+         * calibration) only by 4 strong frames in a row.
          */
-        private const val ORIENTATION_SWITCH_VOTES = 4
+        private val ORIENTATION_SWITCH_VOTES = intArrayOf(2, 4, 8)
         private const val STRONG_ORIENTATION_SCORE = 20f
+        private const val MIN_ORIENTATION_SCORE = 3f
+
+        /** Orientation provisionally taken from one weak read. */
+        private const val CONFIDENCE_LOW = 0
+        /** Orientation from strong heuristic evidence. */
+        private const val CONFIDENCE_NORMAL = 1
+        /** Orientation from hard evidence: starting position, accessibility, calibration. */
+        private const val CONFIDENCE_HIGH = 2
+
+        /**
+         * Accessibility path: minimum lead (in agreement points, see [screenAgreement]) one
+         * orientation must have over the other before the screen read decides the orientation.
+         * The wrong orientation typically loses by 30+ points; a move in flight costs at most 8.
+         */
+        private const val CROSS_CHECK_MIN_MARGIN = 10
+
+        /** Consecutive contrary cross-checks needed to overturn an orientation that is already set. */
+        private const val CROSS_CHECK_SWITCH_FRAMES = 2
 
         /** Frames without a visible board after which the overlay suggestion is cleared. */
         private const val MISSED_FRAMES_BEFORE_CLEAR = 6
@@ -200,9 +222,20 @@ class AnalysisCoordinator(
     /** Last hint posted while no position could be read yet; used to avoid repeating it. */
     private var lastHintStatus: String? = null
 
-    /** Locked board orientation; null until the first board was read. */
+    /**
+     * Locked board orientation on screen (true = white at the bottom); null until the first board
+     * was read. It is used both to turn vision reads into a FEN and to map engine moves to screen
+     * squares, so it must always describe the real screen (also on the accessibility path, whose
+     * FEN does not depend on it).
+     */
     private var whiteAtBottom: Boolean? = null
     private var orientationVotes = 0
+    /** How [whiteAtBottom] was obtained: one of the CONFIDENCE_* constants. */
+    private var orientationConfidence = CONFIDENCE_LOW
+    /** Consecutive accessibility cross-checks contradicting [whiteAtBottom]. */
+    private var crossCheckContrary = 0
+    /** Accessibility placement whose cross-check last confirmed [whiteAtBottom]. */
+    private var crossCheckedPlacement: String? = null
 
     private var candidatePlacement: String? = null
     private var candidateCount = 0
@@ -342,6 +375,7 @@ class AnalysisCoordinator(
         resetGameState()
         // Templates are only built from the initial position with white at the bottom.
         whiteAtBottom = true
+        orientationConfidence = CONFIDENCE_HIGH
         lastHintStatus = null
         notifyCalibration(true, STATUS_RECOGNIZED)
     }
@@ -433,12 +467,16 @@ class AnalysisCoordinator(
         // still used to locate the board so the overlay has bounds to draw arrows in.
         val accessibilityPositions = freshAccessibilityPositions()
         if (accessibilityPositions != null) {
+            // The accessibility squares are absolute, so the screen orientation (needed to draw
+            // the arrows) must come from elsewhere: the accessibility service when it can tell,
+            // otherwise a cross-check against this frame (see processAccessibilityPositions).
+            val reportedOrientation = AccessibilityData.userPlaysWhite ?: AccessibilityData.detectedWhiteAtBottom
             // A failed copy only costs the bounds refresh; previously known bounds are reused.
             val frame = copyBitmap(bitmap)
             val accepted = submit {
                 try {
-                    if (frame != null) updateBoundsFromFrame(frame)
-                    processAccessibilityPositions(accessibilityPositions)
+                    val board = if (frame != null) updateBoundsFromFrame(frame) else null
+                    processAccessibilityPositions(accessibilityPositions, reportedOrientation, board)
                 } finally {
                     frame?.recycle()
                     processing.set(false)
@@ -586,22 +624,26 @@ class AnalysisCoordinator(
         return if (positions.size >= ACCESSIBILITY_MIN_PIECES) positions else null
     }
 
+    /** Board located in an accessibility-path frame (used for the orientation cross-check). */
+    private class ScreenBoard(val px: Pixels, val grid: Grid)
+
     /**
-     * Locates the board in [bitmap] only to refresh the overlay bounds (no piece reading). Used on
-     * the accessibility path, where the position comes from accessibility data but the arrows still
-     * need to know where the board is on screen. If the board cannot be located in this frame, the
-     * last known bounds are kept.
+     * Locates the board in [bitmap] to refresh the overlay bounds. Used on the accessibility
+     * path, where the position comes from accessibility data but the arrows still need to know
+     * where the board is on screen. If the board cannot be located in this frame, the last known
+     * bounds are kept and null is returned.
      */
-    private fun updateBoundsFromFrame(bitmap: Bitmap) {
-        if (!running.get()) return
+    private fun updateBoundsFromFrame(bitmap: Bitmap): ScreenBoard? {
+        if (!running.get()) return null
         val px = Pixels(bitmap)
         val grid = try {
             BoardLocator.locate(px)
         } catch (e: RuntimeException) {
             Log.w(TAG, "Board location failed on accessibility frame", e)
             null
-        } ?: return
+        } ?: return null
         updateBoardBounds(grid, px, bitmap)
+        return ScreenBoard(px, grid)
     }
 
     /**
@@ -609,8 +651,17 @@ class AnalysisCoordinator(
      * feeds its placement into the same move-tracking path ([onPositionChanged]) that sets
      * [currentFen] for vision reads. Accessibility data is exact, so no multi-frame stability
      * check is needed; an unchanged placement is simply ignored.
+     *
+     * The accessibility squares are absolute, so the FEN is right whatever the orientation, but
+     * the arrows are mapped to the screen with [whiteAtBottom]. That is therefore updated here
+     * from [reportedOrientation] (accessibility service) or, failing that, by cross-checking the
+     * positions against the located [board].
      */
-    private fun processAccessibilityPositions(positions: Map<String, Char>) {
+    private fun processAccessibilityPositions(
+        positions: Map<String, Char>,
+        reportedOrientation: Boolean?,
+        board: ScreenBoard?,
+    ) {
         if (!running.get()) return
         ensureTemplatesLoaded()
 
@@ -638,6 +689,10 @@ class AnalysisCoordinator(
             postStatus(STATUS_ANALYZING)
         }
 
+        // May reset tracking (stablePlacement = null), which makes the code below resync and
+        // redraw the arrows with the corrected orientation.
+        resolveAccessibilityOrientation(placement, positions, reportedOrientation, board)
+
         if (placement == stablePlacement) return
         candidatePlacement = placement
         candidateCount = STABLE_FRAMES
@@ -645,6 +700,84 @@ class AnalysisCoordinator(
         candidateFramesSinceStable = 0
         stablePlacement = placement
         onPositionChanged(placement)
+    }
+
+    /**
+     * Keeps [whiteAtBottom] in line with the real screen while the position comes from
+     * accessibility data. Without this the orientation stayed whatever vision last guessed, or
+     * null (drawn as white at the bottom), so when playing black every arrow was drawn rotated by
+     * 180 degrees (e.g. a knight move starting on a bishop).
+     *
+     * Order of evidence: the orientation reported by the accessibility service, then a cross-check
+     * of [positions] against the pieces visible on [board] ([orientationFromScreen]). The
+     * cross-check is skipped for a placement it already confirmed, as the orientation only
+     * changes together with the position (new game) in practice.
+     */
+    private fun resolveAccessibilityOrientation(
+        placement: String,
+        positions: Map<String, Char>,
+        reportedOrientation: Boolean?,
+        board: ScreenBoard?,
+    ) {
+        if (reportedOrientation != null) {
+            crossCheckContrary = 0
+            setOrientation(reportedOrientation, CONFIDENCE_HIGH, "accessibility service")
+            return
+        }
+        if (board == null) return
+        if (placement == crossCheckedPlacement && orientationConfidence == CONFIDENCE_HIGH) return
+
+        val seen = orientationFromScreen(board, positions) ?: return
+        val locked = whiteAtBottom
+        if (locked != null && seen != locked && orientationConfidence == CONFIDENCE_HIGH) {
+            // A confirmed orientation needs the contrary evidence on consecutive frames.
+            crossCheckContrary++
+            if (crossCheckContrary < CROSS_CHECK_SWITCH_FRAMES) return
+        }
+        crossCheckContrary = 0
+        setOrientation(seen, CONFIDENCE_HIGH, "screen cross-check of accessibility data")
+        crossCheckedPlacement = placement
+    }
+
+    /**
+     * Decides the screen orientation by laying the (absolute) accessibility [positions] onto the
+     * located board both ways and keeping the layout that matches what the frame shows. Only
+     * occupancy and piece colour are compared, which the template-free classifier reads reliably;
+     * piece types do not matter. Returns null when the frame cannot tell (no pieces read, or both
+     * layouts fit about equally well, e.g. with very few pieces left).
+     */
+    private fun orientationFromScreen(board: ScreenBoard, positions: Map<String, Char>): Boolean? {
+        val letters = try {
+            TemplateFreeClassifier.classify(CellReader.read(board.px, board.grid))
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Orientation cross-check failed", e)
+            return null
+        }
+        val lead = screenAgreement(letters, positions, true) - screenAgreement(letters, positions, false)
+        Log.d(TAG, "Orientation cross-check lead (white at bottom minus black at bottom): $lead")
+        return when {
+            lead >= CROSS_CHECK_MIN_MARGIN -> true
+            lead <= -CROSS_CHECK_MIN_MARGIN -> false
+            else -> null
+        }
+    }
+
+    /**
+     * How well screen-ordered [letters] match absolute [positions] if the board is shown with
+     * white at the bottom ([bottomIsWhite]) or black at the bottom: one point per square whose
+     * occupancy agrees and one more per square showing a piece of the same colour in both.
+     */
+    private fun screenAgreement(letters: Array<CharArray>, positions: Map<String, Char>, bottomIsWhite: Boolean): Int {
+        var points = 0
+        for (r in 0 until 8) for (c in 0 until 8) {
+            // Screen row 0 is the top. Same mapping as Fen.build and the overlay's squareCenter.
+            val square = if (bottomIsWhite) "${'a' + c}${8 - r}" else "${'h' - c}${r + 1}"
+            val seen = letters[r][c]
+            val reported = positions[square]
+            if ((seen == EMPTY) == (reported == null)) points++
+            if (seen != EMPTY && reported != null && seen.isUpperCase() == reported.isUpperCase()) points++
+        }
+        return points
     }
 
     /**
@@ -710,10 +843,9 @@ class AnalysisCoordinator(
         templatesLoaded = true
         saveTemplates(result)
         // The starting position fixes the orientation; game tracking resyncs on its own when the
-        // start placement is read below. Placements tracked with the other orientation are void.
-        if (whiteAtBottom != null && whiteAtBottom != bottomIsWhite) resetTracking()
-        whiteAtBottom = bottomIsWhite
-        orientationVotes = 0
+        // start placement is read below. Placements tracked with the other orientation are void
+        // (setOrientation resets them).
+        setOrientation(bottomIsWhite, CONFIDENCE_HIGH, "starting position (template learning)")
         Log.i(TAG, "Learnt piece templates from the starting position")
     }
 
@@ -785,7 +917,8 @@ class AnalysisCoordinator(
      *
      * When the accessibility service reports which side the user plays
      * ([AccessibilityData.userPlaysWhite]), that is authoritative and vision-based detection is
-     * skipped.
+     * skipped. An orientation established from accessibility data while it was available (see
+     * [resolveAccessibilityOrientation]) carries over with high confidence.
      *
      * When the orientation changes, all placements tracked so far were built with the wrong
      * orientation, so move tracking is reset and resyncs from the next stable read.
@@ -793,38 +926,62 @@ class AnalysisCoordinator(
     private fun resolveOrientation(letters: Array<CharArray>): Boolean {
         // Trust the accessibility service's orientation when available.
         AccessibilityData.userPlaysWhite?.let { accessWhite ->
-            if (whiteAtBottom != accessWhite) {
-                Log.i(TAG, "Orientation from accessibility: white at bottom = $accessWhite")
-                val old = whiteAtBottom
-                whiteAtBottom = accessWhite
-                orientationVotes = 0
-                if (old != null) resetTracking()
-            }
+            setOrientation(accessWhite, CONFIDENCE_HIGH, "accessibility service")
             return accessWhite
         }
 
         val score = Orientation.score(letters)
         val detected = score >= 0f
+        val strong = abs(score) >= STRONG_ORIENTATION_SCORE
         val locked = whiteAtBottom
         if (locked == null) {
-            whiteAtBottom = detected
-            orientationVotes = 0
+            // First read: lock it, but a weak read only provisionally (overturned quickly).
+            setOrientation(detected, if (strong) CONFIDENCE_NORMAL else CONFIDENCE_LOW, "first read (score $score)")
             return detected
         }
+        // The starting position settles the orientation at once.
+        if (Fen.build(letters, detected).substringBefore(' ') == START_PLACEMENT) {
+            setOrientation(detected, CONFIDENCE_HIGH, "starting position")
+            return detected
+        }
+        // A (near) zero score is no evidence either way: it must neither vote nor reset the votes,
+        // or a wrong lock could survive forever in a balanced position.
+        if (abs(score) < MIN_ORIENTATION_SCORE) return locked
         if (detected == locked) {
             orientationVotes = 0
+            if (strong && orientationConfidence < CONFIDENCE_NORMAL) orientationConfidence = CONFIDENCE_NORMAL
             return locked
         }
-        orientationVotes += if (abs(score) >= STRONG_ORIENTATION_SCORE) 2 else 1
-        val isStart = Fen.build(letters, detected).substringBefore(' ') == START_PLACEMENT
-        if (isStart || orientationVotes >= ORIENTATION_SWITCH_VOTES) {
-            Log.i(TAG, "Board orientation changed: white at bottom = $detected (score $score)")
-            whiteAtBottom = detected
-            orientationVotes = 0
-            resetTracking()
+        orientationVotes += if (strong) 2 else 1
+        if (orientationVotes >= ORIENTATION_SWITCH_VOTES[orientationConfidence]) {
+            setOrientation(detected, if (strong) CONFIDENCE_NORMAL else CONFIDENCE_LOW, "vision (score $score)")
             return detected
         }
         return locked
+    }
+
+    /**
+     * Locks the board orientation with the given confidence (CONFIDENCE_*). If the orientation
+     * used for drawing changes (an unset orientation is drawn as white at the bottom, see
+     * [render]), everything tracked so far is void: vision placements were built with the other
+     * orientation and the arrows on screen are drawn rotated. Tracking is then reset (it resyncs
+     * from the next read) and the overlay cleared at once.
+     */
+    private fun setOrientation(bottomIsWhite: Boolean, confidence: Int, reason: String) {
+        val drawnBefore = whiteAtBottom ?: true
+        val wasUnset = whiteAtBottom == null
+        whiteAtBottom = bottomIsWhite
+        orientationConfidence = confidence
+        orientationVotes = 0
+        if (drawnBefore != bottomIsWhite) {
+            Log.i(TAG, "Board orientation changed: white at bottom = $bottomIsWhite ($reason)")
+            crossCheckContrary = 0
+            crossCheckedPlacement = null
+            resetTracking()
+            postOverlayClear()
+        } else if (wasUnset) {
+            Log.i(TAG, "Board orientation: white at bottom = $bottomIsWhite ($reason)")
+        }
     }
 
     /** Forgets all tracked placements and positions (but not the orientation). */
@@ -968,6 +1125,9 @@ class AnalysisCoordinator(
     private fun resetGameState() {
         whiteAtBottom = null
         orientationVotes = 0
+        orientationConfidence = CONFIDENCE_LOW
+        crossCheckContrary = 0
+        crossCheckedPlacement = null
         missedFrames = 0
         boardVisible = false
         resetTracking()
@@ -986,6 +1146,9 @@ class AnalysisCoordinator(
         val fen = currentFen ?: return
         val analyses = currentAnalyses
         val whiteToMove = sideToMoveIsWhite(fen)
+        // On chess.com the user's pieces are at the bottom. The FEN (and so every engine move) is
+        // in absolute squares; flipped maps them onto a board drawn with black at the bottom.
+        // This is only right if whiteAtBottom describes the real screen, on both input paths.
         val userIsWhite = whiteAtBottom ?: true
         val flipped = !userIsWhite
         val usersTurn = whiteToMove == userIsWhite

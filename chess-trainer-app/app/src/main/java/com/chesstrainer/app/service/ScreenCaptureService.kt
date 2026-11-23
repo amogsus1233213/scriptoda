@@ -410,7 +410,15 @@ class ScreenCaptureService : Service() {
 
         val s = scale
         val width = alignDown((screenWidth * s).roundToInt(), WIDTH_ALIGNMENT)
-        val height = alignDown((screenHeight * s).roundToInt(), HEIGHT_ALIGNMENT)
+        // Derive the height from the aligned width so the capture keeps the screen's aspect ratio.
+        // Otherwise the mirrored screen is letterboxed inside the virtual display (e.g. 1080 wide
+        // at 0.5 aligns to 528 instead of 540, a 2% aspect error), and the board bounds, sent to
+        // the overlay as fractions of the frame, no longer line up with the real screen.
+        val height = alignDown(
+            if (screenWidth > 0) (width.toLong() * screenHeight / screenWidth).toInt()
+            else (screenHeight * s).roundToInt(),
+            HEIGHT_ALIGNMENT,
+        )
         val density = max(1, (resources.displayMetrics.densityDpi * s).roundToInt())
         return CaptureSize(width, height, density)
     }
