@@ -1282,6 +1282,8 @@ class AnalysisCoordinator(
                 fen = fen,
                 isUsersTurn = usersTurn,
                 rank = 1,
+                promotion = analyses.firstOrNull { it.bestMove.startsWith(best.from + best.to) }
+                    ?.bestMove?.getOrNull(4),
             )
         } catch (e: RuntimeException) {
             Log.w(TAG, "Commentary failed for $fen", e)

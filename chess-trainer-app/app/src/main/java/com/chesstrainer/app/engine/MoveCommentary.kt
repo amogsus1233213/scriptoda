@@ -25,6 +25,9 @@ object MoveCommentary {
      * @param fen current position FEN (before the suggested move)
      * @param isUsersTurn whether it is the user's turn to move
      * @param rank 1 = best line, 2 = second, 3 = third; only the best line gets commentary
+     * @param promotion piece the pawn promotes to ('q', 'r', 'b' or 'n'), i.e. the fifth
+     *   character of a UCI move such as "e7e8n". Also read from [toSquare] when that carries the
+     *   suffix ("e8n"). Defaults to a queen.
      * @return the commentary, or "" when there is nothing to say (e.g. [rank] != 1)
      */
     fun generate(
@@ -36,6 +39,7 @@ object MoveCommentary {
         fen: String,
         isUsersTurn: Boolean,
         rank: Int = 1,
+        promotion: Char? = null,
     ): String {
         if (rank != 1) return ""
         val board = parseBoard(fen) ?: return ""
@@ -55,14 +59,21 @@ object MoveCommentary {
         val isCapture = captured != null
         val isCastle = kind == 'k' && isCastling(fromSquare, toSquare)
         val isPromotion = kind == 'p' && (to / 8 == 7 || to / 8 == 0)
+        val promoteTo = (promotion ?: toSquare.getOrNull(2))?.lowercaseChar()?.takeIf { it in "qrbn" } ?: 'q'
 
         // Board after the suggested move (castling rook and en passant victim included).
-        val after = applyMove(board, from, to, isCastle, isPromotion)
+        val after = applyMove(board, from, to, isCastle, if (isPromotion) promoteTo else null)
         val givesCheck = kingSquare(after, !moverIsWhite)?.let { isAttacked(after, it, moverIsWhite) } ?: false
-        // Defended destination: the opponent can recapture right away.
-        val landsDefended = isAttacked(after, to, !moverIsWhite)
-        val isSacrifice = isCapture && landsDefended && pieceValue(piece) > pieceValue(captured!!) + 1
-        val isHanging = isCapture && !landsDefended && pieceValue(captured!!) >= 3
+
+        val capturedValue = captured?.let { pieceValue(it) } ?: 0
+        val canBeRecaptured = legalCapturers(after, to, !moverIsWhite).isNotEmpty()
+        // A promoting pawn only ever risks the pawn, whatever it turns into.
+        val loss = if (kind == 'k') 0 else materialLostOn(after, to, moverIsWhite, pieceValue(piece))
+        val isSacrifice = loss - capturedValue >= 2
+        val isHanging = isCapture && !canBeRecaptured && capturedValue >= 3
+        val winsMaterial = isCapture && capturedValue - loss >= 2
+        // The captured piece is simply lost, as opposed to traded off.
+        val capturedIsLost = isCapture && (!canBeRecaptured || pieceValue(piece) < capturedValue)
 
         // Eval from the side to move's POV (the side playing the suggested move).
         val moverEval = evalCp?.let { if (moverIsWhite) it else -it }
@@ -80,7 +91,7 @@ object MoveCommentary {
 
         return if (isUsersTurn) {
             when {
-                mateIn != null && mateIn == 1 -> pick(CHECKMATE_LINES)
+                mateIn != null && mateIn == 1 -> pick(MATE_IN_ONE_LINES)
                 mateIn != null && mateIn in 2..3 -> pick(MATE_SOON_LINES, mateIn)
                 mateIn != null && mateIn > 0 -> pick(MATE_LINES, mateIn)
                 mateIn != null && mateIn < 0 -> pick(GETTING_MATED_LINES)
@@ -90,19 +101,24 @@ object MoveCommentary {
                 lastLabel == "mistake" || lastLabel == "miss" -> pick(OPPONENT_MISTAKE_LINES)
                 lastLabel == "brilliant" -> pick(OPPONENT_BRILLIANT_LINES)
 
-                isSacrifice -> pick(SACRIFICE_LINES, pieceName.uppercase(Locale.ROOT), capturedName)
+                isSacrifice && isCapture ->
+                    pick(SACRIFICE_CAPTURE_LINES, pieceName.uppercase(Locale.ROOT), capturedName)
+                isSacrifice -> pick(SACRIFICE_LINES, pieceName.uppercase(Locale.ROOT))
+                isPromotion && promoteTo != 'q' -> pick(UNDERPROMOTION_LINES, pieceName(promoteTo))
                 isPromotion -> pick(PROMOTION_LINES)
                 isHanging && isHighValue(captured) -> pick(BIG_CAPTURE_LINES, capturedName)
                 isHanging -> pick(FREE_PIECE_LINES, capturedName)
+                winsMaterial -> pick(WINNING_CAPTURE_LINES, pieceName, capturedName)
                 givesCheck -> pick(CHECK_LINES, pieceName)
                 isCapture -> pick(CAPTURE_LINES, pieceName, capturedName)
                 isCastle -> pick(CASTLE_LINES)
+
+                lastLabel == "inaccuracy" -> pick(OPPONENT_INACCURACY_LINES)
 
                 moverEval != null && moverEval > 500 -> pick(WINNING_BIG_LINES)
                 moverEval != null && moverEval < -500 -> pick(LOSING_BIG_LINES)
                 moverEval != null && moverEval in -30..30 -> pick(EQUAL_LINES)
 
-                lastLabel == "inaccuracy" -> pick(OPPONENT_INACCURACY_LINES)
                 lastLabel == "best" || lastLabel == "great" || lastLabel == "best move" ->
                     pick(BEST_MOVE_LINES, pieceName)
                 else -> pick(DEFAULT_LINES, pieceName)
@@ -119,8 +135,9 @@ object MoveCommentary {
                 lastLabel == "mistake" || lastLabel == "miss" -> pick(MISTAKE_LINES)
                 lastLabel == "inaccuracy" -> pick(INACCURACY_LINES)
 
-                isCapture && isHighValue(captured) -> pick(THREAT_BIG_CAPTURE_LINES, capturedName)
+                capturedIsLost && isHighValue(captured) -> pick(THREAT_BIG_CAPTURE_LINES, capturedName)
                 givesCheck -> pick(THREAT_CHECK_LINES, pieceName)
+                isCapture && !capturedIsLost -> pick(THREAT_TRADE_LINES, capturedName)
                 isCapture -> pick(THREAT_CAPTURE_LINES, capturedName)
 
                 lastLabel == "best" || lastLabel == "excellent" || lastLabel == "good" ||
@@ -165,7 +182,8 @@ object MoveCommentary {
         return rank * 8 + file
     }
 
-    private fun applyMove(board: CharArray, from: Int, to: Int, castle: Boolean, promotion: Boolean): CharArray {
+    /** @param promoteTo lowercase piece the moving pawn promotes to, or null when it does not. */
+    private fun applyMove(board: CharArray, from: Int, to: Int, castle: Boolean, promoteTo: Char?): CharArray {
         val b = board.copyOf()
         val piece = b[from]
         val white = piece.isUpperCase()
@@ -173,7 +191,7 @@ object MoveCommentary {
         if (piece.lowercaseChar() == 'p' && from % 8 != to % 8 && b[to] == EMPTY) {
             b[(from / 8) * 8 + to % 8] = EMPTY
         }
-        b[to] = if (promotion) (if (white) 'Q' else 'q') else piece
+        b[to] = promoteTo?.let { if (white) it.uppercaseChar() else it } ?: piece
         b[from] = EMPTY
         if (castle) {
             val base = (from / 8) * 8
@@ -193,36 +211,68 @@ object MoveCommentary {
     }
 
     /** True if any piece of colour [byWhite] attacks [square]. */
-    private fun isAttacked(board: CharArray, square: Int, byWhite: Boolean): Boolean {
+    private fun isAttacked(board: CharArray, square: Int, byWhite: Boolean): Boolean =
+        attackers(board, square, byWhite).isNotEmpty()
+
+    /** Squares of the pieces of colour [byWhite] that attack [square]. */
+    private fun attackers(board: CharArray, square: Int, byWhite: Boolean): List<Int> {
         val f = square % 8
         val r = square / 8
-        fun at(file: Int, rank: Int): Char =
-            if (file in 0..7 && rank in 0..7) board[rank * 8 + file] else EMPTY
-        fun own(c: Char, kind: Char): Boolean =
-            c != EMPTY && c.isUpperCase() == byWhite && c.lowercaseChar() == kind
+        val found = ArrayList<Int>()
+        fun check(file: Int, rank: Int, kind: Char) {
+            if (file !in 0..7 || rank !in 0..7) return
+            val c = board[rank * 8 + file]
+            if (c != EMPTY && c.isUpperCase() == byWhite && c.lowercaseChar() == kind) found += rank * 8 + file
+        }
 
         // Pawns attack diagonally forward, so look one rank "behind" the square.
         val pawnRank = if (byWhite) r - 1 else r + 1
-        if (own(at(f - 1, pawnRank), 'p') || own(at(f + 1, pawnRank), 'p')) return true
+        check(f - 1, pawnRank, 'p')
+        check(f + 1, pawnRank, 'p')
 
-        for ((df, dr) in KNIGHT_STEPS) if (own(at(f + df, r + dr), 'n')) return true
-        for ((df, dr) in KING_STEPS) if (own(at(f + df, r + dr), 'k')) return true
+        for ((df, dr) in KNIGHT_STEPS) check(f + df, r + dr, 'n')
+        for ((df, dr) in KING_STEPS) check(f + df, r + dr, 'k')
 
         for ((df, dr) in KING_STEPS) {
             val diagonal = df != 0 && dr != 0
             var cf = f + df
             var cr = r + dr
             while (cf in 0..7 && cr in 0..7) {
-                val c = board[cr * 8 + cf]
-                if (c != EMPTY) {
-                    if (own(c, 'q') || own(c, if (diagonal) 'b' else 'r')) return true
+                if (board[cr * 8 + cf] != EMPTY) {
+                    check(cf, cr, 'q')
+                    check(cf, cr, if (diagonal) 'b' else 'r')
                     break
                 }
                 cf += df
                 cr += dr
             }
         }
-        return false
+        return found
+    }
+
+    private fun capture(board: CharArray, from: Int, to: Int): CharArray =
+        board.copyOf().also { it[to] = it[from]; it[from] = EMPTY }
+
+    /**
+     * Attackers of [square] that may actually capture there: excludes pinned pieces and a king
+     * that would step into check.
+     */
+    private fun legalCapturers(board: CharArray, square: Int, byWhite: Boolean): List<Int> =
+        attackers(board, square, byWhite).filter { from ->
+            val next = capture(board, from, square)
+            kingSquare(next, byWhite)?.let { !isAttacked(next, it, !byWhite) } ?: true
+        }
+
+    /**
+     * Material the side [ownerIsWhite] loses if the opponent takes the piece on [square] with its
+     * cheapest capturer and the owner recaptures when possible. 0 when taking does not pay.
+     */
+    private fun materialLostOn(board: CharArray, square: Int, ownerIsWhite: Boolean, invested: Int): Int {
+        val capturer = legalCapturers(board, square, !ownerIsWhite).minByOrNull { pieceValue(board[it]) }
+            ?: return 0
+        val next = capture(board, capturer, square)
+        val regained = if (legalCapturers(next, square, ownerIsWhite).isEmpty()) 0 else pieceValue(board[capturer])
+        return (invested - regained).coerceAtLeast(0)
     }
 
     private val KNIGHT_STEPS = listOf(1 to 2, 2 to 1, -1 to 2, -2 to 1, 1 to -2, 2 to -1, -1 to -2, -2 to -1)
@@ -255,12 +305,12 @@ object MoveCommentary {
     // Lines: user's turn (the suggestion is the user's move)
     // -------------------------------------------------------------------------------------
 
-    private val CHECKMATE_LINES = arrayOf(
-        "Checkmate. I expected nothing less.",
-        "And that's mate. You're welcome.",
-        "Checkmate, darling. Try not to gloat.",
-        "That's the game. Even I'm purring.",
-        "Mate. Honestly surprised you saw it.",
+    private val MATE_IN_ONE_LINES = arrayOf(
+        "Mate in 1. Play it before I lose patience.",
+        "Checkmate is one move away. Go on, then.",
+        "Mate in 1, darling. Don't overthink it.",
+        "One move ends the game. This one.",
+        "There's a mate in 1. Please tell me you see it.",
     )
 
     private val MATE_SOON_LINES = arrayOf(
@@ -317,11 +367,13 @@ object MoveCommentary {
 
     private val SACRIFICE_LINES = arrayOf(
         "SACRIFICE THE %s!! Trust me on this.",
-        "Give up the %s for the %s. Yes, really.",
         "The %s goes. It looks insane but it's winning.",
         "Sac the %s. Tal sends his regards.",
         "%s sacrifice. The kind of move I'd play.",
     )
+
+    // Args are (mover, captured).
+    private val SACRIFICE_CAPTURE_LINES = SACRIFICE_LINES + "Give up the %s for the %s. Yes, really."
 
     private val BIG_CAPTURE_LINES = arrayOf(
         "Their %s is just sitting there. Take it.",
@@ -338,6 +390,14 @@ object MoveCommentary {
         "A free %s. Even a kitten could find this.",
     )
 
+    // Args are (mover, captured).
+    private val WINNING_CAPTURE_LINES = arrayOf(
+        "%s takes %s. That trade only favors you.",
+        "Take the %2\$s with the %1\$s. They can recapture, and you still come out ahead.",
+        "The %s for their %s? Yes, please.",
+        "Grab the %2\$s. Whatever they take back is worth less.",
+    )
+
     private val CHECK_LINES = arrayOf(
         "Check with the %s. Keep their king uncomfortable.",
         "%s check. Make the king dance.",
@@ -346,7 +406,7 @@ object MoveCommentary {
     )
 
     private val CAPTURE_LINES = arrayOf(
-        "%s takes %s. Fair exchange.",
+        "%s takes %s. Nothing more to it.",
         // Args are (mover, captured); %2$s refers to the captured piece.
         "Capture the %2\$s. Clean and simple.",
         "%s takes the %s. No drama, just chess.",
@@ -366,6 +426,13 @@ object MoveCommentary {
         "That pawn has earned its crown.",
         "Promote. The pawn's glow-up is complete.",
         "Queening time. The board won't know what hit it.",
+    )
+
+    private val UNDERPROMOTION_LINES = arrayOf(
+        "Promote to a %s, not a queen. Yes, I'm sure.",
+        "Underpromote to a %s. The queen can wait.",
+        "Make it a %s. Greed loses here, precision wins.",
+        "A %s, not a queen. Trust the cat.",
     )
 
     private val WINNING_BIG_LINES = arrayOf(
@@ -421,7 +488,7 @@ object MoveCommentary {
 
     private val GREAT_LINES = arrayOf(
         "Great move. You have your moments.",
-        "Sharp eye. That was the only move that works.",
+        "Sharp move. That swung things your way.",
         "Great move. I'll allow a small celebration.",
         "You found it. Nicely done, honestly.",
     )
@@ -475,6 +542,13 @@ object MoveCommentary {
         "Your %s is hanging. Hope they don't see it.",
         "Watch the %s. It's not safe where it is.",
         "They can take your %s. Concerning.",
+    )
+
+    private val THREAT_TRADE_LINES = arrayOf(
+        "Expect them to take the %s. You can take back.",
+        "They'll likely trade on the %s. Recapture and carry on.",
+        "A trade on the %s is coming. Nothing to fear.",
+        "They can swap off the %s. Be ready to recapture.",
     )
 
     private val THREAT_CHECK_LINES = arrayOf(
