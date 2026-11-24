@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.AtomicFile
 import android.util.Log
 import com.chesstrainer.app.engine.AnalysisResult
@@ -12,6 +13,7 @@ import com.chesstrainer.app.engine.ClassifiedMove
 import com.chesstrainer.app.engine.MoveClassifier
 import com.chesstrainer.app.engine.MoveClass
 import com.chesstrainer.app.engine.MoveCommentary
+import com.chesstrainer.app.engine.PositionValidator
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.service.AccessibilityData
 import com.chesstrainer.app.service.FenConverter
@@ -98,6 +100,16 @@ class AnalysisCoordinator(
 
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
+
+        /**
+         * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
+         * above which a warning is logged. No ordinary move swings the eval this far, so it is
+         * either a mate appearing or disappearing, or the engine answering for another position.
+         */
+        private const val EVAL_SWING_WARN_CP = 5000
+
+        /** A position analysed and shown less than this long ago is not searched again. */
+        private const val STALE_ANALYSIS_MS = 2000L
 
         /**
          * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
@@ -301,6 +313,21 @@ class AnalysisCoordinator(
     private var fullMoveNumber = 1
 
     /**
+     * The position last drawn on the overlay ([positionKey]), when it was drawn
+     * ([SystemClock.elapsedRealtime]) and the analyses it was drawn from. See [recentlyShown].
+     */
+    private var shownKey: String? = null
+    private var shownAtMs = 0L
+    private var shownAnalyses: List<AnalysisResult>? = null
+
+    /** Placement and eval (white's POV) of the last main search, for [checkEvalSanity]. */
+    private var lastSearchedPlacement: String? = null
+    private var lastSearchedEvalWhite: Int? = null
+
+    /** Whether the last position change found no side-to-move source in [AccessibilityData]. */
+    private var turnSourcesUnavailable = false
+
+    /**
      * Set when a new position has been detected while the previous analysis is still running.
      * The analysis loop checks this and returns early so stale results are never displayed.
      */
@@ -472,12 +499,155 @@ class AnalysisCoordinator(
     private fun analyze(fen: String): AnalysisResult? {
         val e = engine ?: return null
         if (!running.get()) return null
-        return try {
+        if (!isAnalyzable(fen)) return null
+        val result = try {
             e.analyze(fen, depth)
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Analysis failed for $fen", ex)
             null
         }
+        return validatedAnalyses(fen, result?.let { listOf(it) })?.firstOrNull()
+    }
+
+    /**
+     * False (and logged) when [fen] must not be analysed: it is malformed
+     * ([PositionValidator.fenError]) or the side not to move is in check, which means the side to
+     * move is wrong. Either way the engine would return garbage that must not be shown.
+     */
+    private fun isAnalyzable(fen: String): Boolean {
+        val error = PositionValidator.fenError(fen)
+        if (error != null) {
+            Log.w(TAG, "Skipping analysis, invalid FEN ($error): $fen")
+            return false
+        }
+        if (PositionValidator.sideNotToMoveInCheck(fen)) {
+            Log.w(TAG, "Skipping analysis, side not to move is in check (wrong side to move?): $fen")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * Checks the engine's moves against the position they were asked for
+     * ([PositionValidator.bestMoveError]). A bad top move means the answer does not belong to
+     * [fen] (UCI desync), so the whole result is dropped and nothing is rendered; a bad
+     * alternative line is dropped on its own. An empty best move (no legal move: mate or
+     * stalemate) is a valid answer and passes through.
+     */
+    private fun validatedAnalyses(fen: String, analyses: List<AnalysisResult>?): List<AnalysisResult>? {
+        if (analyses.isNullOrEmpty()) return analyses
+        val errors = analyses.map { result ->
+            result.bestMove.takeIf { it.isNotEmpty() }?.let { PositionValidator.bestMoveError(fen, it) }
+        }
+        if (errors.all { it == null }) return analyses
+        errors[0]?.let { error ->
+            Log.w(TAG, "Discarding analysis, bestmove '${analyses[0].bestMove}' does not fit the " +
+                "position ($error): $fen")
+            return null
+        }
+        return analyses.filterIndexed { index, result ->
+            val error = errors[index]
+            if (error != null) {
+                Log.w(TAG, "Dropping line ${index + 1}, move '${result.bestMove}' does not fit the " +
+                    "position ($error): $fen")
+            }
+            error == null
+        }
+    }
+
+    /**
+     * Logs a warning when the eval of [best] (the main search of [fen]) is more than
+     * [EVAL_SWING_WARN_CP] away from the previous main search, provided the two positions are
+     * close ([MAX_SQUARE_JUMP]) and this is not the start of a new game. A swing that size with
+     * no mate score involved cannot come from one or two moves and points at a UCI desync.
+     */
+    private fun checkEvalSanity(fen: String, best: AnalysisResult?) {
+        if (best == null) return
+        val placement = fen.substringBefore(' ')
+        val evalWhite = if (sideToMoveIsWhite(fen)) best.eval else -best.eval
+        val previousPlacement = lastSearchedPlacement
+        val previousEval = lastSearchedEvalWhite
+        lastSearchedPlacement = placement
+        lastSearchedEvalWhite = evalWhite
+        if (previousPlacement == null || previousEval == null) return
+        if (placement == START_PLACEMENT) return
+        val distance = squaresDiffering(previousPlacement, placement) ?: return
+        if (distance > MAX_SQUARE_JUMP) return
+        val swing = abs(evalWhite - previousEval)
+        if (swing <= EVAL_SWING_WARN_CP) return
+        val mateInvolved = best.mate != null || abs(previousEval) >= StockfishEngine.MATE_SCORE - 1000
+        Log.w(TAG, "Eval swing of $swing cp between consecutive analyses ($previousEval -> " +
+            "$evalWhite, white's POV, $distance squares changed): " +
+            (if (mateInvolved) "a forced mate appeared or disappeared" else "possible UCI desync") +
+            ". FEN: $fen")
+    }
+
+    /** Number of squares on which two FEN placements differ, or null if either is malformed. */
+    private fun squaresDiffering(a: String, b: String): Int? {
+        val first = parsePlacement(a) ?: return null
+        val second = parsePlacement(b) ?: return null
+        return (0 until 64).count { first[it] != second[it] }
+    }
+
+    /** Identity of a position for [recentlyShown]: its FEN without the move counters. */
+    private fun positionKey(fen: String): String = fenFields(fen).take(4).joinToString(" ")
+
+    /**
+     * The analyses of [fen] if that exact position was analysed and drawn on the overlay less
+     * than [STALE_ANALYSIS_MS] ago, otherwise null. Used to answer a position that comes back
+     * right away (duplicate or flickering accessibility events, a one-frame misread) without
+     * another search, which would blank the arrows behind "thinking" for its whole duration.
+     */
+    private fun recentlyShown(fen: String): List<AnalysisResult>? {
+        val analyses = shownAnalyses ?: return null
+        if (shownKey != positionKey(fen)) return null
+        val age = SystemClock.elapsedRealtime() - shownAtMs
+        if (age < 0 || age >= STALE_ANALYSIS_MS) return null
+        Log.d(TAG, "Position was analysed and shown $age ms ago, reusing that analysis: $fen")
+        return analyses
+    }
+
+    /**
+     * Logs when neither [AccessibilityData.whiteToMove] nor [AccessibilityData.trackedFen] can
+     * tell whose turn it is (once per change, not per position). The side to move then comes
+     * from move inference, or from [resyncSideToMove] when no move can be inferred.
+     */
+    private fun checkTurnTrackingSources() {
+        val unavailable = AccessibilityData.whiteToMove == null && AccessibilityData.trackedFen == null
+        if (unavailable == turnSourcesUnavailable) return
+        turnSourcesUnavailable = unavailable
+        if (unavailable) {
+            Log.w(TAG, "Turn tracking: neither the move list nor the tracked FEN is available; " +
+                "the side to move comes from move inference or the last known state")
+        } else {
+            Log.d(TAG, "Turn tracking: accessibility side-to-move source available again")
+        }
+    }
+
+    /**
+     * Side to move for a position reached without a recognisable move ([resyncTo]). In order:
+     * the move list, the tracked FEN if it describes this very placement, then the last known
+     * state: the side to move of [prevFen] when the board is still close to it (an unexplained
+     * small change is most often two plies seen as one, which leaves the same side to move).
+     * Only when there is no usable previous state is it assumed to be the user's turn.
+     */
+    private fun resyncSideToMove(placement: String, prevFen: String?, userIsWhite: Boolean): Boolean {
+        AccessibilityData.whiteToMove?.let { return it }
+        val tracked = AccessibilityData.trackedFen
+        if (tracked != null && tracked.substringBefore(' ') == placement) {
+            return sideToMoveIsWhite(tracked)
+        }
+        if (prevFen != null) {
+            val distance = squaresDiffering(prevFen.substringBefore(' '), placement)
+            if (distance != null && distance <= MAX_SQUARE_JUMP) {
+                val white = sideToMoveIsWhite(prevFen)
+                Log.d(TAG, "No side-to-move source for resync; keeping last known side " +
+                    "(${if (white) "white" else "black"} to move, $distance squares changed)")
+                return white
+            }
+        }
+        Log.d(TAG, "No side-to-move source and no usable previous position; assuming the user's turn")
+        return userIsWhite
     }
 
     /**
@@ -498,12 +668,16 @@ class AnalysisCoordinator(
     private fun analyzeMulti(fen: String): List<AnalysisResult>? {
         val e = engine ?: return null
         if (!running.get()) return null
-        return try {
+        if (!isAnalyzable(fen)) return null
+        val raw = try {
             e.analyzeMultiPv(fen, depth, NUM_LINES, moveTimeMs = searchTimeMs())
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Multi-PV analysis failed for $fen", ex)
             null
         }
+        val analyses = validatedAnalyses(fen, raw)
+        checkEvalSanity(fen, analyses?.firstOrNull())
+        return analyses
     }
 
     // -------------------------------------------------------------------------------------
@@ -1086,6 +1260,11 @@ class AnalysisCoordinator(
         castlingRights = "KQkq"
         halfMoveClock = 0
         fullMoveNumber = 1
+        // Analyses of the old tracking state must be neither reused nor compared against.
+        shownKey = null
+        shownAnalyses = null
+        lastSearchedPlacement = null
+        lastSearchedEvalWhite = null
     }
 
     private fun updateBoardBounds(grid: Grid, px: Pixels, bitmap: Bitmap) {
@@ -1124,6 +1303,7 @@ class AnalysisCoordinator(
         EngineStats.positionsSeen++
         positionStale = false
         engine?.interruptSearch()
+        checkTurnTrackingSources()
         val orientationKnown = whiteAtBottom != null || lastKnownOrientation != null
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val prevFen = currentFen
@@ -1158,7 +1338,11 @@ class AnalysisCoordinator(
                     if (diffs in 1..3) return
                 }
             }
-            resyncTo(placement, after, if (placement == START_PLACEMENT) true else (AccessibilityData.whiteToMove ?: userIsWhite))
+            resyncTo(
+                placement,
+                after,
+                if (placement == START_PLACEMENT) true else resyncSideToMove(placement, prevFen, userIsWhite),
+            )
             return
         }
 
@@ -1238,13 +1422,18 @@ class AnalysisCoordinator(
             if (classified != null) {
                 val suggested = beforeAnalysis?.bestMove?.trim()
                 postCoachReaction(classified, beforeFen, suggested.equals(move.uci, ignoreCase = true))
+            } else {
+                Log.w(TAG, "User move ${move.uci} could not be classified: no coach reaction")
             }
             return
         }
         // Opponent just moved → user's turn.  The user-facing analysis runs first so the arrows
         // appear as soon as possible; the opponent's move is classified afterwards.
-        postOverlayThinking()
-        val newAnalyses = analyzeMulti(newFen)
+        // A position shown moments ago (duplicate or flickering events) is not searched again.
+        val newAnalyses = recentlyShown(newFen) ?: run {
+            postOverlayThinking()
+            analyzeMulti(newFen)
+        }
         if (!running.get()) return
 
         previousFen = beforeFen
@@ -1310,8 +1499,12 @@ class AnalysisCoordinator(
     ): Pair<AnalysisResult?, ClassifiedMove?> {
         val e = engine ?: return beforeAnalysis to null
         if (!running.get()) return beforeAnalysis to null
+        if (!isAnalyzable(beforeFen)) return beforeAnalysis to null
         val analysis = beforeAnalysis ?: try {
-            e.analyzeMultiPv(beforeFen, depth, 1, moveTimeMs = CLASSIFY_TIME_MS)?.firstOrNull()
+            validatedAnalyses(
+                beforeFen,
+                e.analyzeMultiPv(beforeFen, depth, 1, moveTimeMs = CLASSIFY_TIME_MS),
+            )?.firstOrNull()
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Analysis failed for $beforeFen", ex)
             null
@@ -1339,12 +1532,25 @@ class AnalysisCoordinator(
     private fun resyncTo(placement: String, board: CharArray, whiteToMove: Boolean) {
         // Prefer the accessibility service's side-to-move when available; the caller's guess
         // (typically userIsWhite) is only a fallback.
-        val sideToMove = AccessibilityData.whiteToMove ?: whiteToMove
+        var sideToMove = AccessibilityData.whiteToMove ?: whiteToMove
         castlingRights = castlingFromPlacement(board)
         halfMoveClock = 0
         fullMoveNumber = 1
         lastUserClassified = null
-        val fen = composeFen(placement, sideToMove, castlingRights, null, fullMoveNumber)
+        // The move that led here is unknown, so a reaction to an earlier move no longer applies.
+        postClearCoachMessage()
+        var fen = composeFen(placement, sideToMove, castlingRights, null, fullMoveNumber)
+        // Without a move-list side to move, sideToMove is a fallback. If it leaves the other
+        // side in check the position is impossible, and the turn must be the other side's.
+        if (AccessibilityData.whiteToMove == null && PositionValidator.sideNotToMoveInCheck(fen)) {
+            val other = composeFen(placement, !sideToMove, castlingRights, null, fullMoveNumber)
+            if (!PositionValidator.sideNotToMoveInCheck(other)) {
+                Log.w(TAG, "Resync: ${if (sideToMove) "black" else "white"} is in check, so it " +
+                    "must be that side's move; correcting the side to move")
+                sideToMove = !sideToMove
+                fen = other
+            }
+        }
         currentFen = fen
         currentAnalyses = null
         if (sideToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
@@ -1357,10 +1563,14 @@ class AnalysisCoordinator(
             postOverlayClear()
             return
         }
-        postOverlayClear()
-        postClearOpponentBadge()
-        postOverlayThinking()
-        val analyses = analyzeMulti(fen)
+        // A position shown moments ago (duplicate or flickering events) is not searched again,
+        // and the overlay is not blanked for it; render() below redraws the same lines.
+        val analyses = recentlyShown(fen) ?: run {
+            postOverlayClear()
+            postClearOpponentBadge()
+            postOverlayThinking()
+            analyzeMulti(fen)
+        }
         if (!running.get()) return
         previousFen = null
         previousAnalysis = null
@@ -1520,16 +1730,20 @@ class AnalysisCoordinator(
         }
         // A forced mate is the most important thing the coach can say. If the generator had
         // nothing (or failed), say it plainly rather than leaving the previous text on screen.
+        // No squares or notation in coach text: the arrow already shows where to play.
         val commentary = if (generated.isBlank() && moverMate != null && moverMate > 0) {
-            val square = best.to.uppercase(java.util.Locale.ROOT)
-            if (moverMate == 1) "Checkmate in one! Play to $square."
-            else "Forced mate in $moverMate. Start with the move to $square."
+            if (moverMate == 1) "Checkmate in one. Play the arrow."
+            else "Forced mate in $moverMate. Start with the arrow."
         } else {
             generated
         }
         suggestions[0] = best.copy(commentary = commentary)
 
         postMultiSuggestion(suggestions, flipped)
+        // Remember what is on screen so the same position is not re-analysed right away.
+        shownKey = positionKey(fen)
+        shownAtMs = SystemClock.elapsedRealtime()
+        shownAnalyses = analyses
     }
 
     /** Arrow label for a forced mate in [moves] by the side to move. */

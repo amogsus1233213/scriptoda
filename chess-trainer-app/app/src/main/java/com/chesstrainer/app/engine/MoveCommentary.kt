@@ -277,12 +277,25 @@ object MoveCommentary {
     private const val LEVEL_CP = 75
     /** Evaluations at or beyond this are forced mates; pawn counts are meaningless there. */
     private const val MATE_EVAL_CP = StockfishEngine.MATE_SCORE - 1_000
-    /** Above this loss the exact pawn count is no longer quoted. */
+    /** From this loss (centipawns) on, the coach always says how much the move cost. */
+    private const val SIGNIFICANT_LOSS_CP = 50
+    /** Above this loss the exact pawn count is no longer quoted, only "more than". */
     private const val MAX_QUOTED_LOSS_CP = 1_500
 
     /**
-     * The coach's reaction to a move the user just played: what it was, why it was good or what
-     * was better, and what it did to the game.
+     * The coach's reaction to a move the user just played. It always opens with the recognition
+     * (the classification), then says what happened in real terms and what was better:
+     *
+     *  - "Blunder. That knight move lost about 3 pawns. The rook move was better."
+     *  - "Mistake. That knight move let a forced mate slip. The queen check was stronger."
+     *  - "You missed it. The knight capture was a forced mate."
+     *  - "Brilliant. That bishop sacrifice was the only winning move."
+     *  - "Best move. Clean."
+     *
+     * A loss of [SIGNIFICANT_LOSS_CP] or more is always quoted in pawns (unless a forced mate
+     * is what was lost, which says more), and the better move is always named by its piece
+     * whenever [fen] allows it. A closing remark tells what the move did to the game as a
+     * whole (see [positionalContext]).
      *
      * @param classification how the move was classified
      * @param playedMove the move the user played, UCI format ("g1f3")
@@ -291,11 +304,12 @@ object MoveCommentary {
      * @param evalBefore centipawns from the user's POV before the move
      * @param evalAfter centipawns from the user's POV after the move
      * @param fen position before the move. When given, moves are described by the piece that
-     *   moves ("that knight move", "taking with the queen"); otherwise just as "that move".
+     *   moves ("that knight move", "the queen capture"); otherwise just as "that move".
      *   Squares and algebraic notation never appear in the text.
      * @param wasSuggested true when [playedMove] is the move the coach was showing as its top
-     *   suggestion. Following the arrow is no surprise, so the coach only nods briefly.
-     * @return one to three short sentences, never empty
+     *   suggestion. The move is still recognised for what it was; only the closing remark of
+     *   a routine good move is swapped for a brief nod.
+     * @return one to four short sentences, never empty
      */
     fun postMoveCommentary(
         classification: MoveClass,
@@ -307,92 +321,184 @@ object MoveCommentary {
         fen: String? = null,
         wasSuggested: Boolean = false,
     ): String {
-        if (wasSuggested) return synchronized(this) {
-            var index = random.nextInt(FOLLOWED_SUGGESTION_LINES.size)
-            if (index == lastPicks[FOLLOWED_SUGGESTION_LINES]) {
-                index = (index + 1 + random.nextInt(FOLLOWED_SUGGESTION_LINES.size - 1)) %
-                    FOLLOWED_SUGGESTION_LINES.size
-            }
-            lastPicks[FOLLOWED_SUGGESTION_LINES] = index
-            FOLLOWED_SUGGESTION_LINES[index]
-        }
         val board = fen?.let { parseBoard(it) }
+        // Notation is internal only: it is turned into piece names before it reaches the text.
         val playedSan = describeMove(playedMove, board)
         val sameMove = playedMove.trim().equals(bestMove.trim(), ignoreCase = true)
         // Only name the better move when there is one to name.
         val bestSan = bestMove.trim().takeIf { it.length >= 4 && !sameMove }?.let { describeMove(it, board) }
-        // Plain English only: "that knight move", "taking with the queen". Never notation.
+        // Plain English only: "that knight move", "the queen capture". Never notation.
         val played = thatMove(playedSan)
-        // Without a board the better move cannot be described, so it is left out.
+        // Without a board the better move cannot be described by its piece.
         val best = bestSan?.takeIf { sanToPiece(it) != "piece" }?.let { betterMove(it, playedSan) }
+
+        // The user had a forced mate and no longer has one.
         val hadMate = evalBefore >= MATE_EVAL_CP && evalAfter < MATE_EVAL_CP
-        // Null when a pawn count would be noise: a thrown-away mate or an absurdly large loss.
-        val pawns = cpLoss.takeIf { !hadMate && it in 1..MAX_QUOTED_LOSS_CP }
-            ?.let { String.format(Locale.US, "%.1f", it / 100.0) }
+        // The move allows a forced mate that was not there before.
+        val walksIntoMate = evalAfter <= -MATE_EVAL_CP && evalBefore > -MATE_EVAL_CP
+        // What the move cost, in pawns. Null when it cost nothing worth mentioning.
+        val lost = cpLoss.takeIf { it >= SIGNIFICANT_LOSS_CP }?.let { pawnsLost(it) }
+        // What happened, in real terms. A mate says more than any pawn count.
+        val whatHappened = when {
+            hadMate -> "$played let a forced mate slip."
+            walksIntoMate -> "$played walks into a forced mate."
+            lost != null -> "$played lost $lost."
+            else -> null
+        }
+        val context = positionalContext(classification, evalBefore, evalAfter)
 
-        val reaction = when (classification) {
-            MoveClass.BRILLIANT -> "Brilliant. $played was hard to find."
-            MoveClass.GREAT -> "Great move. $played was the only good one."
-            MoveClass.BEST -> "$played is the best move. Clean."
-            MoveClass.EXCELLENT -> "$played is nearly best. Fine."
-            MoveClass.GOOD -> "$played is solid. Nothing wrong with it."
-            MoveClass.BOOK -> "$played is book. Still theory."
+        val sentences = ArrayList<String>(4)
+        when (classification) {
+            MoveClass.BRILLIANT -> {
+                // Brilliant means a sacrifice that was the only good move.
+                val piece = sanToPiece(playedSan).takeIf { it != "piece" && it != "castling" }
+                val sacrifice = if (piece == null) "sacrifice" else "$piece sacrifice"
+                val wins = evalAfter >= ADVANTAGE_CP
+                sentences += "Brilliant."
+                sentences += when (pickFresh(BRILLIANT_SHAPES)) {
+                    "only" -> if (wins) "That $sacrifice was the only winning move."
+                    else "That $sacrifice was the only move that holds."
+                    else -> if (wins) "Hard to find. Only the $sacrifice wins."
+                    else "Hard to find. Only the $sacrifice holds."
+                }
+                context?.let { sentences += it }
+            }
+            MoveClass.GREAT -> {
+                sentences += "Great move."
+                sentences += String.format(Locale.US, pickFresh(GREAT_DETAILS), played)
+                context?.let { sentences += it }
+            }
+            MoveClass.BEST -> {
+                sentences += pickFresh(BEST_LINES)
+                sentences += context ?: pickFresh(if (wasSuggested) FOLLOWED_SUGGESTION_TAILS else BEST_TAILS)
+            }
+            MoveClass.EXCELLENT -> {
+                sentences += "Excellent."
+                sentences += context ?: pickFresh(if (wasSuggested) FOLLOWED_SUGGESTION_TAILS else EXCELLENT_TAILS)
+            }
+            MoveClass.GOOD -> {
+                sentences += "Good."
+                sentences += context ?: pickFresh(if (wasSuggested) FOLLOWED_SUGGESTION_TAILS else GOOD_TAILS)
+            }
+            MoveClass.BOOK -> {
+                sentences += "Book move."
+                sentences += pickFresh(BOOK_TAILS)
+            }
 
-            MoveClass.INACCURACY -> when {
-                best == null -> "Inaccuracy. There was something stronger than $played."
-                pawns == null -> "Inaccuracy. $best was stronger."
-                else -> "Inaccuracy. $best was stronger, by about $pawns pawns."
+            MoveClass.INACCURACY -> {
+                sentences += "Inaccuracy."
+                whatHappened?.let { sentences += it }
+                sentences += if (best == null) "There was a stronger move." else "$best was stronger."
+                context?.let { sentences += it }
             }
             MoveClass.MISTAKE -> {
-                val cost = when {
-                    hadMate -> "Mistake. $played let a forced mate slip."
-                    pawns == null -> "$played was a mistake."
-                    else -> "Mistake. $played cost about $pawns pawns."
-                }
-                if (best == null) cost else "$cost $best was better."
+                sentences += "Mistake."
+                sentences += whatHappened ?: "$played made things worse."
+                sentences += if (best == null) "There was a better move." else "$best was better."
+                context?.let { sentences += it }
             }
             MoveClass.BLUNDER -> {
-                val needed = if (best == null) "" else " $best was the move."
-                val gone = when {
-                    hadMate -> " You had a forced mate."
-                    pawns == null -> ""
-                    else -> " That's about $pawns pawns gone."
-                }
-                "$played is a blunder.$needed$gone"
+                sentences += "Blunder."
+                sentences += whatHappened ?: "$played gave away too much."
+                sentences += if (best == null) "There was a much better move." else "$best was better."
+                context?.let { sentences += it }
             }
             MoveClass.MISS -> {
-                val what = if (hadMate) "That was a forced mate." else "That was a tactic."
-                if (bestSan == null) "You missed a tactic there." else "${missedMove(bestSan)} $what"
+                // A miss is a chance the user had and did not take: say what the chance was.
+                val chance = if (hadMate) "a forced mate" else "the tactic"
+                if (best == null) {
+                    sentences += if (hadMate) "You missed a forced mate." else "You missed a tactic."
+                } else {
+                    sentences += "You missed it."
+                    sentences += "$best was $chance."
+                }
+                if (!hadMate && lost != null) sentences += "That cost $lost."
+                context?.let { sentences += it }
             }
-        }.let { capitalizeSentences(it) }
-
-        val context = positionalContext(classification, evalBefore, evalAfter)
-        return if (context == null) reaction else "$reaction $context"
+        }
+        return capitalizeSentences(sentences.joinToString(" "))
     }
 
-    /** Brief, unsurprised nods for when the user plays the move the coach suggested. */
-    private val FOLLOWED_SUGGESTION_LINES = arrayOf(
-        "Good. That's the plan.",
-        "Exactly. Keep going.",
-        "That's the one.",
-        "Right. Stay on plan.",
-        "Good move. Carry on.",
-        "Yes. That works.",
+    /**
+     * A centipawn loss in words: "about half a pawn", "about a pawn", "about 2.5 pawns",
+     * "about 3 pawns". Rounded to the nearest half pawn, which is all the precision an engine
+     * evaluation has.
+     */
+    private fun pawnsLost(cpLoss: Int): String {
+        if (cpLoss > MAX_QUOTED_LOSS_CP) return "more than ${MAX_QUOTED_LOSS_CP / 100} pawns"
+        val halves = ((cpLoss + 25) / 50).coerceAtLeast(1)
+        return when {
+            halves == 1 -> "about half a pawn"
+            halves == 2 -> "about a pawn"
+            halves % 2 == 0 -> "about ${halves / 2} pawns"
+            else -> "about ${halves / 2}.5 pawns"
+        }
+    }
+
+    /** A random line of [lines], never the one picked from them last time. */
+    private fun pickFresh(lines: Array<String>): String = synchronized(this) {
+        var index = random.nextInt(lines.size)
+        if (lines.size > 1 && index == lastPicks[lines]) {
+            index = (index + 1 + random.nextInt(lines.size - 1)) % lines.size
+        }
+        lastPicks[lines] = index
+        lines[index]
+    }
+
+    /** The two ways a brilliant move is described; see [postMoveCommentary]. */
+    private val BRILLIANT_SHAPES = arrayOf("only", "hard")
+
+    // Arg is the move the user played, as a subject ("that knight move").
+    private val GREAT_DETAILS = arrayOf(
+        "%s was the critical one.",
+        "%s was exactly what the position needed.",
+        "%s was the strongest on the board.",
     )
 
-    /** What the move did to the game as a whole, or null when there is nothing worth adding. */
+    private val BEST_TAILS = arrayOf("Clean.", "Nothing better.", "Spot on.", "Keep going.")
+    private val EXCELLENT_TAILS = arrayOf("Nearly the best move.", "Almost perfect.", "Right idea.")
+    private val GOOD_TAILS = arrayOf("Solid.", "Nothing wrong with it.", "Keeps things steady.")
+    private val BOOK_TAILS = arrayOf("Still theory.", "Known opening.", "Keep developing.")
+
+    /** Brief, unsurprised nods for when the user plays the move the coach suggested. */
+    private val FOLLOWED_SUGGESTION_TAILS = arrayOf(
+        "That's the plan.",
+        "Keep going.",
+        "Stay on plan.",
+        "Carry on.",
+    )
+
+    /**
+     * What the move did to the game as a whole, judged from the evaluation before and after it,
+     * or null when there is nothing worth adding.
+     */
     private fun positionalContext(classification: MoveClass, evalBefore: Int, evalAfter: Int): String? {
         val wasWinning = evalBefore >= ADVANTAGE_CP
         val wasLosing = evalBefore <= -ADVANTAGE_CP
         val wasLevel = abs(evalBefore) <= LEVEL_CP
         val isWinning = evalAfter >= ADVANTAGE_CP
+        val isLosing = evalAfter <= -ADVANTAGE_CP
+        val isLevel = abs(evalAfter) <= LEVEL_CP
         val strongMove = classification == MoveClass.BRILLIANT || classification == MoveClass.GREAT ||
             classification == MoveClass.BEST
+        val badMove = classification == MoveClass.INACCURACY || classification == MoveClass.MISTAKE ||
+            classification == MoveClass.MISS || classification == MoveClass.BLUNDER
         return when {
-            wasWinning && isWinning -> "Still in control."
+            // A forced mate against the user has already been said; nothing softens it.
+            evalAfter <= -MATE_EVAL_CP -> null
+
+            wasWinning && isLosing -> "That turned a winning game around."
             wasWinning && evalAfter <= LEVEL_CP -> "The advantage is gone."
-            wasLosing && strongMove -> "Good defense. Keep fighting."
+            wasWinning && isWinning && badMove -> "You're still ahead."
+            wasWinning && isWinning -> "Still in control."
+
+            wasLevel && isLosing -> "Now you're in trouble."
             wasLevel && isWinning -> "You're on top now."
+
+            wasLosing && isWinning -> "You've turned it around."
+            wasLosing && isLevel -> "You're back in the game."
+            wasLosing && strongMove -> "Good defense. Keep fighting."
+            wasLosing && badMove && evalAfter < evalBefore -> "That makes a hard position harder."
             else -> null
         }
     }
@@ -428,6 +534,14 @@ object MoveCommentary {
     private fun sanToMover(san: String): String =
         sanToPiece(san).let { if (it == "castling") it else "the $it" }
 
+    /** What kind of move [san] is, as a noun: "capture", "check", "push" (pawns) or "move". */
+    private fun moveKind(san: String): String = when {
+        'x' in san -> "capture"
+        san.endsWith('+') -> "check"
+        sanToPiece(san) == "pawn" -> "push"
+        else -> "move"
+    }
+
     /** A move the user played, as a subject: "that knight move", "that pawn push", "castling". */
     private fun thatMove(san: String): String {
         val piece = sanToPiece(san)
@@ -435,53 +549,37 @@ object MoveCommentary {
             piece == "castling" -> "castling"
             piece == "piece" -> "that move"
             '=' in san -> "that promotion"
-            'x' in san -> "that $piece capture"
-            piece == "pawn" -> "that pawn push"
-            else -> "that $piece move"
+            else -> "that $piece ${moveKind(san)}"
         }
     }
 
-    /** What a move does, as an action: "taking with the knight", "pushing the pawn". */
-    private fun moveAction(san: String): String {
+    /**
+     * A move named by its piece, as a subject: "the knight move", "the rook capture", "the queen
+     * check", "the pawn push", "castling", "promoting the pawn".
+     */
+    private fun moveNoun(san: String): String {
         val piece = sanToPiece(san)
         return when {
             piece == "castling" -> "castling"
             piece == "piece" -> "another move"
             '=' in san -> "promoting the pawn"
-            'x' in san -> "taking with the $piece"
-            piece == "pawn" -> "pushing the pawn"
-            else -> "moving the $piece"
+            else -> "the $piece ${moveKind(san)}"
         }
     }
 
     /**
-     * The better move [bestSan], told apart from the move that was played: when both read the
-     * same ("moving the knight"), it becomes "a different knight move".
+     * The better move [bestSan], named by its piece and told apart from the move that was
+     * played: when both read the same ("the knight move"), it becomes "a different knight move".
      */
     private fun betterMove(bestSan: String, playedSan: String): String {
-        val action = moveAction(bestSan)
-        if (action != moveAction(playedSan)) return action
+        val noun = moveNoun(bestSan)
+        if (noun != moveNoun(playedSan)) return noun
         val piece = sanToPiece(bestSan)
         return when {
             piece == "castling" -> "castling the other way"
             piece == "piece" -> "another move"
             '=' in bestSan -> "a different promotion"
-            'x' in bestSan -> "a different $piece capture"
-            else -> "a different $piece move"
-        }
-    }
-
-    /** "You missed it. The knight takes." / "You missed the queen check." */
-    private fun missedMove(san: String): String {
-        val piece = sanToPiece(san)
-        return when {
-            piece == "castling" -> "You missed castling."
-            piece == "piece" -> "You missed the best move."
-            '=' in san -> "You missed it. The pawn promotes."
-            'x' in san -> "You missed it. The $piece takes."
-            san.endsWith('+') -> "You missed the $piece check."
-            piece == "pawn" -> "You missed the pawn push."
-            else -> "You missed the $piece move."
+            else -> "a different $piece ${moveKind(bestSan)}"
         }
     }
 
@@ -1563,117 +1661,83 @@ object MoveCommentary {
     // -------------------------------------------------------------------------------------
 
     // Reactions to the user's own move, by classification (see feedbackLines).
+    // Recognition of the move, nothing else: two to five words that name what it was. What it
+    // cost and what was better is added by postMoveCommentary, the advice by generate.
 
     private val BRILLIANT_LINES = arrayOf(
-        "Brilliant. That was hard to see.",
-        "Brilliant move. Well calculated.",
-        "Brilliant find. Not many see that.",
-        "Outstanding. That's a deep idea.",
-        "Brilliant. Exactly the right moment.",
-        "Excellent calculation. Brilliant move.",
-        "Brilliant. That's master-level play.",
-        "Great vision. A brilliant move.",
-        "Brilliant. The engine agrees.",
+        "Brilliant find.",
+        "Brilliant. Only move and you found it.",
+        "Brilliant sacrifice.",
+        "Brilliant. Hard to find.",
+        "Brilliant. Well calculated.",
     )
 
     private val GREAT_LINES = arrayOf(
-        "Great move. That was the critical moment.",
-        "Only move, and you found it.",
-        "Great find. Everything else was worse.",
-        "Strong. That swung it your way.",
+        "Great move.",
+        "Strong.",
+        "Well played.",
+        "Great find.",
         "Great move. Well spotted.",
-        "Precise. That was the one.",
-        "Great move under pressure.",
-        "Sharp. Nothing else worked.",
-        "Great find. Good pattern recognition.",
     )
 
     private val BEST_LINES = arrayOf(
-        "Best move. Keep going.",
-        "Correct. That's the engine's choice.",
-        "Good. That's the top move.",
-        "Right move. Nothing to add.",
-        "Accurate. Carry on.",
-        "That's it. Best on the board.",
-        "Exactly right. Keep it up.",
-        "Best move. Stay on plan.",
+        "Best move.",
+        "Exactly right.",
+        "Engine agrees.",
+        "That's the top move.",
+        "Best on the board.",
     )
 
     private val EXCELLENT_LINES = arrayOf(
-        "Excellent. Nearly the best move.",
-        "Very good. Tiny difference from best.",
-        "Strong move. That works.",
-        "Excellent choice. Carry on.",
-        "Good. Almost perfect.",
-        "That works well. Keep going.",
-        "Excellent. Solid and strong.",
+        "Excellent.",
+        "Excellent move.",
+        "Nearly best.",
+        "Very good.",
     )
 
     private val GOOD_LINES = arrayOf(
-        "Good. Solid move.",
-        "That works. Nothing wrong with it.",
-        "Fine move. Keep building.",
-        "Reasonable. The position holds.",
-        "Good move. No harm done.",
-        "Sound. Carry on.",
-        "Solid. Good chess is mostly this.",
-        "Good enough. Stay focused.",
+        "Good move.",
+        "Good. Solid.",
+        "That works.",
+        "Sound move.",
     )
 
     private val BOOK_LINES = arrayOf(
-        "Book move. Still theory.",
-        "Theory. You know the opening.",
-        "Main line. Good.",
-        "Still in book. Keep developing.",
-        "Book. Standard opening play.",
-        "Known position. Carry on.",
+        "Book move.",
+        "Still theory.",
+        "Main line.",
+        "Still in book.",
     )
 
     private val INACCURACY_LINES = arrayOf(
-        "Inaccuracy. There was something stronger.",
-        "Hmm. There was a better move.",
-        "Slightly off. Nothing serious.",
-        "Imprecise. Look a bit deeper.",
-        "Small slip. The position still holds.",
-        "Not the best. Slow down a touch.",
-        "Inaccuracy. You left something on the table.",
-        "Playable, but there was better.",
-        "A bit loose. Tighten up.",
+        "Slight inaccuracy.",
+        "There was better.",
+        "Close but not best.",
+        "Inaccuracy.",
+        "A little imprecise.",
     )
 
     private val MISTAKE_LINES = arrayOf(
-        "Mistake. That costs you.",
-        "That's a mistake. Check their threats first.",
-        "Mistake. There was a much better move.",
-        "Wrong move. Tighten up from here.",
-        "Careless. Calculate before you move.",
-        "Mistake. The position got worse.",
-        "That hurt your position. Regroup.",
-        "No. There was better. Reset and focus.",
-        "Mistake. Look at their reply before moving.",
+        "Mistake.",
+        "That cost you.",
+        "Not the best.",
+        "That was a mistake.",
+        "Wrong move there.",
     )
 
     private val MISS_LINES = arrayOf(
-        "You missed a tactic there.",
-        "Missed chance. Check captures first.",
-        "There was a tactic. Look for forcing moves.",
-        "Missed it. Checks, captures, threats, every move.",
-        "A shot was there. Stay alert for the next.",
-        "Missed opportunity. Slow down and look.",
-        "You let them off the hook.",
-        "There was more in the position. Look deeper.",
+        "You missed it.",
+        "Missed chance.",
+        "There was a tactic.",
+        "You let them off.",
     )
 
     private val BLUNDER_LINES = arrayOf(
-        "Blunder. That changes the game.",
-        "That's a blunder. Find the best defense.",
-        "Blunder. Check their reply before you move.",
-        "Serious error. Damage control now.",
-        "Blunder. Take a breath and defend.",
-        "That was a blunder. Stay in the game.",
-        "Bad move. Look at what they have now.",
-        "Blunder. Reset and fight on.",
-        "That hurts. Make it hard for them.",
+        "Blunder.",
+        "That hurts.",
+        "Rough.",
+        "That was a blunder.",
+        "Big blunder.",
     )
 
     private val TIME_PRESSURE_LINES = arrayOf(

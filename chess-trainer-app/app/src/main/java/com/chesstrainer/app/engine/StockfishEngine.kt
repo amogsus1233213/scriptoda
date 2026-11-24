@@ -1,5 +1,6 @@
 package com.chesstrainer.app.engine
 
+import android.util.Log
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.IOException
@@ -41,6 +42,8 @@ class StockfishEngine(private val binaryPath: String) {
     companion object {
         /** Base value used to represent mate scores in centipawns. */
         const val MATE_SCORE = 100_000
+
+        private const val TAG = "StockfishEngine"
 
         private const val ANALYSIS_TIMEOUT_MS = 10_000L
         private const val HANDSHAKE_TIMEOUT_MS = 5_000L
@@ -167,6 +170,13 @@ class StockfishEngine(private val binaryPath: String) {
     ): List<AnalysisResult>? {
         require(depth > 0) { "depth must be positive" }
         require(lineCount > 0) { "lineCount must be positive" }
+
+        // Last line of defence for every caller: a malformed position makes the engine search
+        // garbage or crash, so it is never sent.
+        PositionValidator.fenError(fen)?.let { error ->
+            Log.w(TAG, "Refusing to analyse invalid FEN ($error): $fen")
+            return null
+        }
 
         analysisLock.withLock {
             if (!isReady() && !start()) return null

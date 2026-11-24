@@ -1,5 +1,6 @@
 package com.chesstrainer.app.engine
 
+import android.util.Log
 import kotlin.math.abs
 
 enum class MoveClass(val symbol: String, val displayName: String) {
@@ -65,6 +66,12 @@ object MoveClassifier {
     /** Below this eval after the move, a large loss is a blunder rather than a miss. */
     private const val MISS_LOSING_EVAL = -200
 
+    private const val TAG = "MoveClassifier"
+    /** A move that gains more than this (cp) must not come out as a mistake or blunder. */
+    private const val CONSISTENCY_GAIN_CP = 100
+    /** A move that loses more than this (cp) must not come out as brilliant or great. */
+    private const val CONSISTENCY_LOSS_CP = 200
+
     /**
      * @param engine engine used to evaluate the position after [playedMove]
      * @param fen position before the move
@@ -127,6 +134,8 @@ object MoveClassifier {
             else -> byCpLoss(cpLoss)
         }
 
+        checkConsistency(played, classification, isBest, evalBefore, evalAfter)
+
         return ClassifiedMove(
             move = played,
             classification = classification,
@@ -135,6 +144,39 @@ object MoveClassifier {
             evalBefore = evalBefore,
             evalAfter = evalAfter
         )
+    }
+
+    /**
+     * Verifies that [classification] agrees with the direction the evaluation moved (both from
+     * the mover's POV, mate scores clamped as for the centipawn loss). It only logs: a violation
+     * does not mean the move was misjudged here, it means the two evaluations it was judged from
+     * do not describe the same game (wrong position analysed, wrong side to move, UCI desync, or
+     * searches of very different depth disagreeing).
+     */
+    private fun checkConsistency(
+        played: String,
+        classification: MoveClass,
+        isBest: Boolean,
+        evalBefore: Int,
+        evalAfter: Int
+    ) {
+        val change = clamp(evalAfter) - clamp(evalBefore)
+        val detail = "evalBefore=$evalBefore evalAfter=$evalAfter (mover's POV, change $change cp)"
+        when {
+            change > CONSISTENCY_GAIN_CP &&
+                (classification == MoveClass.BLUNDER || classification == MoveClass.MISTAKE) ->
+                Log.w(TAG, "Inconsistent classification: $played is ${classification.displayName} " +
+                    "but the eval improved. $detail")
+            change < -CONSISTENCY_LOSS_CP &&
+                (classification == MoveClass.BRILLIANT || classification == MoveClass.GREAT) ->
+                Log.w(TAG, "Inconsistent classification: $played is ${classification.displayName} " +
+                    "but the eval dropped. $detail")
+            // Same symptom one step earlier: the engine's own best move should not lose eval.
+            isBest && change < -CONSISTENCY_LOSS_CP ->
+                Log.w(TAG, "Engine's best move $played loses eval: the analyses before and " +
+                    "after the move disagree. $detail")
+            else -> Log.d(TAG, "Classified $played as ${classification.displayName}. $detail")
+        }
     }
 
     private fun byCpLoss(cpLoss: Int): MoveClass = when {
@@ -366,6 +408,15 @@ internal class Board private constructor(
             -1
         }
         return Board(next, !whiteToMove, newEp)
+    }
+
+    /** Piece on [square] (0..63, a1 = 0), or null when it is empty or off the board. */
+    fun pieceAt(square: Int): Char? = squares.getOrNull(square)?.takeIf { it != EMPTY }
+
+    /** True when the side that is not to move is in check, which no legal position allows. */
+    fun sideNotToMoveInCheck(): Boolean {
+        val king = kingSquare(!whiteToMove) ?: return false
+        return isAttacked(king, byWhite = whiteToMove)
     }
 
     private fun kingSquare(white: Boolean): Int? {

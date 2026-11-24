@@ -198,6 +198,8 @@ class OverlayService : Service() {
 
     /** Coach reaction to the user's own move, shown while there are no suggestions. Main thread only. */
     private var coachMessage: String? = null
+    /** True between [showThinking] and the next suggestion or clearing. Main thread only. */
+    private var thinking = false
     private val expireCoachMessage = Runnable { dropCoachMessage(restoreWaiting = true) }
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
@@ -288,14 +290,19 @@ class OverlayService : Service() {
         }
     }
 
-    /** Shows "Engine is calculating..." in the panel and clears stale arrows. */
+    /**
+     * Shows "Engine is calculating..." in the panel and clears stale arrows. A reaction to the
+     * user's own move that is still on screen stays there while the engine thinks: the opponent
+     * often replies at once, and the reaction must not vanish before it could be read. The
+     * next suggestion (or the reaction's own timeout) replaces it.
+     */
     fun showThinking() {
         mainHandler.post {
             currentLines = emptyList()
-            dropCoachMessage(restoreWaiting = false)
+            thinking = true
             arrowView?.setArrows(emptyList())
             val view = commentaryView ?: return@post
-            view.text = THINKING_TEXT
+            view.text = coachMessage ?: THINKING_TEXT
             panelRoot?.post { clampAndUpdate() }
         }
     }
@@ -515,6 +522,7 @@ class OverlayService : Service() {
      */
     private fun renderMultiSuggestion(autoExpand: Boolean) {
         val lines = currentLines
+        thinking = false
         val view = commentaryView ?: return
         if (lines.isEmpty()) {
             // A reaction to the user's own move outlives the clearing of the arrows.
@@ -524,7 +532,8 @@ class OverlayService : Service() {
             return
         }
         if (autoExpand && !expanded && !userCollapsed) setExpanded(true)
-        dropCoachMessage(restoreWaiting = false)
+        // The suggestion's own commentary takes over from the reaction to the previous move.
+        dropCoachMessage(restoreWaiting = true)
 
         val commentary = lines.first().commentary
         // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis).
@@ -557,7 +566,7 @@ class OverlayService : Service() {
         if (!restoreWaiting) return
         val view = commentaryView ?: return
         if (view.text.toString() == message) {
-            view.text = WAITING_TEXT
+            view.text = if (thinking) THINKING_TEXT else WAITING_TEXT
             panelRoot?.post { clampAndUpdate() }
         }
     }
