@@ -1484,6 +1484,8 @@ class AnalysisCoordinator(
         val opponentClass = lastClassified?.classification
             ?.takeIf { lastMove?.let { m -> m.white != userIsWhite } == true }
         val seconds = AccessibilityData.userTimeSeconds
+        // Engine line behind the best suggestion: its PV lets the coach explain the plan.
+        val bestAnalysis = analyses.firstOrNull { it.bestMove.startsWith(best.from + best.to) }
         val commentary = try {
             MoveCommentary.generate(
                 fromSquare = best.from,
@@ -1495,11 +1497,11 @@ class AnalysisCoordinator(
                 fen = fen,
                 isUsersTurn = usersTurn,
                 rank = 1,
-                promotion = analyses.firstOrNull { it.bestMove.startsWith(best.from + best.to) }
-                    ?.bestMove?.getOrNull(4),
+                promotion = bestAnalysis?.bestMove?.getOrNull(4),
                 userLastMove = lastUserClassified?.classification,
                 opponentLastMove = opponentClass,
                 timePressure = seconds != null && seconds <= TIME_PRESSURE_THRESHOLD_SECONDS,
+                pv = bestAnalysis?.pv.orEmpty(),
             )
         } catch (e: RuntimeException) {
             Log.w(TAG, "Commentary failed for $fen", e)
