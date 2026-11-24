@@ -495,7 +495,11 @@ class AnalysisCoordinator(
             return
         }
 
-        if (!processing.compareAndSet(false, true)) return
+        if (!processing.compareAndSet(false, true)) {
+            positionStale = true
+            engine?.interruptSearch()
+            return
+        }
 
         // Check if accessibility data is available (higher accuracy than vision). When it is
         // fresh and complete enough, piece recognition is skipped for this frame; the frame is
@@ -1153,6 +1157,7 @@ class AnalysisCoordinator(
             null
         }
         if (!running.get()) return
+        if (positionStale) return
 
         castlingRights = updatedCastlingRights(castlingRights, move, after)
         val prevBoard = currentFen?.let { parsePlacement(it.substringBefore(' ')) }
@@ -1236,6 +1241,7 @@ class AnalysisCoordinator(
         postOverlayThinking()
         val analyses = analyzeMulti(fen)
         if (!running.get()) return
+        if (positionStale) return
         previousFen = null
         previousAnalysis = null
         currentFen = fen
