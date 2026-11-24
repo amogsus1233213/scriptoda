@@ -34,6 +34,20 @@ class BoardAccessibilityService : AccessibilityService() {
         /** Nodes included in [AccessibilityData.lastViewDump]. */
         private const val DUMP_NODES = 100
 
+        /** Packages whose window-state events should NOT reset the game tracker. */
+        private val TRANSIENT_SYSTEM_PACKAGES = setOf(
+            "com.android.systemui",
+            "com.android.settings",
+            "android",
+        )
+        /** Package prefixes that are transient system UI (keyboards, etc.). */
+        private val TRANSIENT_SYSTEM_PREFIXES = listOf(
+            "com.google.android.inputmethod",
+            "com.samsung.android.inputmethod",
+            "com.swiftkey",
+        )
+        private const val TARGET_LEFT_DELAY_MS = 2000L
+
         @Volatile
         var instance: BoardAccessibilityService? = null
             private set
@@ -66,6 +80,14 @@ class BoardAccessibilityService : AccessibilityService() {
     private var lastMoveCount = 0
     private var moveTrackingActive = false
 
+    /** Deferred target-left reset: gives transient system UI time to dismiss before wiping the game. */
+    private var targetLeftPending = false
+    private val targetLeftRunnable = Runnable {
+        if (targetLeftPending) {
+            targetLeftPending = false
+            doTargetLeft()
+        }
+    }
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
@@ -87,8 +109,27 @@ class BoardAccessibilityService : AccessibilityService() {
         if (pkg != TARGET_PACKAGE) {
             // Another window came to the front. Content changes elsewhere (such as the status
             // bar clock) do not mean the chess app is gone.
-            if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) onTargetLeft()
+            if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                // Transient system UI (notification shade, keyboard, volume, dialogs) should
+                // not wipe the game tracker.  Only schedule a deferred reset for real app switches.
+                val isTransient = pkg in TRANSIENT_SYSTEM_PACKAGES ||
+                    TRANSIENT_SYSTEM_PREFIXES.any { prefix -> pkg.startsWith(prefix) }
+                if (!isTransient) {
+                    // Defer the reset — if chess.com reappears within TARGET_LEFT_DELAY_MS the
+                    // pending reset is cancelled and the game tracker survives.
+                    if (!targetLeftPending) {
+                        targetLeftPending = true
+                        handler.postDelayed(targetLeftRunnable, TARGET_LEFT_DELAY_MS)
+                    }
+                }
+            }
             return
+        }
+
+        // Chess.com is visible — cancel any pending target-left reset.
+        if (targetLeftPending) {
+            targetLeftPending = false
+            handler.removeCallbacks(targetLeftRunnable)
         }
 
         AccessibilityData.targetPackageVisible = true
@@ -104,14 +145,15 @@ class BoardAccessibilityService : AccessibilityService() {
         if (result.positions != null) {
             moveTrackingActive = false
             publish(result)
+            // Side to move from the move list — only when the board parser produced the position.
+            // When move tracking is active, game.white is authoritative (set in publishFromMoveList).
+            val moves = MoveListReader.extract(nodes)
+            if (moves.isNotEmpty()) {
+                AccessibilityData.whiteToMove = !moves.last().isWhite
+            }
         } else {
             publishFromMoveList(nodes, result)
-        }
-
-        // Side to move from the move list: the side that did not make the last listed move.
-        val moves = MoveListReader.extract(nodes)
-        if (moves.isNotEmpty()) {
-            AccessibilityData.whiteToMove = !moves.last().isWhite
+            // publishFromMoveList sets whiteToMove from game.white — do not overwrite it here.
         }
     }
 
@@ -226,14 +268,32 @@ class BoardAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Detect new game: if we see move 1 white and our game has advanced past it,
-        // or if the moves don't match what we have, reset.
+        // Detect new game: compare the entire overlapping prefix of extracted moves against
+        // appliedSan.  A rematch with the same opening move must still be caught.
         val firstExtracted = extracted.first()
         if (firstExtracted.moveNumber == 1 && firstExtracted.isWhite && game.appliedSan.isNotEmpty()) {
-            // Check if this is a new game by seeing if the first move differs
-            if (game.appliedSan.isNotEmpty() && extracted.firstOrNull()?.san?.lowercase() !=
-                game.appliedSan.firstOrNull()?.lowercase()) {
-                Log.i(TAG, "New game detected, resetting move tracker")
+            var needsReset = false
+
+            // 1. If the extracted list is significantly shorter than what we tracked,
+            //    the game went backwards — almost certainly a new game.
+            if (game.appliedSan.size > extracted.size + 2) {
+                needsReset = true
+                Log.i(TAG, "New game detected: tracked ${game.appliedSan.size} moves but only ${extracted.size} extracted")
+            }
+
+            // 2. Compare every overlapping move; any mismatch means a new game.
+            if (!needsReset) {
+                val overlapSize = minOf(extracted.size, game.appliedSan.size)
+                for (i in 0 until overlapSize) {
+                    if (extracted[i].san.lowercase() != game.appliedSan[i].lowercase()) {
+                        needsReset = true
+                        Log.i(TAG, "New game detected: move ${i + 1} differs ('${extracted[i].san}' vs '${game.appliedSan[i]}')")
+                        break
+                    }
+                }
+            }
+
+            if (needsReset) {
                 game.reset()
                 lastMoveCount = 0
             }
@@ -260,21 +320,19 @@ class BoardAccessibilityService : AccessibilityService() {
                     applied = true
                     Log.i(TAG, "Move tracked: ${move.moveNumber}${if (move.isWhite) "." else "..."} ${move.san}")
                 } else {
-                    Log.w(TAG, "Failed to apply move: ${move.san}")
-                    AccessibilityData.lastRejectReason = "Move tracking: failed to apply ${move.san}"
-                    publish(parseResult)
-                    return
+                    Log.w(TAG, "Failed to apply move: ${move.san}, attempting full replay")
+                    applied = attemptFullReplay(extracted, parseResult) || applied
+                    break
                 }
             } else if (move.moveNumber == expectedMoveNum && !move.isWhite && expectedWhite) {
                 // We expected white but got black — might have missed white's move
                 // This can happen if we started tracking mid-turn
                 continue
             } else if (move.moveNumber > expectedMoveNum) {
-                // We missed a move. Can't continue tracking.
-                Log.w(TAG, "Missed move(s): expected $expectedMoveNum, saw ${move.moveNumber}")
-                AccessibilityData.lastRejectReason = "Move tracking: missed move $expectedMoveNum"
-                publish(parseResult)
-                return
+                // We missed a move. Try a full replay from scratch.
+                Log.w(TAG, "Missed move(s): expected $expectedMoveNum, saw ${move.moveNumber}. Attempting full replay")
+                applied = attemptFullReplay(extracted, parseResult) || applied
+                break
             }
         }
 
@@ -303,14 +361,50 @@ class BoardAccessibilityService : AccessibilityService() {
             // We can't know for sure from moves alone, but chess.com defaults to user at bottom.
             // For now, leave orientation detection to the coordinator's vision fallback.
 
-            // Schedule another read to stay fresh
-            scheduleRead(MIN_INTERVAL_MS)
+            // Schedule another read only when a new move was applied; otherwise use a slower poll.
+            if (applied) {
+                scheduleRead(MIN_INTERVAL_MS)
+            } else {
+                scheduleRead(1000L)
+            }
         } else {
             publish(parseResult)
         }
     }
 
+    /**
+     * Resets the game tracker and replays ALL extracted moves from scratch.
+     * Returns true if the replay produced a valid game state; false if it failed
+     * (the tracker is left reset so the next read can try again).
+     */
+    private fun attemptFullReplay(
+        extracted: List<MoveListReader.ExtractedMove>,
+        parseResult: BoardPositionParser.ParseResult,
+    ): Boolean {
+        game.reset()
+        lastMoveCount = 0
+        for (m in extracted) {
+            if (!game.applySan(m.san)) {
+                Log.w(TAG, "Full replay failed at ${m.moveNumber}${if (m.isWhite) "." else "..."} ${m.san}")
+                game.reset()
+                lastMoveCount = 0
+                AccessibilityData.lastRejectReason = "Move tracking: cannot replay game"
+                publish(parseResult)
+                return false
+            }
+        }
+        Log.i(TAG, "Full replay succeeded with ${extracted.size} moves")
+        return true
+    }
+
     private fun onTargetLeft() {
+        // Cancel any deferred target-left as well.
+        targetLeftPending = false
+        handler.removeCallbacks(targetLeftRunnable)
+        doTargetLeft()
+    }
+
+    private fun doTargetLeft() {
         cancelScheduledRead()
         lastOrientation = null
         identicalOrientations = 0
@@ -352,6 +446,7 @@ class BoardAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         readScheduled = false
+        targetLeftPending = false
         instance = null
         AccessibilityData.serviceConnected = false
         AccessibilityData.clear()

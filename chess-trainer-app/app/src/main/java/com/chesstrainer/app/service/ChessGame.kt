@@ -55,11 +55,15 @@ class ChessGame {
         val san = raw.trim().replace("[​ ]".toRegex(), "")
         if (san.isEmpty()) return false
 
-        val low = san.lowercase()
+        // Fix 2: Strip annotations BEFORE castling check so "O-O+" etc. match
+        // Fix 4: Guard against empty string after stripping
+        val clean = san.replace("[+#!?]".toRegex(), "")
+        if (clean.isEmpty()) return false
+
+        val low = clean.lowercase()
         if (low == "o-o" || low == "0-0") return applyCastle(true)
         if (low == "o-o-o" || low == "0-0-0") return applyCastle(false)
 
-        val clean = san.replace("[+#!?]".toRegex(), "")
         val parsed = parseSan(clean) ?: return false
         val candidates = findCandidates(parsed)
         if (candidates.size != 1) return false
@@ -67,7 +71,8 @@ class ChessGame {
         val from = candidates[0]
         val to = parsed.destFile + parsed.destRank * 8
         doMove(from, to, parsed.promo)
-        appliedSan.add(raw)
+        // Fix 3: Store cleaned SAN for consistent comparison with castling path
+        appliedSan.add(clean)
         return true
     }
 
@@ -82,16 +87,31 @@ class ChessGame {
     )
 
     private fun parseSan(s: String): San? {
+        // Fix 4: Guard against empty string
+        if (s.isEmpty()) return null
+
         var idx = 0
         var piece = 'P'
         val firstChar = s[0]
 
-        if (firstChar.lowercaseChar() in "nbrqk") {
+        // Fix 1: For lowercase 'b', default to pawn (b-file) not bishop.
+        // Chess.com sends lowercase piece letters, so 'b4' means b-pawn to b4.
+        // Uppercase 'B' is unambiguously bishop. Other pieces (n,r,q,k) are unambiguous.
+        if (firstChar.lowercaseChar() in "nrqk") {
             piece = firstChar.uppercaseChar()
             idx = 1
+        } else if (firstChar == 'B') {
+            // Uppercase B is unambiguously bishop
+            piece = 'B'
+            idx = 1
         }
+        // lowercase 'b' is left as pawn (piece='P', idx=0); fallback in findCandidates
+        // will try bishop if no pawn candidates are found
 
         val rest = s.substring(idx)
+        // Fix 4: Guard after substring
+        if (rest.isEmpty()) return null
+
         val promoIdx = rest.indexOf('=')
         val promo = if (promoIdx >= 0) {
             rest.getOrNull(promoIdx + 1)?.uppercaseChar()?.takeIf { it in "NBRQ" } ?: return null
@@ -101,7 +121,8 @@ class ChessGame {
         }
 
         val moveChars = rest.replace("=.*".toRegex(), "").let {
-            if (promo != '.' && it.last().uppercaseChar() == promo) it.dropLast(1) else it
+            // Fix 4: Use lastOrNull() instead of last()
+            if (promo != '.' && it.isNotEmpty() && it.last().uppercaseChar() == promo) it.dropLast(1) else it
         }.replace("x", "").replace("X", "")
 
         if (moveChars.length < 2) return null
@@ -122,13 +143,6 @@ class ChessGame {
 
         val capture = 'x' in rest || 'X' in rest
 
-        // Handle 'b' ambiguity: "bxc5" could be bishop or b-pawn
-        // Try piece='B' interpretation first, pawn fallback handled in findCandidates
-        if (piece == 'P' && firstChar.lowercaseChar() == 'b' && s.length >= 3 &&
-            (s[1] == 'x' || s[1] == 'X' || s[1] in 'a'..'h' || s[1] in '1'..'8')) {
-            // Could be bishop. We'll try both in findCandidates.
-        }
-
         return San(piece, destFile, destRank, disambFile, disambRank, capture, promo)
     }
 
@@ -146,16 +160,22 @@ class ChessGame {
             results.add(from)
         }
 
-        // Handle 'b' ambiguity: if piece was P (pawn) and no candidates, try Bishop
+        // Fix 1: Handle 'b' ambiguity in both directions
+        // If parsed as pawn (lowercase 'b' input) and no pawn candidates, try bishop
         if (results.isEmpty() && san.piece == 'P') {
             val bSan = san.copy(piece = 'B')
             return findCandidates(bSan)
         }
-        // If still P (pawn) with multiple candidates from 'b' confusion, also try Bishop
+        // If parsed as pawn with multiple candidates, also try bishop
         if (results.size > 1 && san.piece == 'P') {
             val bSan = san.copy(piece = 'B')
             val bResults = findCandidates(bSan)
             if (bResults.size == 1) return bResults
+        }
+        // If parsed as bishop (uppercase 'B' input) and no candidates, try pawn on b-file
+        if (results.isEmpty() && san.piece == 'B') {
+            val pSan = san.copy(piece = 'P', disambFile = 1) // b-file = index 1
+            return findCandidates(pSan)
         }
 
         return results
@@ -298,8 +318,17 @@ class ChessGame {
         board[to] = piece
         board[from] = '.'
 
-        // Promotion
-        if (promo != '.') board[to] = if (white) promo.uppercaseChar() else promo.lowercaseChar()
+        // Fix 5: Promotion validation
+        val destRank = to / 8
+        val isLastRank = destRank == 0 || destRank == 7
+        val effectivePromo = if (lc == 'p' && isLastRank) {
+            // Pawn on last rank: use given promo or default to queen
+            if (promo != '.') promo else 'Q'
+        } else {
+            // Not a pawn on last rank: ignore any promo suffix
+            '.'
+        }
+        if (effectivePromo != '.') board[to] = if (white) effectivePromo.uppercaseChar() else effectivePromo.lowercaseChar()
 
         // En passant target
         ep = if (lc == 'p' && abs(to / 8 - from / 8) == 2) (from + to) / 2 else -1
