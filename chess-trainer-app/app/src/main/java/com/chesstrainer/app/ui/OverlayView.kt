@@ -949,7 +949,7 @@ data class ArrowData(
      * the same line. With [mateIn] > 0 and step >= 1 the move belongs to a forced-mate
      * sequence: its number is drawn on the piece that makes it (the [from] square, traced back
      * to where that piece stands now), and steps 2 and up get a solid arrow from [from] to [to].
-     * Number and arrow share the step's own color (gold, orange, cyan, lime), so the order
+     * Number and arrow share the step's own color (gold, orange, cyan, lime, ...), so the order
      * reads at a glance. A step above 1 without a mate is an ordinary plan, drawn as a faded,
      * dashed arrow.
      */
@@ -1016,13 +1016,27 @@ class ArrowView(
         private val STEP_COLOR_2 = Color.parseColor("#FF8C00") // Orange
         private val STEP_COLOR_3 = Color.parseColor("#00CED1") // Cyan
         private val STEP_COLOR_4 = Color.parseColor("#32CD32") // Lime green
+        private val STEP_COLOR_5 = Color.parseColor("#FF69B4") // Hot pink
+        private val STEP_COLOR_6 = Color.parseColor("#9370DB") // Medium purple
+        private val STEP_COLOR_7 = Color.parseColor("#FF4500") // Red-orange
+        private val STEP_COLOR_8 = Color.parseColor("#00BFFF") // Deep sky blue
+        private val STEP_COLOR_FALLBACK = Color.parseColor("#FFFFFF") // White
 
-        /** Color of move number [step] of a forced mate, shared by its arrow and its number. */
+        /**
+         * Color of move number [step] of a forced mate, shared by its arrow (step 1 included),
+         * the number on that arrow and the number on the piece. Eight distinct colors, one per
+         * step the coordinator can send (the move to play plus its premoves).
+         */
         fun stepColor(step: Int): Int = when (step) {
+            1 -> STEP_COLOR_1
             2 -> STEP_COLOR_2
             3 -> STEP_COLOR_3
             4 -> STEP_COLOR_4
-            else -> STEP_COLOR_1
+            5 -> STEP_COLOR_5
+            6 -> STEP_COLOR_6
+            7 -> STEP_COLOR_7
+            8 -> STEP_COLOR_8
+            else -> STEP_COLOR_FALLBACK
         }
 
         /** Alpha of the dark outline drawn behind every arrow. */
@@ -1243,7 +1257,11 @@ class ArrowView(
         if (length < 1f) return
 
         val style = styleFor(arrow.rank)
-        val color = withAlpha(arrowColorForRank(arrow.rank, arrow.color), style.alpha)
+        // A move of a forced mate takes its step's color, so the arrow always matches the
+        // numbered badge on its piece; any other arrow keeps its classification color.
+        val baseColor =
+            if (isMateStep(arrow)) stepColor(arrow.step) else arrowColorForRank(arrow.rank, arrow.color)
+        val color = withAlpha(baseColor, style.alpha)
         shaftPaint.color = color
         headPaint.color = color
 

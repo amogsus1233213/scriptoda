@@ -106,8 +106,11 @@ class AnalysisCoordinator(
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
 
-        /** Extra user moves of a forced mate drawn as numbered waypoints (after move 1). */
-        private const val MAX_MATE_PREMOVES = 4
+        /**
+         * Extra user moves of a forced mate drawn as numbered waypoints (after move 1). With
+         * move 1 that is 8 steps, one per color of the overlay's step palette.
+         */
+        private const val MAX_MATE_PREMOVES = 7
 
         /**
          * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
@@ -2066,7 +2069,7 @@ class AnalysisCoordinator(
      * be drawn with their number. The PV alternates user move, opponent reply, ..., so the
      * user's moves sit at the even indices.
      *
-     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]) in gold.
+     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]), each in its step's color.
      * Each line carries both squares of its UCI move: `from` is the piece to move (the overlay
      * numbers it with `step`), `to` is where it goes. `step` runs 2, 3, ...; step 1 is the best
      * arrow itself, set in [render]. Note that `from` is the square in the position after the
