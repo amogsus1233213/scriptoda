@@ -38,7 +38,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -58,7 +60,10 @@ import kotlin.math.max
  *  3. The piece placement must be read identically on [STABLE_FRAMES] consecutive frames before it
  *     is accepted (filters out piece animations and drags). A placement differing from the last
  *     successfully analysed one on more than [MAX_SQUARE_JUMP] squares needs [JUMP_STABLE_FRAMES]
- *     identical reads instead, as it is most likely a misread.
+ *     identical reads instead, as it is most likely a misread. A finished move of the opponent
+ *     is accepted from a single read ([isClearOpponentMove]), and a move reported by the
+ *     accessibility service is picked up between frames ([pollAccessibility]), so the search for
+ *     the user's reply starts without waiting for the next frame.
  *  4. A new placement is diffed against the previous one to recover the move that was played,
  *     which also tells whose turn it is now. The move is classified with [MoveClassifier] and
  *     the new position is analysed by Stockfish.
@@ -86,7 +91,7 @@ class AnalysisCoordinator(
         private const val SEARCH_TIME_MS = 5000
 
         /** At or below this many seconds on the user's clock, the search uses [FAST_MOVETIME_MS]. */
-        private const val TIME_PRESSURE_THRESHOLD_SECONDS = 20
+        private const val TIME_PRESSURE_THRESHOLD_SECONDS = 60
 
         /** Time budget (ms) for the main search when the user is in time pressure. */
         private const val FAST_MOVETIME_MS = 500
@@ -128,6 +133,13 @@ class AnalysisCoordinator(
 
         /** Consecutive identical reads required before a placement is trusted. */
         private const val STABLE_FRAMES = 2
+
+        /**
+         * How often (ms) [AccessibilityData] is checked for a new move between screen frames.
+         * Frames arrive only every 500 ms at the default 2 fps, which used to be the wait before
+         * a move the accessibility service had already reported reached the engine.
+         */
+        private const val ACCESSIBILITY_POLL_MS = 100L
 
         /**
          * Unstable reads (differing from the stable placement) after which the most frequently
@@ -334,20 +346,33 @@ class AnalysisCoordinator(
     private var turnSourcesUnavailable = false
 
     /**
-     * Placement the worker's main search is running for, null while no main search is running.
-     * Written by the worker, read by the capture thread ([interruptStaleSearch]).
+     * Placement the worker's main search or move classification is running for, null while
+     * neither is running. Written by the worker, read by the capture and poll threads
+     * ([interruptStaleSearch]).
      */
     @Volatile
     private var searchingPlacement: String? = null
 
     /**
-     * Set by the capture thread ([interruptStaleSearch]) when the board changed while the main
-     * search of [searchingPlacement] was still running; the search is interrupted at the same
-     * time. The worker checks it once the search returns and drops the (cut short) result, so
-     * the new position is analysed from the next frame.
+     * Set by the capture or poll thread ([interruptStaleSearch]) when the board changed while
+     * the engine work for [searchingPlacement] was still running; the search is interrupted at
+     * the same time. The worker checks it once the search returns and drops the (cut short)
+     * result, so the new position is analysed from the next frame.
      */
     @Volatile
     private var positionStale = false
+
+    /** Checks [AccessibilityData] for moves between frames; see [pollAccessibility]. */
+    @Volatile
+    private var accessibilityPoller: ScheduledExecutorService? = null
+
+    /** Set once a frame went down the accessibility path; [pollAccessibility] waits for it. */
+    @Volatile
+    private var accessibilityFrameSeen = false
+
+    /** Placement [pollAccessibility] last handed to the worker. */
+    @Volatile
+    private var polledPlacement: String? = null
 
     /** Placement whose search last gave no analysis, and how often it was retried. Worker only. */
     private var failedPlacement: String? = null
@@ -374,6 +399,15 @@ class AnalysisCoordinator(
             initEngine()
         }
         ScreenCaptureService.listener = frameListener
+        accessibilityFrameSeen = false
+        polledPlacement = null
+        accessibilityPoller = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "analysis-a11y-poll").apply { isDaemon = true }
+        }.also {
+            it.scheduleWithFixedDelay(
+                { pollAccessibility() }, ACCESSIBILITY_POLL_MS, ACCESSIBILITY_POLL_MS, TimeUnit.MILLISECONDS,
+            )
+        }
     }
 
     /** Stops consuming frames, shuts the engine down and clears the overlay. */
@@ -383,6 +417,8 @@ class AnalysisCoordinator(
             ScreenCaptureService.listener = null
         }
         calibrationRequested.set(false)
+        accessibilityPoller?.shutdownNow()
+        accessibilityPoller = null
         // Interrupt a running search so the teardown below is not stuck behind it.
         engine?.stop()
         submit {
@@ -720,21 +756,103 @@ class AnalysisCoordinator(
     }
 
     /**
-     * Capture thread: called for a frame that arrives while the worker is busy. If the worker
-     * is in the main search and accessibility data shows another placement than the one being
-     * searched, the search is stopped from here (the worker itself is blocked inside it and
-     * cannot do so), which makes it return within moments.
+     * [classifyMove] for the move that led to [placement]. Classifying takes several short
+     * engine searches during which the worker sees no frames, so a quick reply on the board
+     * used to wait for all of them before its own search could start. Like the main search it
+     * can therefore be cut short when the board moves on ([interruptStaleSearch]); a
+     * classification from interrupted searches is unreliable and is dropped.
+     */
+    private fun classifyInterruptibly(
+        placement: String,
+        beforeFen: String,
+        move: InferredMove,
+        beforeAnalysis: AnalysisResult?,
+        olderAnalysis: AnalysisResult?,
+        multiPvBefore: List<AnalysisResult>?,
+    ): Pair<AnalysisResult?, ClassifiedMove?> {
+        positionStale = false
+        searchingPlacement = placement
+        val result = try {
+            classifyMove(beforeFen, move, beforeAnalysis, olderAnalysis, multiPvBefore)
+        } finally {
+            searchingPlacement = null
+        }
+        if (positionStale) {
+            Log.d(TAG, "Board moved on while classifying ${move.uci}; classification dropped")
+            return beforeAnalysis to null
+        }
+        return result
+    }
+
+    /**
+     * Capture or poll thread: called when the board is looked at while the worker is busy. If
+     * the worker is in the main search or classifying a move, and accessibility data shows
+     * another placement than the one it works on, the engine is stopped from here (the worker
+     * itself is blocked inside it and cannot do so), which makes it return within moments.
      */
     private fun interruptStaleSearch() {
         val searching = searchingPlacement ?: return
-        val live = try {
-            freshAccessibilityPositions()?.let { BoardPositionParser.positionsToFen(it).substringBefore(' ') }
-        } catch (e: RuntimeException) {
-            null
-        } ?: return
+        val live = liveAccessibilityPlacement() ?: return
         if (live == searching) return
+        // The worker may have moved on to other engine work since the read above.
+        if (searchingPlacement != searching) return
         positionStale = true
         engine?.interruptSearch()
+    }
+
+    /**
+     * The placement accessibility data shows right now, from the same source
+     * [processAccessibilityPositions] takes it from (the tracked FEN when move tracking is
+     * active, else the reported positions), or null when the accessibility path is not in use.
+     * Any thread.
+     */
+    private fun liveAccessibilityPlacement(): String? {
+        val positions = freshAccessibilityPositions() ?: return null
+        val tracked = AccessibilityData.trackedFen
+        if (tracked != null && AccessibilityData.isRecent()) return tracked.substringBefore(' ')
+        return try {
+            BoardPositionParser.positionsToFen(positions).substringBefore(' ')
+        } catch (e: RuntimeException) {
+            null
+        }
+    }
+
+    /**
+     * Poll thread, every [ACCESSIBILITY_POLL_MS]: hands a placement newly reported by the
+     * accessibility service to the worker right away instead of with the next screen frame.
+     * Only ordinary moves are taken this way (see [isClearMoveFromCurrent]); anything else
+     * (new game, resync, orientation not settled) is left to the frame path, which has the
+     * screen to cross-check against. While the worker is busy, this also stops a search of a
+     * position that is no longer on the board sooner than the next frame would.
+     */
+    private fun pollAccessibility() {
+        try {
+            if (!running.get() || !accessibilityFrameSeen) return
+            val live = liveAccessibilityPlacement() ?: return
+            if (live == polledPlacement) return
+            if (!processing.compareAndSet(false, true)) {
+                interruptStaleSearch()
+                return
+            }
+            val positions = freshAccessibilityPositions()
+            if (positions == null) {
+                processing.set(false)
+                return
+            }
+            polledPlacement = live
+            val reportedOrientation = AccessibilityData.userPlaysWhite
+            val accepted = submit {
+                try {
+                    processAccessibilityPositions(positions, reportedOrientation, null, clearMoveOnly = true)
+                } finally {
+                    processing.set(false)
+                }
+            }
+            if (!accepted) processing.set(false)
+        } catch (e: RuntimeException) {
+            // An exception escaping a scheduled task would silently end the polling.
+            Log.w(TAG, "Accessibility poll failed", e)
+        }
     }
 
     /**
@@ -787,6 +905,7 @@ class AnalysisCoordinator(
         // still used to locate the board so the overlay has bounds to draw arrows in.
         val accessibilityPositions = freshAccessibilityPositions()
         if (accessibilityPositions != null) {
+            accessibilityFrameSeen = true
             // The accessibility squares are absolute, so the screen orientation (needed to draw
             // the arrows) must come from elsewhere: the accessibility service when it can tell,
             // otherwise a cross-check against this frame (see processAccessibilityPositions).
@@ -906,6 +1025,12 @@ class AnalysisCoordinator(
         val finalPlacement = when {
             // Normal path: two identical reads in a row
             candidateCount >= STABLE_FRAMES && placement != stablePlacement -> placement
+            // Fast path: a finished move of the opponent is taken from the first read, so the
+            // search for the user's reply starts one frame interval (500 ms at 2 fps) sooner.
+            isClearOpponentMove(placement) -> {
+                Log.d(TAG, "Clear opponent move read once; not waiting for a second frame")
+                placement
+            }
             // Majority vote: after MAX_FRAMES_BEFORE_MAJORITY frames, pick the most-read position
             candidateFramesSinceStable >= MAX_FRAMES_BEFORE_MAJORITY && candidateHistory.isNotEmpty() -> {
                 val best = candidateHistory.maxByOrNull { it.value }
@@ -972,7 +1097,9 @@ class AnalysisCoordinator(
      * Accessibility counterpart of [processFrame]: converts the reported positions to a FEN and
      * feeds its placement into the same move-tracking path ([onPositionChanged]) that sets
      * [currentFen] for vision reads. Accessibility data is exact, so no multi-frame stability
-     * check is needed; an unchanged placement is simply ignored.
+     * check is needed; an unchanged placement is simply ignored. With [clearMoveOnly] (calls
+     * from [pollAccessibility], which have no frame and so no [board]) anything but an ordinary
+     * move is ignored as well and left to the next frame.
      *
      * The accessibility squares are absolute, so the FEN is right whatever the orientation, but
      * the arrows are mapped to the screen with [whiteAtBottom]. That is therefore updated here
@@ -983,6 +1110,7 @@ class AnalysisCoordinator(
         positions: Map<String, Char>,
         reportedOrientation: Boolean?,
         board: ScreenBoard?,
+        clearMoveOnly: Boolean = false,
     ) {
         if (!running.get()) return
         ensureTemplatesLoaded()
@@ -1015,6 +1143,8 @@ class AnalysisCoordinator(
             Log.w(TAG, "Ignoring malformed accessibility placement: $placement")
             return
         }
+        // Between frames ([pollAccessibility]) only an ordinary move is taken.
+        if (clearMoveOnly && !isClearMoveFromCurrent(placement, reportedOrientation)) return
 
         missedFrames = 0
         if (!boardVisible) {
@@ -1201,6 +1331,88 @@ class AnalysisCoordinator(
             postOverlayClear()
             lastHintStatus = STATUS_LOOKING
             postStatus(STATUS_LOOKING)
+        }
+    }
+
+    /**
+     * The single pseudo-legal move that turns the tracked position into [placement], or null
+     * if there is none or move tracking is not in step with [stablePlacement].
+     */
+    private fun moveFromCurrent(placement: String): InferredMove? {
+        if (placement == stablePlacement || placement == START_PLACEMENT) return null
+        val cur = currentFen ?: return null
+        val curPlacement = cur.substringBefore(' ')
+        if (curPlacement != stablePlacement) return null
+        val before = parsePlacement(curPlacement) ?: return null
+        val after = parsePlacement(placement) ?: return null
+        return MoveInference.infer(before, after, epSquareOf(cur))
+    }
+
+    /**
+     * Accessibility path between frames: true if [placement] is one ordinary move away from
+     * the tracked position and the screen orientation is settled, so it can be processed
+     * without a frame to cross-check the orientation against.
+     */
+    private fun isClearMoveFromCurrent(placement: String, reportedOrientation: Boolean?): Boolean {
+        if (reportedOrientation == null &&
+            (whiteAtBottom == null || orientationConfidence != CONFIDENCE_HIGH)
+        ) {
+            return false
+        }
+        return moveFromCurrent(placement) != null
+    }
+
+    /**
+     * Vision path: true if a single read of [placement] can be trusted without the usual
+     * second identical read. That is the case when it is exactly one move of the opponent,
+     * made on the opponent's turn, to a square the piece cannot be merely passing over.
+     *
+     * The stability check exists for frames caught mid-animation or mid-drag. The opponent's
+     * pieces are never dragged on the user's screen, and of an animated piece only a slider
+     * (or a pawn's double step, or the king while castling) can be read on a square short of
+     * its destination and still look like a legal move. Those cases keep the two-read rule;
+     * the user's own moves keep it too, as a dragged piece can hover over any square.
+     */
+    private fun isClearOpponentMove(placement: String): Boolean {
+        val userIsWhite = whiteAtBottom ?: return false
+        if (orientationConfidence == CONFIDENCE_LOW) return false
+        val cur = currentFen ?: return false
+        if (sideToMoveIsWhite(cur) == userIsWhite) return false
+        val move = moveFromCurrent(placement) ?: return false
+        if (move.white == userIsWhite) return false
+        val before = parsePlacement(cur.substringBefore(' ')) ?: return false
+        val after = parsePlacement(placement) ?: return false
+        return isFinalDestination(before, after, move)
+    }
+
+    /** False if the piece of [move] could be caught in passing, on its way to a square beyond. */
+    private fun isFinalDestination(before: CharArray, after: CharArray, move: InferredMove): Boolean {
+        val fromFile = move.from % 8
+        val fromRank = move.from / 8
+        val toFile = move.to % 8
+        val toRank = move.to / 8
+        val capture = before[move.to] != EMPTY || move.enPassant
+        return when (before[move.from].lowercaseChar()) {
+            'n' -> true
+            // A single king step may be the first half of castling; castling itself is complete.
+            'k' -> abs(toFile - fromFile) == 2
+            'p' -> {
+                val dir = if (move.white) 1 else -1
+                val startRank = if (move.white) 1 else 6
+                // Only a single step off the starting rank can still become a double step.
+                capture || move.promotion != null || abs(toRank - fromRank) == 2 ||
+                    fromRank != startRank || after[move.to + 8 * dir] != EMPTY
+            }
+            'b', 'r', 'q' -> {
+                if (capture) return true
+                // A slider that could go on along its line may still be moving.
+                val nextFile = toFile + Integer.signum(toFile - fromFile)
+                val nextRank = toRank + Integer.signum(toRank - fromRank)
+                if (nextFile !in 0..7 || nextRank !in 0..7) return true
+                val beyond = after[nextRank * 8 + nextFile]
+                beyond != EMPTY && beyond.isUpperCase() == move.white
+            }
+            else -> false
         }
     }
 
@@ -1503,7 +1715,7 @@ class AnalysisCoordinator(
             postClearCoachMessage()
             postOverlayClear()
             val (analysedBefore, classified) =
-                classifyMove(beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
+                classifyInterruptibly(placement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
             if (!running.get()) return
             previousAnalysis = analysedBefore
             lastClassified = classified
@@ -1549,9 +1761,7 @@ class AnalysisCoordinator(
             EngineStats.currentMateIn = null
         }
         // Do not draw arrows for a position that already changed while the engine was busy.
-        val live = freshAccessibilityPositions()?.let {
-            BoardPositionParser.positionsToFen(it).substringBefore(' ')
-        }
+        val live = liveAccessibilityPlacement()
         if (positionStale || (live != null && live != placement)) {
             // An interrupted search is too shallow to keep for classifying the next move.
             if (positionStale) currentAnalyses = null
@@ -1564,7 +1774,7 @@ class AnalysisCoordinator(
 
         // Only now, with the arrows on screen, classify the opponent's move for its badge.
         val (analysedBefore, classified) =
-            classifyMove(beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
+            classifyInterruptibly(placement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
         if (!running.get()) return
         previousAnalysis = analysedBefore
         lastClassified = classified
@@ -1573,9 +1783,7 @@ class AnalysisCoordinator(
             // The coach's line was written before the opponent's move was classified. When that
             // move turns out to be remarkable, render again so the coach can react to it.
             if (classified.classification in COACH_REACTS_TO_OPPONENT) {
-                val stillLive = freshAccessibilityPositions()?.let {
-                    BoardPositionParser.positionsToFen(it).substringBefore(' ')
-                }
+                val stillLive = liveAccessibilityPlacement()
                 if (stillLive == null || stillLive == placement) render()
             }
         }
@@ -1689,9 +1897,7 @@ class AnalysisCoordinator(
             EngineStats.currentMateIn = null
         }
         // Do not draw arrows for a position that already changed while the engine was busy.
-        val live = freshAccessibilityPositions()?.let {
-            BoardPositionParser.positionsToFen(it).substringBefore(' ')
-        }
+        val live = liveAccessibilityPlacement()
         if (positionStale || (live != null && live != placement)) {
             // An interrupted search is too shallow to keep for classifying the next move.
             if (positionStale) currentAnalyses = null
