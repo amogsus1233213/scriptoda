@@ -1091,6 +1091,21 @@ class AnalysisCoordinator(
                 postOverlayClear()
                 return
             }
+            // Guard against vision misreads caused by our own arrow overlay.
+            // When the board differs from the last known-good position by only
+            // a few squares and no legal move can be inferred, it is almost
+            // certainly the arrow graphics being read as pieces.
+            if (placement != START_PLACEMENT && lastKnownGoodFen != null) {
+                val goodPlacement = lastKnownGoodFen!!.substringBefore(' ')
+                val goodBoard = parsePlacement(goodPlacement)
+                if (goodBoard != null) {
+                    var diffs = 0
+                    for (i in after.indices) {
+                        if (after[i] != goodBoard[i]) diffs++
+                    }
+                    if (diffs in 1..3) return
+                }
+            }
             resyncTo(placement, after, if (placement == START_PLACEMENT) true else userIsWhite)
             return
         }
