@@ -61,6 +61,11 @@ class BoardAccessibilityService : AccessibilityService() {
     private var lastOrientation: Boolean? = null
     private var identicalOrientations = 0
 
+    /** Incremental game tracker: reconstructs the position from the accessible move list. */
+    private val game = ChessGame()
+    private var lastMoveCount = 0
+    private var moveTrackingActive = false
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
@@ -95,7 +100,13 @@ class BoardAccessibilityService : AccessibilityService() {
         cancelScheduledRead()
         lastReadTime = SystemClock.uptimeMillis()
         val nodes = readTree() ?: return
-        publish(parse(nodes))
+        val result = parse(nodes)
+        if (result.positions != null) {
+            moveTrackingActive = false
+            publish(result)
+        } else {
+            publishFromMoveList(nodes, result)
+        }
     }
 
     /** The chess app's view tree, or null if it is not the active window or cannot be read. */
@@ -195,10 +206,110 @@ class BoardAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Fallback: when the board parser finds no piece nodes, extract moves from chess.com's
+     * move list bar and replay them to reconstruct the position.
+     */
+    private fun publishFromMoveList(nodes: List<ViewTreeReader.NodeData>, parseResult: BoardPositionParser.ParseResult) {
+        AccessibilityData.lastNodeCount = parseResult.nodeCount
+
+        val extracted = MoveListReader.extract(nodes)
+        if (extracted.isEmpty()) {
+            AccessibilityData.lastRejectReason = "No board nodes and no moves in tree"
+            publish(parseResult)
+            return
+        }
+
+        // Detect new game: if we see move 1 white and our game has advanced past it,
+        // or if the moves don't match what we have, reset.
+        val firstExtracted = extracted.first()
+        if (firstExtracted.moveNumber == 1 && firstExtracted.isWhite && game.appliedSan.isNotEmpty()) {
+            // Check if this is a new game by seeing if the first move differs
+            if (game.appliedSan.isNotEmpty() && extracted.firstOrNull()?.san?.lowercase() !=
+                game.appliedSan.firstOrNull()?.lowercase()) {
+                Log.i(TAG, "New game detected, resetting move tracker")
+                game.reset()
+                lastMoveCount = 0
+            }
+        }
+
+        // If game hasn't started tracking yet and we don't see move 1,
+        // we can't reconstruct. Wait for a new game.
+        if (game.appliedSan.isEmpty() && !(firstExtracted.moveNumber == 1 && firstExtracted.isWhite)) {
+            AccessibilityData.lastRejectReason = "Move tracking: waiting for new game (saw move ${firstExtracted.moveNumber})"
+            publish(parseResult)
+            return
+        }
+
+        // Apply any new moves we haven't seen yet
+        var applied = false
+        for (move in extracted) {
+            val expectedMoveNum = (game.appliedSan.size / 2) + 1
+            val expectedWhite = game.appliedSan.size % 2 == 0
+            // Skip moves we've already applied
+            if (move.moveNumber < expectedMoveNum) continue
+            if (move.moveNumber == expectedMoveNum && move.isWhite == expectedWhite) {
+                // This is the next move to apply
+                if (game.applySan(move.san)) {
+                    applied = true
+                    Log.i(TAG, "Move tracked: ${move.moveNumber}${if (move.isWhite) "." else "..."} ${move.san}")
+                } else {
+                    Log.w(TAG, "Failed to apply move: ${move.san}")
+                    AccessibilityData.lastRejectReason = "Move tracking: failed to apply ${move.san}"
+                    publish(parseResult)
+                    return
+                }
+            } else if (move.moveNumber == expectedMoveNum && !move.isWhite && expectedWhite) {
+                // We expected white but got black — might have missed white's move
+                // This can happen if we started tracking mid-turn
+                continue
+            } else if (move.moveNumber > expectedMoveNum) {
+                // We missed a move. Can't continue tracking.
+                Log.w(TAG, "Missed move(s): expected $expectedMoveNum, saw ${move.moveNumber}")
+                AccessibilityData.lastRejectReason = "Move tracking: missed move $expectedMoveNum"
+                publish(parseResult)
+                return
+            }
+        }
+
+        // If we have a position from move tracking, publish it
+        if (game.appliedSan.isNotEmpty()) {
+            moveTrackingActive = true
+            val positions = game.toPositions()
+            val fen = game.toFen()
+            AccessibilityData.lastRejectReason = null
+
+            if (positions == lastPositions && !applied) {
+                identicalReads++
+                AccessibilityData.confirm(null)
+            } else {
+                identicalReads = 1
+                lastPositions = positions
+                AccessibilityData.update(positions, null)
+                Log.i(TAG, "Move-tracked position: ${game.appliedSan.size} moves, $fen")
+            }
+            if (identicalReads == STABLE_READS) {
+                AccessibilityData.markStable(positions)
+            }
+
+            // Infer user's color: in move 1, the player at the bottom made the first move.
+            // We can't know for sure from moves alone, but chess.com defaults to user at bottom.
+            // For now, leave orientation detection to the coordinator's vision fallback.
+
+            // Schedule another read to stay fresh
+            scheduleRead(MIN_INTERVAL_MS)
+        } else {
+            publish(parseResult)
+        }
+    }
+
     private fun onTargetLeft() {
         cancelScheduledRead()
         lastOrientation = null
         identicalOrientations = 0
+        moveTrackingActive = false
+        game.reset()
+        lastMoveCount = 0
         if (AccessibilityData.userPlaysWhite != null) Log.i(TAG, "Chess app left, user's colour unknown")
         AccessibilityData.onTargetLeft()
     }
