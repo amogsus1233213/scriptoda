@@ -107,6 +107,12 @@ class BoardAccessibilityService : AccessibilityService() {
         } else {
             publishFromMoveList(nodes, result)
         }
+
+        // Side to move from the move list: the side that did not make the last listed move.
+        val moves = MoveListReader.extract(nodes)
+        if (moves.isNotEmpty()) {
+            AccessibilityData.whiteToMove = !moves.last().isWhite
+        }
     }
 
     /** The chess app's view tree, or null if it is not the active window or cannot be read. */
@@ -278,6 +284,7 @@ class BoardAccessibilityService : AccessibilityService() {
             val positions = game.toPositions()
             val fen = game.toFen()
             AccessibilityData.lastRejectReason = null
+            AccessibilityData.whiteToMove = game.white
 
             if (positions == lastPositions && !applied) {
                 identicalReads++

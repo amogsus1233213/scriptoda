@@ -42,6 +42,12 @@ object AccessibilityData {
     @Volatile var detectedWhiteAtBottom: Boolean? = null
 
     /**
+     * Side to move as read from chess.com's move list (true = white to move); null when the
+     * move list could not tell.
+     */
+    @Volatile var whiteToMove: Boolean? = null
+
+    /**
      * Last positions that were read identically on at least two consecutive reads. Unlike
      * [detectedPositions], this skips the in-between states seen while a piece animates or is
      * dragged.
@@ -88,6 +94,7 @@ object AccessibilityData {
         targetPackageVisible = false
         userPlaysWhite = null
         detectedWhiteAtBottom = null
+        whiteToMove = null
         lastUpdateTime = 0L
     }
 
@@ -100,6 +107,7 @@ object AccessibilityData {
     fun clear() {
         detectedPositions = null
         detectedWhiteAtBottom = null
+        whiteToMove = null
         lastStablePositions = null
         positionChangeCount = 0
         lastViewDump = ""
