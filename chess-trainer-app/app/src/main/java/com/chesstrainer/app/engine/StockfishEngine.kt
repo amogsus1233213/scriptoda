@@ -198,7 +198,7 @@ class StockfishEngine(private val binaryPath: String) {
                 return null
             }
 
-            val deadline = deadlineAfter(ANALYSIS_TIMEOUT_MS)
+            val deadline = deadlineAfter(if (moveTimeMs > 0) moveTimeMs.toLong() + ANALYSIS_TIMEOUT_MS else ANALYSIS_TIMEOUT_MS)
             val infos = HashMap<Int, InfoLine>()
             var bestMove: String? = null
 
@@ -216,11 +216,16 @@ class StockfishEngine(private val binaryPath: String) {
             if (bestMove == null) {
                 if (process?.isAlive == true) {
                     send("stop")
-                    val stopLine = waitForLine(queue, deadlineAfter(STOP_DRAIN_TIMEOUT_MS)) {
-                        it.startsWith("bestmove")
-                    }
-                    if (stopLine != null) {
-                        bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
+                    val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
+                    while (bestMove == null) {
+                        val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
+                        if (stopLine.startsWith("bestmove")) {
+                            bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
+                        } else if (stopLine.startsWith("info ")) {
+                            val info = parseInfo(stopLine) ?: continue
+                            val existing = infos[info.multiPv]
+                            if (shouldReplace(existing, info)) infos[info.multiPv] = info
+                        }
                     }
                 }
                 if (bestMove == null && infos.isNotEmpty()) {
@@ -282,8 +287,9 @@ class StockfishEngine(private val binaryPath: String) {
     private fun shouldReplace(existing: InfoLine?, candidate: InfoLine): Boolean {
         if (existing == null) return true
         if (candidate.depth < existing.depth) return false
+        if (candidate.depth > existing.depth) return true
         // Prefer exact scores over lower/upper bounds at the same depth.
-        if (candidate.isBound && !existing.isBound && candidate.depth == existing.depth) return false
+        if (candidate.isBound && !existing.isBound) return false
         // Bound lines often carry a truncated PV; keep the old one if the new one is empty.
         return candidate.pv.isNotEmpty() || existing.pv.isEmpty()
     }
@@ -356,8 +362,18 @@ class StockfishEngine(private val binaryPath: String) {
             } else {
                 info.pv.firstOrNull().orEmpty()
             }
+            // After an interrupted search the bestmove token may not match the
+            // PV's first move.  When they disagree, replace the PV so the
+            // displayed arrow and eval stay consistent.
+            val pvAdjusted = if (index == 1 && bestMove.isNotEmpty() &&
+                info.pv.firstOrNull() != null && info.pv[0] != bestMove
+            ) {
+                listOf(bestMove)
+            } else {
+                info.pv
+            }
             val pv = when {
-                info.pv.isNotEmpty() -> info.pv
+                pvAdjusted.isNotEmpty() -> pvAdjusted
                 move.isNotEmpty() -> listOf(move)
                 else -> emptyList()
             }
