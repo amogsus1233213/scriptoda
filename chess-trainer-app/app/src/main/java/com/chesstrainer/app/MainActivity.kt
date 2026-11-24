@@ -2,6 +2,9 @@ package com.chesstrainer.app
 
 import android.Manifest
 import android.app.ActivityManager
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -407,6 +410,35 @@ class MainActivity : AppCompatActivity() {
             ).forEach { addView(it, matchWrap()) }
         }
         container.addView(panel, matchWrap().apply { topMargin = dp(12f) })
+
+        val copyDebugButton = com.google.android.material.button.MaterialButton(this).apply {
+            text = "Copy A11y Debug to Clipboard"
+            isAllCaps = false
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            cornerRadius = dp(8f)
+            setOnClickListener {
+                val info = buildString {
+                    appendLine("=== Accessibility Debug ===")
+                    appendLine("Service connected: ${AccessibilityData.serviceConnected}")
+                    appendLine("Service running: ${AccessibilityStatus.isServiceRunning()}")
+                    appendLine("Target visible: ${AccessibilityData.targetPackageVisible}")
+                    appendLine("Positions: ${AccessibilityData.detectedPositions?.size ?: "null"}")
+                    appendLine("Stable positions: ${AccessibilityData.lastStablePositions?.size ?: "null"}")
+                    appendLine("User plays white: ${AccessibilityData.userPlaysWhite}")
+                    appendLine("Node count: ${AccessibilityData.lastNodeCount}")
+                    appendLine("Reject reason: ${AccessibilityData.lastRejectReason ?: "none"}")
+                    appendLine("Is recent: ${AccessibilityData.isRecent()}")
+                    appendLine("Last update: ${System.currentTimeMillis() - AccessibilityData.lastUpdateTime}ms ago")
+                    appendLine()
+                    appendLine("=== View Dump ===")
+                    appendLine(AccessibilityData.lastViewDump.ifEmpty { "(empty)" })
+                }
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("A11y Debug", info))
+                Toast.makeText(this@MainActivity, "Copied to clipboard!", Toast.LENGTH_SHORT).show()
+            }
+        }
+        container.addView(copyDebugButton, matchWrap().apply { topMargin = dp(8f) })
 
         val hint = TextView(this).apply {
             text = "Stats refresh every second while this tab is open."
