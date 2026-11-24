@@ -82,6 +82,12 @@ class AnalysisCoordinator(
         /** Time budget (ms) for the main multi-PV search; 0 means use depth only. */
         private const val SEARCH_TIME_MS = 3000
 
+        /** At or below this many seconds on the user's clock, the search uses [FAST_MOVETIME_MS]. */
+        private const val TIME_PRESSURE_THRESHOLD_SECONDS = 20
+
+        /** Time budget (ms) for the main search when the user is in time pressure. */
+        private const val FAST_MOVETIME_MS = 500
+
         /** Time budget (ms) for analysing the previous position when classifying a played move. */
         private const val CLASSIFY_TIME_MS = 500
 
@@ -467,12 +473,26 @@ class AnalysisCoordinator(
         }
     }
 
+    /**
+     * Time budget for the main search: [FAST_MOVETIME_MS] when the user's clock
+     * ([AccessibilityData.userTimeSeconds]) is known and at or below
+     * [TIME_PRESSURE_THRESHOLD_SECONDS], otherwise [SEARCH_TIME_MS].
+     */
+    private fun searchTimeMs(): Int {
+        val seconds = AccessibilityData.userTimeSeconds
+        if (seconds != null && seconds <= TIME_PRESSURE_THRESHOLD_SECONDS) {
+            Log.d(TAG, "Time pressure (${seconds}s left): searching for $FAST_MOVETIME_MS ms")
+            return FAST_MOVETIME_MS
+        }
+        return SEARCH_TIME_MS
+    }
+
     /** Analyses [fen] with [NUM_LINES] principal variations, ordered best first. */
     private fun analyzeMulti(fen: String): List<AnalysisResult>? {
         val e = engine ?: return null
         if (!running.get()) return null
         return try {
-            e.analyzeMultiPv(fen, depth, NUM_LINES, moveTimeMs = SEARCH_TIME_MS)
+            e.analyzeMultiPv(fen, depth, NUM_LINES, moveTimeMs = searchTimeMs())
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Multi-PV analysis failed for $fen", ex)
             null
@@ -1418,7 +1438,13 @@ class AnalysisCoordinator(
                 }
             }
             SuggestedLineData(move.substring(0, 2), move.substring(2, 4), evalCp, mateIn, label, color, rank)
-        }.toMutableList()
+        }
+            // Two arrows landing on the same square overlap (heads and badges collide), so only
+            // the best-ranked move per destination is kept. The list is in rank order and
+            // distinctBy keeps the first occurrence, so PV1 beats PV2 beats PV3. This also
+            // collapses promotions of one pawn to different pieces (e7e8q / e7e8n).
+            .distinctBy { it.to }
+            .toMutableList()
 
         if (suggestions.isEmpty()) {
             postOverlayClear()

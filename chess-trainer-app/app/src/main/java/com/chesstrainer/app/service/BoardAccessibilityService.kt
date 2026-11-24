@@ -141,6 +141,9 @@ class BoardAccessibilityService : AccessibilityService() {
         cancelScheduledRead()
         lastReadTime = SystemClock.uptimeMillis()
         val nodes = readTree() ?: return
+        // The user's clock, for time pressure detection in AnalysisCoordinator. Null when the
+        // tree shows no clock (untimed game, or not on a game screen).
+        AccessibilityData.userTimeSeconds = ClockReader.userTimeSeconds(nodes)
         val result = parse(nodes)
         if (result.positions != null) {
             moveTrackingActive = false

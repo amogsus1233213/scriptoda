@@ -56,6 +56,13 @@ object AccessibilityData {
     @Volatile var trackedFen: String? = null
 
     /**
+     * Time left on the user's clock in whole seconds, as read from the view tree by
+     * [ClockReader]; null when no clock is shown or it cannot be told which one is the user's.
+     * [AnalysisCoordinator] shortens the search when this is low.
+     */
+    @Volatile var userTimeSeconds: Int? = null
+
+    /**
      * Last positions that were read identically on at least two consecutive reads. Unlike
      * [detectedPositions], this skips the in-between states seen while a piece animates or is
      * dragged.
@@ -104,6 +111,7 @@ object AccessibilityData {
         detectedWhiteAtBottom = null
         whiteToMove = null
         trackedFen = null
+        userTimeSeconds = null
         lastUpdateTime = 0L
     }
 
@@ -118,6 +126,7 @@ object AccessibilityData {
         detectedWhiteAtBottom = null
         whiteToMove = null
         trackedFen = null
+        userTimeSeconds = null
         lastStablePositions = null
         positionChangeCount = 0
         lastViewDump = ""
