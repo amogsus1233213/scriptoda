@@ -15,6 +15,11 @@ object AccessibilityData {
     @Volatile var lastUpdateTime: Long = 0L
     @Volatile var targetPackageVisible: Boolean = false
 
+    /** Diagnostics for the Stats tab: why the last read gave no board, and how big the tree was. */
+    @Volatile var lastRejectReason: String? = null
+    @Volatile var lastNodeCount: Int = 0
+    @Volatile var serviceConnected: Boolean = false
+
     /**
      * Whether the user plays white (white at the bottom of the board), when the accessibility
      * service can tell; null when unknown. [AnalysisCoordinator] treats a non-null value as
@@ -101,5 +106,7 @@ object AccessibilityData {
         lastUpdateTime = 0L
         targetPackageVisible = false
         userPlaysWhite = null
+        lastRejectReason = null
+        lastNodeCount = 0
     }
 }

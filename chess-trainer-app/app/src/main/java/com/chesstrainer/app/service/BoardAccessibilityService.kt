@@ -64,6 +64,7 @@ class BoardAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        AccessibilityData.serviceConnected = true
         Log.i(TAG, "Accessibility service connected")
     }
 
@@ -99,12 +100,27 @@ class BoardAccessibilityService : AccessibilityService() {
 
     /** The chess app's view tree, or null if it is not the active window or cannot be read. */
     private fun readTree(): List<ViewTreeReader.NodeData>? {
-        val root = rootInActiveWindow ?: return null
+        val root = rootInActiveWindow
+        if (root == null) {
+            AccessibilityData.lastRejectReason = "No active window"
+            return null
+        }
         return try {
-            if (root.packageName?.toString() != TARGET_PACKAGE) null
-            else ViewTreeReader.traverse(root).takeIf { it.isNotEmpty() }
+            if (root.packageName?.toString() != TARGET_PACKAGE) {
+                AccessibilityData.lastRejectReason =
+                    "Active package: ${root.packageName} (need $TARGET_PACKAGE)"
+                null
+            } else {
+                val nodes = ViewTreeReader.traverse(root)
+                if (nodes.isEmpty()) {
+                    AccessibilityData.lastNodeCount = 0
+                    AccessibilityData.lastRejectReason = "Empty view tree"
+                    null
+                } else nodes
+            }
         } catch (e: RuntimeException) {
             Log.w(TAG, "Error reading view tree", e)
+            AccessibilityData.lastRejectReason = "Error reading view tree: ${e.javaClass.simpleName}"
             null
         } finally {
             root.recycle()
@@ -124,6 +140,8 @@ class BoardAccessibilityService : AccessibilityService() {
     }
 
     private fun publish(result: BoardPositionParser.ParseResult) {
+        AccessibilityData.lastNodeCount = result.nodeCount
+        AccessibilityData.lastRejectReason = result.rejectReason
         trackOrientation(result.whiteAtBottom)
 
         val positions = result.positions
@@ -217,6 +235,7 @@ class BoardAccessibilityService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         readScheduled = false
         instance = null
+        AccessibilityData.serviceConnected = false
         AccessibilityData.clear()
         super.onDestroy()
         Log.i(TAG, "Accessibility service destroyed")

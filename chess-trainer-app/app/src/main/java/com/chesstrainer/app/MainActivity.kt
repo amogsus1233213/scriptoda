@@ -85,6 +85,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statsEvalText: TextView
     private lateinit var statsOrientationText: TextView
     private lateinit var statsAccessibilityText: TextView
+    private lateinit var statsA11yDiagText: TextView
     private lateinit var statsPositionsText: TextView
 
     private var selectedTab = TAB_CONTROLS
@@ -393,6 +394,7 @@ class MainActivity : AppCompatActivity() {
         statsEvalText = statusRow("Evaluation")
         statsOrientationText = statusRow("Board Orientation")
         statsAccessibilityText = statusRow("Accessibility Data")
+        statsA11yDiagText = statusRow("A11y Detail")
         statsPositionsText = statusRow("Positions Seen")
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -401,7 +403,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.surface))
             listOf(
                 statsMovesText, statsDepthText, statsFenText, statsEvalText,
-                statsOrientationText, statsAccessibilityText, statsPositionsText,
+                statsOrientationText, statsAccessibilityText, statsA11yDiagText, statsPositionsText,
             ).forEach { addView(it, matchWrap()) }
         }
         container.addView(panel, matchWrap().apply { topMargin = dp(12f) })
@@ -495,6 +497,22 @@ class MainActivity : AppCompatActivity() {
         statsAccessibilityText.setTextColor(
             ContextCompat.getColor(this, if (accessibilityOk) R.color.accent_green else R.color.accent_red)
         )
+
+        val a11yDiag = buildString {
+            append(if (AccessibilityData.serviceConnected) "Connected" else "Disconnected")
+            append(" | Pkg: ")
+            append(if (AccessibilityData.targetPackageVisible) "com.chess" else "none")
+            append(" | Nodes: ${AccessibilityData.lastNodeCount}")
+            val reason = AccessibilityData.lastRejectReason
+            if (reason != null) append(" | $reason")
+            val dump = AccessibilityData.lastViewDump
+            if (dump.isNotEmpty()) {
+                append("\n")
+                append(dump.take(300))
+            }
+        }
+        statsA11yDiagText.text = "A11y: $a11yDiag"
+        statsA11yDiagText.setTextColor(secondary)
 
         statsPositionsText.text = "Positions Seen: ${EngineStats.positionsSeen}"
         statsPositionsText.setTextColor(primary)
