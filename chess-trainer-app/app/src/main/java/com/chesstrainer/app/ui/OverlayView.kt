@@ -130,7 +130,8 @@ data class SuggestedLine(
     val commentary: String = "", // short coach comment, only shown for the best line
     /**
      * Place in the user's own move sequence: 1 = the move to play now, 2 and up = the user's
-     * later moves of the best line (premoves), drawn faded with their number.
+     * later moves of the best line (premoves), drawn with their number: waypoints for a forced
+     * mate, faded arrows for a plan.
      */
     val step: Int = 1,
 )
@@ -943,8 +944,9 @@ data class ArrowData(
     val mateIn: Int? = null,
     /**
      * 1 = the move to play now (the normal arrow). 2, 3, ... = the user's later moves of the
-     * same line, drawn as faded, dashed premove arrows with this number at the tip. For those,
-     * a non-null [mateIn] marks a forced-mate sequence (clearer than an ordinary plan).
+     * same line, carrying this number. For those, a non-null [mateIn] marks a forced-mate
+     * sequence, drawn as numbered waypoints on the destination squares (the squares to premove
+     * to, in order); a null one marks an ordinary plan, drawn as faded, dashed arrows.
      */
     val step: Int = 1,
 )
@@ -976,9 +978,16 @@ class ArrowView(
         /** Most premove arrows (step 2 and up) drawn besides the [MAX_ARROWS] suggestions. */
         const val MAX_PREMOVES = 4
 
-        /** Premove arrows of a forced mate: the 2nd move, then every later one. */
-        const val PREMOVE_MATE_ALPHA_2 = 100
-        const val PREMOVE_MATE_ALPHA_3 = 70
+        /** Waypoint ring on the destination square of a forced-mate premove. */
+        const val WAYPOINT_ALPHA = 220
+        const val WAYPOINT_RADIUS_FACTOR = 0.40f
+        const val WAYPOINT_STROKE_FACTOR = 0.07f
+        /** Translucent fill inside the waypoint ring, so the square reads as a target. */
+        const val WAYPOINT_FILL_ALPHA = 60
+        /** Thin ring around a piece that joins the mate later and still stands on its square. */
+        const val WAYPOINT_ORIGIN_ALPHA = 130
+        const val WAYPOINT_ORIGIN_STROKE_FACTOR = 0.035f
+        const val WAYPOINT_BADGE_DP = 18f
         /** Premove arrows of an ordinary plan: about 30% opacity. */
         const val PREMOVE_PLAN_ALPHA = 77
         /** The number badge stays more readable than its arrow. */
@@ -1052,6 +1061,7 @@ class ArrowView(
     private val premovePath = Path()
     private var premoveDash: DashPathEffect? = null
     private var premoveDashSquare = 0f
+    private val waypointPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stepBadgePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stepBadgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#1B1B1B")
@@ -1127,7 +1137,11 @@ class ArrowView(
         val square = board.width() / 8f
         if (hasArrows) {
             // Premoves first (last step lowest), so the moves to play now stay on top.
-            for (i in premoves.indices.reversed()) drawPremoveArrow(canvas, premoves[i], board, square)
+            for (i in premoves.indices.reversed()) {
+                val premove = premoves[i]
+                if (premove.mateIn != null) drawMateWaypoint(canvas, premove, i, board, square)
+                else drawPremoveArrow(canvas, premove, board, square)
+            }
             val drawOrder = arrows.sortedByDescending { it.rank }
             for (arrow in drawOrder) drawArrow(canvas, arrow, board, square)
             for (i in premoves.indices.reversed()) drawStepBadge(canvas, premoves[i], i, board, square)
@@ -1189,7 +1203,60 @@ class ArrowView(
     }
 
     /**
-     * Draws a later move of the best line ([ArrowData.step] > 1): a dashed, faded arrow. The
+     * Draws a later move of a forced mate as a waypoint: a ring on the destination square, the
+     * square to premove to. No arrow is drawn, as the piece often is not on the move's start
+     * square yet (it gets there by an earlier move of the sequence). The number is added by
+     * [drawStepBadge].
+     *
+     * When the move is made by a piece that has not moved earlier in the sequence, that piece
+     * still stands on the start square, so a thin ring marks it: this tells the user which
+     * piece goes to the waypoint. A piece continuing from an earlier waypoint needs no mark.
+     * @param index position of [arrow] in [premoves]
+     */
+    private fun drawMateWaypoint(canvas: Canvas, arrow: ArrowData, index: Int, board: RectF, square: Float) {
+        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val radius = square * WAYPOINT_RADIUS_FACTOR
+        val stroke = square * WAYPOINT_STROKE_FACTOR
+        val outline = BORDER_EXTRA_DP * density * 0.6f
+
+        // One ring per square: a later waypoint on the same square only adds its number.
+        val ringDrawn = (0 until index).any { premoves[it].mateIn != null && premoves[it].to == arrow.to }
+        if (!ringDrawn) {
+            waypointPaint.style = Paint.Style.FILL
+            waypointPaint.color = withAlpha(arrow.color, WAYPOINT_FILL_ALPHA)
+            canvas.drawCircle(end.x, end.y, radius, waypointPaint)
+            drawRing(canvas, end.x, end.y, radius, stroke, outline, arrow.color, WAYPOINT_ALPHA)
+        }
+
+        // The piece is still on its start square unless an earlier move of the line put it there.
+        val best = arrows.firstOrNull()
+        val arrivesLater = best?.to == arrow.from || (0 until index).any { premoves[it].to == arrow.from }
+        val sameOrigin = (0 until index).any { premoves[it].mateIn != null && premoves[it].from == arrow.from }
+        if (!arrivesLater && !sameOrigin && best?.from != arrow.from) {
+            val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
+            drawRing(
+                canvas, start.x, start.y, radius, square * WAYPOINT_ORIGIN_STROKE_FACTOR,
+                outline, arrow.color, WAYPOINT_ORIGIN_ALPHA,
+            )
+        }
+    }
+
+    /** A colored ring with a thin dark outline, so it reads on light and dark squares alike. */
+    private fun drawRing(
+        canvas: Canvas, cx: Float, cy: Float, radius: Float, stroke: Float, outline: Float,
+        color: Int, alpha: Int,
+    ) {
+        waypointPaint.style = Paint.Style.STROKE
+        waypointPaint.strokeWidth = stroke + outline
+        waypointPaint.color = withAlpha(Color.BLACK, alpha * BORDER_ALPHA / 255)
+        canvas.drawCircle(cx, cy, radius, waypointPaint)
+        waypointPaint.strokeWidth = stroke
+        waypointPaint.color = withAlpha(color, alpha)
+        canvas.drawCircle(cx, cy, radius, waypointPaint)
+    }
+
+    /**
+     * Draws a later move of an ordinary plan ([ArrowData.step] > 1): a dashed, faded arrow. The
      * whole arrow (outline included) is composed opaque in one layer and faded once, so the
      * dashes, the head and the outline do not show through each other.
      */
@@ -1202,11 +1269,7 @@ class ArrowView(
         if (length < 1f) return
 
         val style = STYLE_PREMOVE
-        val alpha = when {
-            arrow.mateIn == null -> PREMOVE_PLAN_ALPHA
-            arrow.step <= 2 -> PREMOVE_MATE_ALPHA_2
-            else -> PREMOVE_MATE_ALPHA_3
-        }
+        val alpha = PREMOVE_PLAN_ALPHA
         val color = withAlpha(arrow.color, 255)
 
         val angle = atan2(dy, dx)
@@ -1261,12 +1324,15 @@ class ArrowView(
      * Draws the premove number ("2", "3", ...) in a small disc at the top-left corner of the
      * destination square: at the arrow tip, yet clear of the classification badge, which sits at
      * the top-right corner. A premove landing where an earlier one already has its number uses
-     * the bottom-left corner instead.
+     * the bottom-left corner instead. The number of a forced-mate waypoint is a little larger
+     * and fully opaque, as it is the order to premove in.
      * @param index position of [arrow] in [premoves]
      */
     private fun drawStepBadge(canvas: Canvas, arrow: ArrowData, index: Int, board: RectF, square: Float) {
         val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
-        val size = PREMOVE_BADGE_DP * density
+        val waypoint = arrow.mateIn != null
+        val size = (if (waypoint) WAYPOINT_BADGE_DP else PREMOVE_BADGE_DP) * density
+        val badgeAlpha = if (waypoint) 255 else PREMOVE_BADGE_ALPHA
         if (size <= 0f) return
         val half = size / 2f
         val offset = square * 0.45f
@@ -1275,11 +1341,11 @@ class ArrowView(
         val cy = (if (taken) end.y + offset else end.y - offset).coerceIn(half, max(half, height - half))
 
         stepBadgePaint.style = Paint.Style.FILL
-        stepBadgePaint.color = withAlpha(arrow.color, PREMOVE_BADGE_ALPHA)
+        stepBadgePaint.color = withAlpha(arrow.color, badgeAlpha)
         canvas.drawCircle(cx, cy, half, stepBadgePaint)
         stepBadgePaint.style = Paint.Style.STROKE
         stepBadgePaint.strokeWidth = 1.2f * density
-        stepBadgePaint.color = withAlpha(Color.parseColor("#1B1B1B"), PREMOVE_BADGE_ALPHA)
+        stepBadgePaint.color = withAlpha(Color.parseColor("#1B1B1B"), badgeAlpha)
         canvas.drawCircle(cx, cy, half, stepBadgePaint)
 
         stepBadgeTextPaint.textSize = size * 0.72f

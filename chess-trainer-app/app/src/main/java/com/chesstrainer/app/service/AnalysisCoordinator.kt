@@ -102,7 +102,7 @@ class AnalysisCoordinator(
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
 
-        /** Extra user moves of a forced mate drawn as numbered premove arrows (after move 1). */
+        /** Extra user moves of a forced mate drawn as numbered waypoints (after move 1). */
         private const val MAX_MATE_PREMOVES = 4
         /** Extra user moves of an ordinary best line drawn as faint "plan" arrows. */
         private const val MAX_PLAN_PREMOVES = 2
@@ -1773,10 +1773,12 @@ class AnalysisCoordinator(
 
     /**
      * The user's follow-up moves (2nd, 3rd, ...) from the principal variation behind [best], to
-     * be drawn as numbered premove arrows. The PV alternates user move, opponent reply, ..., so
-     * the user's moves sit at the even indices.
+     * be drawn with their number. The PV alternates user move, opponent reply, ..., so the
+     * user's moves sit at the even indices.
      *
-     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]) in gold.
+     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]) in gold,
+     * as waypoints on the destination squares: the start square of a later move is often still
+     * empty on the board, so an arrow from it would mislead.
      * Any other line shows at most [MAX_PLAN_PREMOVES] faint neutral arrows, and only when the
      * evaluation has settled, as a line the engine is still changing its mind about is no plan.
      * @param sign +1 if the user (side to move) is white, -1 if black
