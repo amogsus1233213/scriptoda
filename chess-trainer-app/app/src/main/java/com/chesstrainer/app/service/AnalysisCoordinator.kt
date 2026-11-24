@@ -1139,7 +1139,7 @@ class AnalysisCoordinator(
 
         val e = engine
         val multiPvForClassifier = if (multiPvInvalidated) null else currentAnalyses?.takeIf { it.size >= 2 }
-        val classified = if (e != null && beforeAnalysis != null) {
+        val classified = if (e != null && e.isReady() && beforeAnalysis != null) {
             try {
                 MoveClassifier.classify(
                     engine = e,
@@ -1301,7 +1301,7 @@ class AnalysisCoordinator(
         val classified = lastClassified
 
         if (analyses.isNullOrEmpty()) {
-            postOverlayClear()
+            postOverlayThinking()
             return
         }
 

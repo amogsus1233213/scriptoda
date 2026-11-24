@@ -42,7 +42,7 @@ class StockfishEngine(private val binaryPath: String) {
         /** Base value used to represent mate scores in centipawns. */
         const val MATE_SCORE = 100_000
 
-        private const val ANALYSIS_TIMEOUT_MS = 15_000L
+        private const val ANALYSIS_TIMEOUT_MS = 10_000L
         private const val HANDSHAKE_TIMEOUT_MS = 5_000L
         private const val READY_TIMEOUT_MS = 3_000L
         private const val STOP_DRAIN_TIMEOUT_MS = 1_000L
@@ -117,8 +117,8 @@ class StockfishEngine(private val binaryPath: String) {
                 return false
             }
 
-            send("setoption name Threads value 6")
-            send("setoption name Hash value 512")
+            send("setoption name Threads value 4")
+            send("setoption name Hash value 128")
 
             if (!send("isready") ||
                 waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
