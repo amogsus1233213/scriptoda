@@ -1153,36 +1153,29 @@ class AnalysisCoordinator(
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
         val newWhiteToMove = !move.white
 
-        // --- Hardened opponent-turn detection ---
-        // Primary check: whose turn is it now vs. which side the user plays.
-        val turnBasedOpponent = newWhiteToMove != userIsWhite
-        // Cross-check: the inferred mover should be the opponent if it's now the user's turn.
-        val moveBasedOpponent = move.white != userIsWhite
-        if (turnBasedOpponent != moveBasedOpponent) {
-            Log.w(TAG, "Opponent-turn cross-check mismatch: turnBased=$turnBasedOpponent, " +
-                "moveBased=$moveBasedOpponent, move.white=${move.white}, userIsWhite=$userIsWhite")
-        }
-        // Use the move-inference-based check as the authoritative signal: if the mover was the
-        // opponent, treat this as the opponent's turn regardless of turn parity.
-        val isOpponentTurn = moveBasedOpponent
+        // It's the opponent's turn (= user just moved) when the side to move next
+        // is NOT the user's side.  The mover check (move.white != userIsWhite) is the
+        // complement of this — it tells us whether the opponent made the last move.
+        val isOpponentTurn = newWhiteToMove != userIsWhite
+        val opponentJustMoved = move.white != userIsWhite
 
         if (isOpponentTurn) {
-            // Opponent's turn: skip multi-PV analysis, just track the position and hide arrows.
+            // User just moved → opponent's turn now.  Clear overlay and skip analysis.
             previousFen = beforeFen
             previousAnalysis = beforeAnalysis
             currentFen = newFen
             currentAnalyses = null
-            // The move was inferred from a legal transition, so keep the jump-check reference fresh.
             lastKnownGoodFen = newFen
             lastMove = move
             lastClassified = classified
+            postClearOpponentBadge()
             postOverlayClear()
-            if (classified != null) {
-                postOpponentBadge(move.uci.substring(2, 4), classified.classification.displayName, !userIsWhite)
-            }
             return
         }
-        postClearOpponentBadge()
+        // Opponent just moved → user's turn.  Show badge for opponent's move, then analyse.
+        if (opponentJustMoved && classified != null) {
+            postOpponentBadge(move.uci.substring(2, 4), classified.classification.displayName, !userIsWhite)
+        }
         postOverlayThinking()
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return

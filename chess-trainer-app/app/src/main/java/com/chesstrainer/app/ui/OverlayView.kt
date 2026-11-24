@@ -17,6 +17,7 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Point
 import android.graphics.PointF
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -165,7 +166,23 @@ class OverlayService : Service() {
     private var commentaryView: TextView? = null
 
     private var expanded = false
+
+    /** Set when the user collapsed the panel by hand; suppresses auto-expand until they reopen it. */
+    private var userCollapsed = false
     private var lastScreen = Point()
+
+    /**
+     * Top-left position the user chose for the panel (initial spot, end of the last drag, or that
+     * spot re-mapped after a rotation). The window sits at the nearest fully visible position, so
+     * a temporarily larger panel (expanded, longer text) is pushed in from a screen edge without
+     * losing the chosen spot.
+     */
+    private var anchorX = 0
+    private var anchorY = 0
+
+    /** Size of the area the window manager lets the panel occupy; see [refreshUsableArea]. */
+    private val usableArea = Point()
+    private val displayFrame = Rect()
     private var currentLines: List<SuggestedLine> = emptyList()
     private var currentFlipped = false
     private var portraitBounds: RectF? = null
@@ -211,6 +228,9 @@ class OverlayService : Service() {
         panelRoot?.let { removeWindow(it) }
         arrowView = null
         panelRoot = null
+        // Callers may still hold this instance for a moment; make late API calls no-ops.
+        commentaryView = null
+        currentLines = emptyList()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -355,6 +375,9 @@ class OverlayService : Service() {
             x = uiContext.dpInt(12f)
             y = (lastScreen.y * 0.15f).roundToInt()
         }
+        anchorX = panelParams.x
+        anchorY = panelParams.y
+        usableArea.set(lastScreen.x, lastScreen.y)
 
         renderMultiSuggestion(autoExpand = false)
         windowManager.addView(root, panelParams)
