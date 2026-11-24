@@ -495,11 +495,7 @@ class AnalysisCoordinator(
             return
         }
 
-        if (!processing.compareAndSet(false, true)) {
-            positionStale = true
-            engine?.interruptSearch()
-            return
-        }
+        if (!processing.compareAndSet(false, true)) return
 
         // Check if accessibility data is available (higher accuracy than vision). When it is
         // fresh and complete enough, piece recognition is skipped for this frame; the frame is
@@ -1159,7 +1155,6 @@ class AnalysisCoordinator(
             null
         }
         if (!running.get()) return
-        if (positionStale) return
 
         castlingRights = updatedCastlingRights(castlingRights, move, after)
         val prevBoard = currentFen?.let { parsePlacement(it.substringBefore(' ')) }
@@ -1169,6 +1164,9 @@ class AnalysisCoordinator(
         if (!move.white) fullMoveNumber++
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
         currentFen = newFen
+        // currentAnalyses belongs to the previous position from here on; drop it so nothing
+        // renders or classifies against the wrong position if analysis below fails.
+        currentAnalyses = null
         val newWhiteToMove = !move.white
 
         // It's the opponent's turn (= user just moved) when the side to move next
@@ -1196,7 +1194,6 @@ class AnalysisCoordinator(
         postOverlayThinking()
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
-        if (positionStale) return
 
         previousFen = beforeFen
         previousAnalysis = beforeAnalysis
@@ -1227,6 +1224,7 @@ class AnalysisCoordinator(
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
         currentFen = fen
+        currentAnalyses = null
         if (whiteToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
             previousFen = null
             previousAnalysis = null
@@ -1242,7 +1240,6 @@ class AnalysisCoordinator(
         postOverlayThinking()
         val analyses = analyzeMulti(fen)
         if (!running.get()) return
-        if (positionStale) return
         previousFen = null
         previousAnalysis = null
         currentAnalyses = analyses
@@ -1301,7 +1298,7 @@ class AnalysisCoordinator(
         val classified = lastClassified
 
         if (analyses.isNullOrEmpty()) {
-            postOverlayThinking()
+            postOverlayClear()
             return
         }
 
