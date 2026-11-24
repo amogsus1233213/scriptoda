@@ -84,7 +84,9 @@ object MoveClassifier {
         analysisBefore: AnalysisResult,
         depth: Int = 12,
         isBookMove: Boolean = false,
-        evalBeforeOpponentMove: Int? = null
+        evalBeforeOpponentMove: Int? = null,
+        precomputedEvalAfter: Int? = null,
+        multiPvBefore: List<AnalysisResult>? = null
     ): ClassifiedMove {
         val played = playedMove.trim().lowercase()
         val best = analysisBefore.bestMove.trim().lowercase()
@@ -92,11 +94,15 @@ object MoveClassifier {
         val board = Board.fromFen(fen)
 
         val evalBefore = analysisBefore.eval
-        val afterAnalysis = engine.analyze(fen, depth, listOf(played))
-        val evalAfter = when {
-            afterAnalysis != null -> -afterAnalysis.eval
-            isBest -> evalBefore
-            else -> throw IllegalStateException("Engine failed to analyse position after $played")
+        val evalAfter = if (precomputedEvalAfter != null) {
+            precomputedEvalAfter
+        } else {
+            val afterAnalysis = engine.analyze(fen, depth, listOf(played))
+            when {
+                afterAnalysis != null -> -afterAnalysis.eval
+                isBest -> evalBefore
+                else -> throw IllegalStateException("Engine failed to analyse position after $played")
+            }
         }
 
         val cpLoss = if (isBest) 0 else maxOf(0, clamp(evalBefore) - clamp(evalAfter))
@@ -105,7 +111,7 @@ object MoveClassifier {
             isBookMove -> MoveClass.BOOK
             isBest && isBrilliant(played, board, evalBefore, evalAfter) -> MoveClass.BRILLIANT
             isGreat(cpLoss, evalAfter, evalBeforeOpponentMove) -> MoveClass.GREAT
-            isBest && isOnlyMove(engine, fen, played, depth) -> MoveClass.GREAT
+            isBest && isOnlyMove(engine, fen, played, depth, multiPvBefore) -> MoveClass.GREAT
             isBest -> MoveClass.BEST
             isMiss(cpLoss, evalBefore, evalAfter, board, best) -> MoveClass.MISS
             else -> byCpLoss(cpLoss)
@@ -136,9 +142,19 @@ object MoveClassifier {
     }
 
     /** True if [move] holds the position while every alternative loses. */
-    private fun isOnlyMove(engine: StockfishEngine, fen: String, move: String, depth: Int): Boolean {
-        val lines = engine.analyzeMultiPv(fen, depth, 2) ?: return false
-        if (lines.size < 2) return false // a forced move (single legal reply) is no achievement
+    private fun isOnlyMove(
+        engine: StockfishEngine,
+        fen: String,
+        move: String,
+        depth: Int,
+        multiPvBefore: List<AnalysisResult>?
+    ): Boolean {
+        val lines = if (multiPvBefore != null && multiPvBefore.size >= 2) {
+            multiPvBefore
+        } else {
+            engine.analyzeMultiPv(fen, depth, 2) ?: return false
+        }
+        if (lines.size < 2) return false
         val (bestLine, secondLine) = lines
         if (bestLine.bestMove.trim().lowercase() != move) return false
         return bestLine.eval >= HOLDING_MIN_EVAL && secondLine.eval <= ONLY_MOVE_ALTERNATIVE_MAX

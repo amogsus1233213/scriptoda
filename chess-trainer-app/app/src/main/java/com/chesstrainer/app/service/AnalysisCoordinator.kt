@@ -281,6 +281,7 @@ class AnalysisCoordinator(
     private var lastMove: InferredMove? = null
     private var lastClassified: ClassifiedMove? = null
     private var castlingRights = "KQkq"
+    private var halfMoveClock = 0
     private var fullMoveNumber = 1
 
     /**
@@ -1037,6 +1038,7 @@ class AnalysisCoordinator(
         lastMove = null
         lastClassified = null
         castlingRights = "KQkq"
+        halfMoveClock = 0
         fullMoveNumber = 1
     }
 
@@ -1072,6 +1074,7 @@ class AnalysisCoordinator(
         EngineStats.positionsSeen++
         positionStale = false
         engine?.interruptSearch()
+        val orientationKnown = whiteAtBottom != null || lastKnownOrientation != null
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val prevFen = currentFen
         val after = parsePlacement(placement) ?: return
@@ -1084,6 +1087,10 @@ class AnalysisCoordinator(
         }
 
         if (move == null) {
+            if (placement != START_PLACEMENT && !orientationKnown) {
+                postOverlayClear()
+                return
+            }
             resyncTo(placement, after, if (placement == START_PLACEMENT) true else userIsWhite)
             return
         }
@@ -1118,6 +1125,7 @@ class AnalysisCoordinator(
         if (!running.get()) return
 
         val e = engine
+        val multiPvForClassifier = currentAnalyses?.takeIf { it.size >= 2 }
         val classified = if (e != null && beforeAnalysis != null) {
             try {
                 MoveClassifier.classify(
@@ -1127,8 +1135,8 @@ class AnalysisCoordinator(
                     analysisBefore = beforeAnalysis,
                     depth = depth,
                     isBookMove = false,
-                    // Eval before the opponent's previous move, from the current mover's POV.
                     evalBeforeOpponentMove = olderAnalysis?.let { -it.eval },
+                    multiPvBefore = multiPvForClassifier,
                 )
             } catch (ex: IllegalStateException) {
                 Log.w(TAG, "Could not classify ${move.uci}", ex)
@@ -1140,6 +1148,10 @@ class AnalysisCoordinator(
         if (!running.get()) return
 
         castlingRights = updatedCastlingRights(castlingRights, move, after)
+        val prevBoard = currentFen?.let { parsePlacement(it.substringBefore(' ')) }
+        val movedPiece = prevBoard?.get(move.from)?.lowercaseChar()
+        val wasCapture = (prevBoard != null && prevBoard[move.to] != EMPTY) || move.enPassant
+        halfMoveClock = if (movedPiece == 'p' || wasCapture) 0 else halfMoveClock + 1
         if (!move.white) fullMoveNumber++
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
         val newWhiteToMove = !move.white
@@ -1198,6 +1210,7 @@ class AnalysisCoordinator(
     /** Starts tracking from [placement] without a known previous move. */
     private fun resyncTo(placement: String, board: CharArray, whiteToMove: Boolean) {
         castlingRights = castlingFromPlacement(board)
+        halfMoveClock = 0
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
         if (whiteToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
@@ -1295,7 +1308,11 @@ class AnalysisCoordinator(
             val color: Int
             when {
                 rank == 1 -> {
-                    label = "Best move"
+                    label = if (usersTurn && classified != null) {
+                        classified.classification.displayName
+                    } else {
+                        "Best move"
+                    }
                     color = MoveColors.BEST
                 }
                 else -> {
@@ -1444,7 +1461,7 @@ class AnalysisCoordinator(
     ): String {
         val side = if (whiteToMove) "w" else "b"
         val ep = epSquare?.let { squareName(it) } ?: "-"
-        return "$placement $side ${castling.ifEmpty { "-" }} $ep 0 ${max(1, fullMove)}"
+        return "$placement $side ${castling.ifEmpty { "-" }} $ep $halfMoveClock ${max(1, fullMove)}"
     }
 
     private fun fenFields(fen: String): MutableList<String> {
