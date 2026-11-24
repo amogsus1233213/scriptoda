@@ -140,6 +140,9 @@ class OverlayService : Service() {
         private const val WAITING_TEXT = "Engine is waiting for a move..."
         private const val THINKING_TEXT = "Calculating (~3s)..."
 
+        /** How long the coach's reaction to the user's own move stays in the bubble. */
+        private const val COACH_MESSAGE_MS = 8_000L
+
         /** Currently running service instance, or null if the overlay is not shown. */
         @Volatile
         var instance: OverlayService? = null
@@ -185,6 +188,10 @@ class OverlayService : Service() {
     private val displayFrame = Rect()
     private var currentLines: List<SuggestedLine> = emptyList()
     private var currentFlipped = false
+
+    /** Coach reaction to the user's own move, shown while there are no suggestions. Main thread only. */
+    private var coachMessage: String? = null
+    private val expireCoachMessage = Runnable { dropCoachMessage(restoreWaiting = true) }
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
 
@@ -230,6 +237,7 @@ class OverlayService : Service() {
         panelRoot = null
         // Callers may still hold this instance for a moment; make late API calls no-ops.
         commentaryView = null
+        coachMessage = null
         currentLines = emptyList()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -277,11 +285,36 @@ class OverlayService : Service() {
     fun showThinking() {
         mainHandler.post {
             currentLines = emptyList()
+            dropCoachMessage(restoreWaiting = false)
             arrowView?.setArrows(emptyList())
             val view = commentaryView ?: return@post
             view.text = THINKING_TEXT
             panelRoot?.post { clampAndUpdate() }
         }
+    }
+
+    /**
+     * Shows the coach's reaction to the move the user just played. It stays in the bubble for
+     * [durationMs], or until the next suggestion / "thinking" state replaces it. Ignored while
+     * suggestions are on screen, since those carry their own commentary.
+     */
+    fun showCoachMessage(text: String, durationMs: Long = COACH_MESSAGE_MS) {
+        if (text.isEmpty()) return
+        mainHandler.post {
+            val view = commentaryView ?: return@post
+            if (currentLines.isNotEmpty()) return@post
+            mainHandler.removeCallbacks(expireCoachMessage)
+            coachMessage = text
+            view.text = text
+            if (!expanded && !userCollapsed) setExpanded(true)
+            panelRoot?.post { clampAndUpdate() }
+            mainHandler.postDelayed(expireCoachMessage, durationMs)
+        }
+    }
+
+    /** Removes the coach's reaction, e.g. when the game it belonged to is gone. */
+    fun clearCoachMessage() {
+        mainHandler.post { dropCoachMessage(restoreWaiting = true) }
     }
 
     /** Shows a classification badge on the square the opponent's piece landed on. */
@@ -477,12 +510,14 @@ class OverlayService : Service() {
         val lines = currentLines
         val view = commentaryView ?: return
         if (lines.isEmpty()) {
-            view.text = WAITING_TEXT
+            // A reaction to the user's own move outlives the clearing of the arrows.
+            view.text = coachMessage ?: WAITING_TEXT
             arrowView?.setArrows(emptyList())
             panelRoot?.post { clampAndUpdate() }
             return
         }
         if (autoExpand && !expanded && !userCollapsed) setExpanded(true)
+        dropCoachMessage(restoreWaiting = false)
 
         val commentary = lines.first().commentary
         // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis).
@@ -501,6 +536,22 @@ class OverlayService : Service() {
         panelRoot?.post { clampAndUpdate() }
     }
 
+    /**
+     * Forgets the coach's reaction. With [restoreWaiting] the bubble goes back to the waiting
+     * text if it is still showing the reaction. Main thread only.
+     */
+    private fun dropCoachMessage(restoreWaiting: Boolean) {
+        mainHandler.removeCallbacks(expireCoachMessage)
+        val message = coachMessage ?: return
+        coachMessage = null
+        if (!restoreWaiting) return
+        val view = commentaryView ?: return
+        if (view.text.toString() == message) {
+            view.text = WAITING_TEXT
+            panelRoot?.post { clampAndUpdate() }
+        }
+    }
+
     private fun buildCommentaryView(): TextView {
         val ctx = uiContext
         return TextView(ctx).apply {
@@ -511,7 +562,8 @@ class OverlayService : Service() {
             // Keep the bubble compact: wrap instead of widening it.
             maxWidth = ctx.dpInt(220f)
             // Room for a reaction to the last move plus advice for this one.
-            maxLines = 4
+            // A post-move reaction (what was played, what was better, what it cost) needs more.
+            maxLines = 6
             ellipsize = android.text.TextUtils.TruncateAt.END
             val h = ctx.dpInt(8f)
             val v = ctx.dpInt(6f)

@@ -1082,6 +1082,7 @@ class AnalysisCoordinator(
         lastMove = null
         lastClassified = null
         lastUserClassified = null
+        postClearCoachMessage()
         castlingRights = "KQkq"
         halfMoveClock = 0
         fullMoveNumber = 1
@@ -1223,6 +1224,7 @@ class AnalysisCoordinator(
             lastClassified = null
             lastUserClassified = null
             postClearOpponentBadge()
+            postClearCoachMessage()
             postOverlayClear()
             val (analysedBefore, classified) =
                 classifyMove(beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
@@ -1230,6 +1232,13 @@ class AnalysisCoordinator(
             previousAnalysis = analysedBefore
             lastClassified = classified
             lastUserClassified = classified
+            // Tell the user right away how their move was, and what was better if it was not.
+            // beforeAnalysis is the top line that was on screen (null if nothing was shown), so a
+            // match means the user simply followed the arrow: no surprise, just a brief nod.
+            if (classified != null) {
+                val suggested = beforeAnalysis?.bestMove?.trim()
+                postCoachReaction(classified, beforeFen, suggested.equals(move.uci, ignoreCase = true))
+            }
             return
         }
         // Opponent just moved → user's turn.  The user-facing analysis runs first so the arrows
@@ -1534,6 +1543,33 @@ class AnalysisCoordinator(
 
     private fun postClearOpponentBadge() {
         mainHandler.post { OverlayService.instance?.clearOpponentBadge() }
+    }
+
+    /**
+     * Shows the coach's reaction to the user's own move, played in [beforeFen].
+     * @param wasSuggested the move is the one the coach was showing as its best line
+     */
+    private fun postCoachReaction(classified: ClassifiedMove, beforeFen: String, wasSuggested: Boolean) {
+        val text = try {
+            MoveCommentary.postMoveCommentary(
+                classification = classified.classification,
+                playedMove = classified.move,
+                bestMove = classified.engineBest,
+                cpLoss = classified.cpLoss,
+                evalBefore = classified.evalBefore,
+                evalAfter = classified.evalAfter,
+                fen = beforeFen,
+                wasSuggested = wasSuggested,
+            )
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Post-move commentary failed for ${classified.move}", e)
+            return
+        }
+        mainHandler.post { if (running.get()) OverlayService.instance?.showCoachMessage(text) }
+    }
+
+    private fun postClearCoachMessage() {
+        mainHandler.post { OverlayService.instance?.clearCoachMessage() }
     }
 
     private fun postOverlayThinking() {

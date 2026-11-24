@@ -238,6 +238,181 @@ object MoveCommentary {
     }
 
     // -------------------------------------------------------------------------------------
+    // Post-move reactions (the user just played a move and it has been classified)
+    // -------------------------------------------------------------------------------------
+
+    /** At least this far ahead / behind (centipawns, mover's POV) counts as better / worse. */
+    private const val ADVANTAGE_CP = 150
+    /** Within this margin (centipawns) the game counts as roughly equal. */
+    private const val LEVEL_CP = 75
+    /** Evaluations at or beyond this are forced mates; pawn counts are meaningless there. */
+    private const val MATE_EVAL_CP = StockfishEngine.MATE_SCORE - 1_000
+    /** Above this loss the exact pawn count is no longer quoted. */
+    private const val MAX_QUOTED_LOSS_CP = 1_500
+
+    /**
+     * The coach's reaction to a move the user just played: what it was, why it was good or what
+     * was better, and what it did to the game.
+     *
+     * @param classification how the move was classified
+     * @param playedMove the move the user played, UCI format ("g1f3")
+     * @param bestMove the engine's best move in that position, UCI format; may be empty
+     * @param cpLoss centipawns lost compared with [bestMove]
+     * @param evalBefore centipawns from the user's POV before the move
+     * @param evalAfter centipawns from the user's POV after the move
+     * @param fen position before the move. When given, moves are written in algebraic notation
+     *   ("Nxd4"); otherwise as plain squares ("f3d4").
+     * @param wasSuggested true when [playedMove] is the move the coach was showing as its top
+     *   suggestion. Following the arrow is no surprise, so the coach only nods briefly.
+     * @return one to three short sentences, never empty
+     */
+    fun postMoveCommentary(
+        classification: MoveClass,
+        playedMove: String,
+        bestMove: String,
+        cpLoss: Int,
+        evalBefore: Int,
+        evalAfter: Int,
+        fen: String? = null,
+        wasSuggested: Boolean = false,
+    ): String {
+        if (wasSuggested) return synchronized(this) {
+            var index = random.nextInt(FOLLOWED_SUGGESTION_LINES.size)
+            if (index == lastPicks[FOLLOWED_SUGGESTION_LINES]) {
+                index = (index + 1 + random.nextInt(FOLLOWED_SUGGESTION_LINES.size - 1)) %
+                    FOLLOWED_SUGGESTION_LINES.size
+            }
+            lastPicks[FOLLOWED_SUGGESTION_LINES] = index
+            FOLLOWED_SUGGESTION_LINES[index]
+        }
+        val board = fen?.let { parseBoard(it) }
+        val played = describeMove(playedMove, board)
+        val sameMove = playedMove.trim().equals(bestMove.trim(), ignoreCase = true)
+        // Only name the better move when there is one to name.
+        val best = bestMove.trim().takeIf { it.length >= 4 && !sameMove }?.let { describeMove(it, board) }
+        val hadMate = evalBefore >= MATE_EVAL_CP && evalAfter < MATE_EVAL_CP
+        // Null when a pawn count would be noise: a thrown-away mate or an absurdly large loss.
+        val pawns = cpLoss.takeIf { !hadMate && it in 1..MAX_QUOTED_LOSS_CP }
+            ?.let { String.format(Locale.US, "%.1f", it / 100.0) }
+
+        val reaction = when (classification) {
+            MoveClass.BRILLIANT ->
+                "Incredible! $played is a sacrifice that only works because it's the only " +
+                    "winning move. The engine bows."
+            MoveClass.GREAT -> "Perfect! $played was the only good move here and you found it."
+            MoveClass.BEST -> "That's exactly what the engine recommends. $played — clean play."
+            MoveClass.EXCELLENT -> "$played is almost as good as the best. Tiny difference, don't worry."
+            MoveClass.GOOD -> "$played is a solid move. Nothing wrong with it."
+            MoveClass.BOOK -> "$played — straight out of the opening book."
+
+            MoveClass.INACCURACY -> when {
+                best == null -> "$played was okay, but there was something stronger."
+                pawns == null -> "$played was okay, but $best was stronger."
+                else -> "$played was okay, but $best was stronger. About $pawns pawn difference."
+            }
+            MoveClass.MISTAKE -> {
+                val cost = when {
+                    hadMate -> "$played let a forced mate slip."
+                    pawns == null -> "$played was a mistake."
+                    else -> "$played cost you about $pawns pawns."
+                }
+                if (best == null) cost else "$cost $best was the right call."
+            }
+            MoveClass.BLUNDER -> {
+                val needed = if (best == null) "" else " $best was what you needed."
+                val gone = when {
+                    hadMate -> " You had a forced mate."
+                    pawns == null -> ""
+                    else -> " That's $pawns pawns gone."
+                }
+                "$played threw away the game.$needed$gone"
+            }
+            MoveClass.MISS -> when {
+                best == null -> "You missed a tactic there! That was worth grabbing."
+                hadMate -> "You missed $best! That was a forced mate."
+                else -> "You missed $best! That was a tactic worth grabbing."
+            }
+        }
+
+        val context = positionalContext(classification, evalBefore, evalAfter)
+        return if (context == null) reaction else "$reaction $context"
+    }
+
+    /** Brief, unsurprised nods for when the user plays the move the coach suggested. */
+    private val FOLLOWED_SUGGESTION_LINES = arrayOf(
+        "Good, that's the plan.",
+        "Exactly.",
+        "That's the one.",
+        "Just as we discussed.",
+        "Right on plan.",
+        "Yes. Keep going.",
+    )
+
+    /** What the move did to the game as a whole, or null when there is nothing worth adding. */
+    private fun positionalContext(classification: MoveClass, evalBefore: Int, evalAfter: Int): String? {
+        val wasWinning = evalBefore >= ADVANTAGE_CP
+        val wasLosing = evalBefore <= -ADVANTAGE_CP
+        val wasLevel = abs(evalBefore) <= LEVEL_CP
+        val isWinning = evalAfter >= ADVANTAGE_CP
+        val strongMove = classification == MoveClass.BRILLIANT || classification == MoveClass.GREAT ||
+            classification == MoveClass.BEST
+        return when {
+            wasWinning && isWinning -> "Still in control."
+            wasWinning && evalAfter <= LEVEL_CP -> "You had the advantage and let it slip!"
+            wasLosing && strongMove -> "Fighting spirit! You're not going down easy."
+            wasLevel && isWinning -> "BOOM! You just took over this game."
+            else -> null
+        }
+    }
+
+    /**
+     * Writes a UCI move in algebraic notation ("Nxd4", "exd5", "O-O", "e8=Q+") for [board], the
+     * position before the move. Falls back to the UCI text when the board is unknown or does not
+     * match the move. Disambiguation ignores pins, and mate is marked as a plain check.
+     */
+    private fun describeMove(uci: String, board: CharArray?): String {
+        val move = uci.trim().lowercase(Locale.ROOT)
+        if (board == null) return move
+        val from = squareIndex(move) ?: return move
+        val to = squareIndex(move.drop(2)) ?: return move
+        val piece = board[from]
+        if (piece == EMPTY) return move
+        val white = piece.isUpperCase()
+        val kind = piece.lowercaseChar()
+        val toName = move.substring(2, 4)
+        val castle = kind == 'k' && isCastling(move.substring(0, 2), toName)
+        val promoteTo = move.getOrNull(4)?.takeIf { kind == 'p' && it in "qrbn" }
+        val isCapture = board[to] != EMPTY || (kind == 'p' && from % 8 != to % 8)
+
+        val text = StringBuilder()
+        when {
+            castle -> text.append(if (to % 8 == 6) "O-O" else "O-O-O")
+            kind == 'p' -> {
+                if (isCapture) text.append(move[0]).append('x')
+                text.append(toName)
+                if (promoteTo != null) text.append('=').append(promoteTo.uppercaseChar())
+            }
+            else -> {
+                text.append(kind.uppercaseChar())
+                val rivals = attackers(board, to, white).filter { it != from && board[it] == piece }
+                if (rivals.isNotEmpty()) {
+                    when {
+                        rivals.none { it % 8 == from % 8 } -> text.append(move[0])
+                        rivals.none { it / 8 == from / 8 } -> text.append(move[1])
+                        else -> text.append(move, 0, 2)
+                    }
+                }
+                if (isCapture) text.append('x')
+                text.append(toName)
+            }
+        }
+        val after = applyMove(board, from, to, castle, promoteTo)
+        val check = kingSquare(after, !white)?.let { isAttacked(after, it, white) } ?: false
+        if (check) text.append('+')
+        return text.toString()
+    }
+
+    // -------------------------------------------------------------------------------------
     // Board helpers (squares indexed rank * 8 + file, a1 = 0)
     // -------------------------------------------------------------------------------------
 
