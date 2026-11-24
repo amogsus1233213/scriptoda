@@ -65,9 +65,16 @@ object MoveColors {
     val MISTAKE = Color.parseColor("#E58F2A")
     val BLUNDER = Color.parseColor("#CA3431")
     val NEUTRAL = Color.parseColor("#5D5A55")
+    /** Gold, reserved for a mate in one so it cannot be mistaken for an ordinary best move. */
+    val MATE = Color.parseColor("#FFD700")
 
     /** Maps a classification label (case-insensitive) to its color. */
-    fun forLabel(label: String): Int = when (label.trim().lowercase(Locale.ROOT)) {
+    fun forLabel(label: String): Int = when (val l = label.trim().lowercase(Locale.ROOT)) {
+        "mate in 1", "mate in 1!" -> MATE
+        else -> if (l.startsWith("mate in ")) BEST else forClassLabel(l)
+    }
+
+    private fun forClassLabel(label: String): Int = when (label) {
         "brilliant" -> BRILLIANT
         "best", "best move", "best reply" -> BEST
         "good", "excellent" -> GOOD
@@ -529,7 +536,10 @@ class OverlayService : Service() {
 
         arrowView?.setArrows(
             lines.map {
-                ArrowData(it.from, it.to, it.labelColor, it.rank, it.label, currentFlipped)
+                // Suggestions are the user's own moves and the user sits at the bottom, so the
+                // user is white unless the board is flipped. mateIn is from white's POV.
+                val userMate = it.mateIn?.let { m -> if (currentFlipped) -m else m }?.takeIf { m -> m > 0 }
+                ArrowData(it.from, it.to, it.labelColor, it.rank, it.label, currentFlipped, userMate)
             },
         )
         // Text length may have changed the panel size; keep it on screen.
@@ -745,9 +755,19 @@ class EvalBarView(context: Context) : View(context) {
     private val clipPath = Path()
     private val rect = RectF()
 
+    /** "M2"-style text shown while there is a forced mate, or null. */
+    private var mateText: String? = null
+    private var mateForWhite = false
+    private val mateTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+
     /** @param evalCp centipawns from white's perspective; @param mateIn positive = white mates. */
     fun setEvaluation(evalCp: Int, mateIn: Int?, isFlipped: Boolean) {
         flipped = isFlipped
+        mateText = mateIn?.takeIf { it != 0 }?.let { "M${kotlin.math.abs(it)}" }
+        mateForWhite = mateIn != null && mateIn > 0
         val target = when {
             mateIn != null && mateIn > 0 -> 1f
             mateIn != null && mateIn < 0 -> 0f
@@ -800,7 +820,38 @@ class EvalBarView(context: Context) : View(context) {
             else canvas.drawRect(0f, 0f, whiteW, h, whitePaint)
             canvas.drawLine(w / 2f, 0f, w / 2f, h, midPaint)
         }
+        drawMateText(canvas, w, h)
         canvas.restore()
+    }
+
+    /**
+     * Draws the mate count at the winning side's end of the bar, which is always filled with
+     * that side's color (also mid-animation), in the contrasting color.
+     */
+    private fun drawMateText(canvas: Canvas, w: Float, h: Float) {
+        val text = mateText ?: return
+        val thickness = min(w, h)
+        mateTextPaint.color = if (mateForWhite) blackPaint.color else whitePaint.color
+        mateTextPaint.textSize = thickness * 0.7f
+        // Shrink to fit across a narrow vertical bar.
+        val available = (if (vertical) w else w / 2f) * 0.9f
+        val measured = mateTextPaint.measureText(text)
+        if (measured > available && measured > 0f) mateTextPaint.textSize *= available / measured
+        val fm = mateTextPaint.fontMetrics
+        val inset = max(thickness, mateTextPaint.measureText(text)) * 0.75f
+        // White's end is the bottom / left, or the top / right when flipped; black's the other.
+        // atStart = the winner's end is the top (vertical) or the right (horizontal).
+        val atStart = mateForWhite == flipped
+        val cx: Float
+        val cy: Float
+        if (vertical) {
+            cx = w / 2f
+            cy = if (atStart) inset else h - inset
+        } else {
+            cx = if (atStart) w - inset else inset
+            cy = h / 2f
+        }
+        canvas.drawText(text, cx, cy - (fm.ascent + fm.descent) / 2f, mateTextPaint)
     }
 }
 
@@ -812,6 +863,8 @@ data class ArrowData(
     val rank: Int,
     val label: String,
     val isFlipped: Boolean,
+    /** Moves until the mover delivers mate (> 0), or null when the move is not a forced mate. */
+    val mateIn: Int? = null,
 )
 
 /**
@@ -892,6 +945,14 @@ class ArrowView(
         color = Color.BLACK
     }
     private val layerBounds = RectF()
+
+    private val matePillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val matePillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1B1B1B")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    private val matePillRect = RectF()
 
     /** Classification icons keyed by drawable resource id, loaded lazily on first use. */
     private val drawableCache = HashMap<Int, Drawable?>()
@@ -1024,11 +1085,42 @@ class ArrowView(
         val cx = (end.x + offset).coerceIn(half, max(half, width - half))
         val cy = (end.y - offset).coerceIn(half, max(half, height - half))
 
+        val mate = arrow.mateIn
+        if (mate != null && mate > 0) {
+            drawMatePill(canvas, "M$mate", arrow.color, cx, cy, sizePx.toFloat())
+            return
+        }
+
         val drawable = getCachedDrawable(MoveColors.drawableResForLabel(arrow.label)) ?: return
         val left = (cx - half).roundToInt()
         val top = (cy - half).roundToInt()
         drawable.setBounds(left, top, left + sizePx, top + sizePx)
         drawable.draw(canvas)
+    }
+
+    /**
+     * Draws a "M2"-style pill in place of the classification icon, so a forced mate is readable
+     * on the board itself. Filled with the arrow's own color (gold for a mate in one).
+     */
+    private fun drawMatePill(canvas: Canvas, text: String, color: Int, cx: Float, cy: Float, height: Float) {
+        matePillTextPaint.textSize = height * 0.68f
+        val pillWidth = max(height, matePillTextPaint.measureText(text) + height * 0.6f)
+        val halfW = pillWidth / 2f
+        val halfH = height / 2f
+        // Keep the (wider than the icon) pill inside the view.
+        val x = cx.coerceIn(halfW, max(halfW, width - halfW))
+        matePillRect.set(x - halfW, cy - halfH, x + halfW, cy + halfH)
+
+        matePillPaint.style = Paint.Style.FILL
+        matePillPaint.color = color
+        canvas.drawRoundRect(matePillRect, halfH, halfH, matePillPaint)
+        matePillPaint.style = Paint.Style.STROKE
+        matePillPaint.strokeWidth = 1.5f * density
+        matePillPaint.color = Color.parseColor("#1B1B1B")
+        canvas.drawRoundRect(matePillRect, halfH, halfH, matePillPaint)
+
+        val fm = matePillTextPaint.fontMetrics
+        canvas.drawText(text, x, cy - (fm.ascent + fm.descent) / 2f, matePillTextPaint)
     }
 
     /**
