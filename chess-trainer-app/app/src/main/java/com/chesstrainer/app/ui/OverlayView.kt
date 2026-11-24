@@ -461,6 +461,7 @@ class OverlayService : Service() {
     private fun setExpanded(value: Boolean) {
         if (expanded == value) return
         expanded = value
+        if (value) userCollapsed = false else userCollapsed = true
         pillView.visibility = if (value) View.GONE else View.VISIBLE
         expandedView.visibility = if (value) View.VISIBLE else View.GONE
         updatePanelWindow()
@@ -477,11 +478,11 @@ class OverlayService : Service() {
         val view = commentaryView ?: return
         if (lines.isEmpty()) {
             view.text = WAITING_TEXT
-            arrowView?.clearArrows()
+            arrowView?.setArrows(emptyList())
             panelRoot?.post { clampAndUpdate() }
             return
         }
-        if (autoExpand && !expanded) setExpanded(true)
+        if (autoExpand && !expanded && !userCollapsed) setExpanded(true)
 
         val commentary = lines.first().commentary
         // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis).

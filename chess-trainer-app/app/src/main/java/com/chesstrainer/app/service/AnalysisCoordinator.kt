@@ -1123,10 +1123,12 @@ class AnalysisCoordinator(
         // Only the best line of the previous position is needed for classification.
         var beforeAnalysis: AnalysisResult? = currentAnalyses?.firstOrNull()
         var olderAnalysis = previousAnalysis
+        var multiPvInvalidated = false
         if (sideToMoveIsWhite(beforeFen) != move.white) {
             beforeFen = withSideToMove(beforeFen, move.white)
             beforeAnalysis = null
             olderAnalysis = null
+            multiPvInvalidated = true
         }
         if (move.enPassant && epSquareOf(beforeFen) != move.to) {
             beforeFen = withEnPassant(beforeFen, move.to)
@@ -1136,7 +1138,7 @@ class AnalysisCoordinator(
         if (!running.get()) return
 
         val e = engine
-        val multiPvForClassifier = currentAnalyses?.takeIf { it.size >= 2 }
+        val multiPvForClassifier = if (multiPvInvalidated) null else currentAnalyses?.takeIf { it.size >= 2 }
         val classified = if (e != null && beforeAnalysis != null) {
             try {
                 MoveClassifier.classify(
@@ -1166,6 +1168,7 @@ class AnalysisCoordinator(
         halfMoveClock = if (movedPiece == 'p' || wasCapture) 0 else halfMoveClock + 1
         if (!move.white) fullMoveNumber++
         val newFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
+        currentFen = newFen
         val newWhiteToMove = !move.white
 
         // It's the opponent's turn (= user just moved) when the side to move next
@@ -1178,7 +1181,6 @@ class AnalysisCoordinator(
             // User just moved → opponent's turn now.  Clear overlay and skip analysis.
             previousFen = beforeFen
             previousAnalysis = beforeAnalysis
-            currentFen = newFen
             currentAnalyses = null
             lastKnownGoodFen = newFen
             lastMove = move
@@ -1198,7 +1200,6 @@ class AnalysisCoordinator(
 
         previousFen = beforeFen
         previousAnalysis = beforeAnalysis
-        currentFen = newFen
         currentAnalyses = newAnalyses
         if (!newAnalyses.isNullOrEmpty()) lastKnownGoodFen = newFen
         lastMove = move
@@ -1225,10 +1226,10 @@ class AnalysisCoordinator(
         halfMoveClock = 0
         fullMoveNumber = 1
         val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
+        currentFen = fen
         if (whiteToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
             previousFen = null
             previousAnalysis = null
-            currentFen = fen
             currentAnalyses = null
             lastKnownGoodFen = fen
             lastMove = null
@@ -1244,12 +1245,10 @@ class AnalysisCoordinator(
         if (positionStale) return
         previousFen = null
         previousAnalysis = null
-        currentFen = fen
         currentAnalyses = analyses
         if (!analyses.isNullOrEmpty()) lastKnownGoodFen = fen
         lastMove = null
         lastClassified = null
-        EngineStats.positionsSeen++
         EngineStats.lastFen = fen
         EngineStats.whiteAtBottom = whiteAtBottom
         val best = analyses?.firstOrNull()
@@ -1321,7 +1320,7 @@ class AnalysisCoordinator(
             val color: Int
             when {
                 rank == 1 -> {
-                    label = if (usersTurn && classified != null &&
+                    label = if (classified != null &&
                         classified.classification in NOTABLE_CLASSIFICATIONS
                     ) {
                         classified.classification.displayName
