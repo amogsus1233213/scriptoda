@@ -42,10 +42,11 @@ class StockfishEngine(private val binaryPath: String) {
         /** Base value used to represent mate scores in centipawns. */
         const val MATE_SCORE = 100_000
 
-        private const val ANALYSIS_TIMEOUT_MS = 10_000L
+        private const val ANALYSIS_TIMEOUT_MS = 15_000L
         private const val HANDSHAKE_TIMEOUT_MS = 5_000L
         private const val READY_TIMEOUT_MS = 3_000L
         private const val STOP_DRAIN_TIMEOUT_MS = 1_000L
+        private const val OPTION_TIMEOUT_MS = 1_000L
         private const val QUIT_WAIT_MS = 1_000L
         private const val DESTROY_WAIT_MS = 500L
         private const val POLL_INTERVAL_MS = 100L
@@ -115,6 +116,10 @@ class StockfishEngine(private val binaryPath: String) {
                 shutdownProcess()
                 return false
             }
+
+            send("setoption name Threads value 2")
+            send("setoption name Hash value 64")
+
             if (!send("isready") ||
                 waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
             ) {
@@ -157,7 +162,8 @@ class StockfishEngine(private val binaryPath: String) {
         fen: String,
         depth: Int = 12,
         lineCount: Int = 1,
-        moves: List<String> = emptyList()
+        moves: List<String> = emptyList(),
+        moveTimeMs: Int = 0
     ): List<AnalysisResult>? {
         require(depth > 0) { "depth must be positive" }
         require(lineCount > 0) { "lineCount must be positive" }
@@ -166,8 +172,6 @@ class StockfishEngine(private val binaryPath: String) {
             if (!isReady() && !start()) return null
             val queue = lines
 
-            // Synchronize with the engine so no stale output from an earlier
-            // (possibly interrupted) search leaks into this one.
             queue.clear()
             if (!send("isready") ||
                 waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
@@ -188,7 +192,8 @@ class StockfishEngine(private val binaryPath: String) {
                 append("position fen ").append(fen.trim())
                 if (moves.isNotEmpty()) append(" moves ").append(moves.joinToString(" "))
             }
-            if (!send(position) || !send("go depth $depth")) {
+            val goCommand = if (moveTimeMs > 0) "go movetime $moveTimeMs" else "go depth $depth"
+            if (!send(position) || !send(goCommand)) {
                 markDeadIfNeeded()
                 return null
             }
@@ -210,15 +215,21 @@ class StockfishEngine(private val binaryPath: String) {
 
             if (bestMove == null) {
                 if (process?.isAlive == true) {
-                    // Timed out: interrupt the search and consume its bestmove so the
-                    // engine is idle for the next caller.
                     send("stop")
-                    waitForLine(queue, deadlineAfter(STOP_DRAIN_TIMEOUT_MS)) {
+                    val stopLine = waitForLine(queue, deadlineAfter(STOP_DRAIN_TIMEOUT_MS)) {
                         it.startsWith("bestmove")
                     }
+                    if (stopLine != null) {
+                        bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
+                    }
                 }
-                markDeadIfNeeded()
-                return null
+                if (bestMove == null && infos.isNotEmpty()) {
+                    bestMove = infos[1]?.pv?.firstOrNull() ?: infos.values.firstOrNull()?.pv?.firstOrNull()
+                }
+                if (bestMove == null) {
+                    markDeadIfNeeded()
+                    return null
+                }
             }
 
             return buildResults(bestMove, infos)
@@ -228,6 +239,15 @@ class StockfishEngine(private val binaryPath: String) {
     /** Interrupts the current search; the pending [analyze] call returns promptly. */
     fun stop() {
         if (process?.isAlive == true) send("stop")
+    }
+
+    /**
+     * Sends "stop" without acquiring [analysisLock], so it can be called from another
+     * thread while [analyzeMultiPv] is waiting. The running search will produce a
+     * "bestmove" that [analyzeMultiPv] picks up.
+     */
+    fun interruptSearch() {
+        if (initialized && process?.isAlive == true) send("stop")
     }
 
     /** Asks the engine to exit and releases the process. */

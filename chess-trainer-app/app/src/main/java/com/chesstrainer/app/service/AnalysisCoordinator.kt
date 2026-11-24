@@ -74,10 +74,16 @@ class AnalysisCoordinator(
     companion object {
         private const val TAG = "AnalysisCoordinator"
 
-        const val DEFAULT_DEPTH = 22
+        const val DEFAULT_DEPTH = 18
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 3
+
+        /** Time budget (ms) for the main multi-PV search; 0 means use depth only. */
+        private const val SEARCH_TIME_MS = 5000
+
+        /** Alternative lines worse than this (cp) are not drawn as arrows. */
+        private const val QUALITY_CUTOFF_CP = 150
 
         /**
          * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
@@ -277,6 +283,13 @@ class AnalysisCoordinator(
     private var castlingRights = "KQkq"
     private var fullMoveNumber = 1
 
+    /**
+     * Set when a new position has been detected while the previous analysis is still running.
+     * The analysis loop checks this and returns early so stale results are never displayed.
+     */
+    @Volatile
+    private var positionStale = false
+
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
 
@@ -455,7 +468,7 @@ class AnalysisCoordinator(
         val e = engine ?: return null
         if (!running.get()) return null
         return try {
-            e.analyzeMultiPv(fen, depth, NUM_LINES)
+            e.analyzeMultiPv(fen, depth, NUM_LINES, moveTimeMs = SEARCH_TIME_MS)
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Multi-PV analysis failed for $fen", ex)
             null
@@ -1057,6 +1070,8 @@ class AnalysisCoordinator(
 
     private fun onPositionChanged(placement: String) {
         EngineStats.positionsSeen++
+        positionStale = false
+        engine?.interruptSearch()
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val prevFen = currentFen
         val after = parsePlacement(placement) ?: return
@@ -1155,6 +1170,7 @@ class AnalysisCoordinator(
         postOverlayThinking()
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
+        if (positionStale) return
 
         previousFen = beforeFen
         previousAnalysis = beforeAnalysis
@@ -1195,6 +1211,7 @@ class AnalysisCoordinator(
             postOverlayClear()
             return
         }
+        postOverlayClear()
         postClearOpponentBadge()
         postOverlayThinking()
         val analyses = analyzeMulti(fen)
@@ -1282,14 +1299,13 @@ class AnalysisCoordinator(
                     color = MoveColors.BEST
                 }
                 else -> {
-                    // How much worse than the best line, from the side to move's POV.
                     val cpDiff = bestEval - result.eval
+                    if (cpDiff > QUALITY_CUTOFF_CP) return@mapIndexedNotNull null
                     label = when {
                         cpDiff < 10 -> "Excellent"
                         cpDiff < 50 -> "Good"
                         cpDiff < 100 -> "Inaccuracy"
-                        cpDiff < 200 -> "Mistake"
-                        else -> "Blunder"
+                        else -> "Mistake"
                     }
                     color = MoveColors.forLabel(label)
                 }

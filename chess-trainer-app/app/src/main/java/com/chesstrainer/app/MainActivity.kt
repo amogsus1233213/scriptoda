@@ -473,7 +473,8 @@ class MainActivity : AppCompatActivity() {
         val mate = EngineStats.currentMateIn
         val cp = EngineStats.currentEvalCp
         val evalLabel = when {
-            mate != null -> "Mate in $mate"
+            mate != null && mate > 0 -> "Mate in $mate"
+            mate != null -> "Getting mated in ${-mate}"
             cp != null -> "${if (cp > 0) "+" else ""}$cp cp"
             else -> "—"
         }
