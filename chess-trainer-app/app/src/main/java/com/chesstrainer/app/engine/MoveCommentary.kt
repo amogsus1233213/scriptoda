@@ -169,8 +169,11 @@ object MoveCommentary {
             .takeIf { it.firstOrNull()?.startsWith(suggested) == true }
             ?: listOf(suggested + if (isPromotion) promoteTo.toString() else "")
         val steps = simulate(board, line, moverIsWhite)
+        // Looking ahead is reserved for forced mates (explainMate below). Any other position
+        // gets a remark about the suggested move alone: only its first step is passed on, so
+        // nothing is said about replies or follow-up moves.
         val plan = if (mateIn != null || isPromotion) null else
-            explainPlan(position, steps, loss, canBeRecaptured, isSacrifice, moverEval)
+            explainPlan(position, steps.take(1), loss, canBeRecaptured, isSacrifice, moverEval)
         val tacticalPlan = plan?.takeIf { it.tactical }?.text
 
         // 1. Things that must not be drowned out: forced mates and gifts from the opponent.
