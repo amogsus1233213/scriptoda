@@ -82,7 +82,7 @@ class AnalysisCoordinator(
         private const val NUM_LINES = 3
 
         /** Time budget (ms) for the main multi-PV search; 0 means use depth only. */
-        private const val SEARCH_TIME_MS = 5000
+        private const val SEARCH_TIME_MS = 3000
 
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
@@ -1146,7 +1146,7 @@ class AnalysisCoordinator(
                     fen = beforeFen,
                     playedMove = move.uci,
                     analysisBefore = beforeAnalysis,
-                    depth = depth,
+                    depth = 12,
                     isBookMove = false,
                     evalBeforeOpponentMove = olderAnalysis?.let { -it.eval },
                     multiPvBefore = multiPvForClassifier,

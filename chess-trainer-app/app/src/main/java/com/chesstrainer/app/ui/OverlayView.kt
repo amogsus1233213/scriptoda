@@ -138,7 +138,7 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "chess_overlay"
         private const val NOTIFICATION_ID = 2002
         private const val WAITING_TEXT = "Engine is waiting for a move..."
-        private const val THINKING_TEXT = "Engine is calculating..."
+        private const val THINKING_TEXT = "Calculating (~3s)..."
 
         /** Currently running service instance, or null if the overlay is not shown. */
         @Volatile
