@@ -10,6 +10,7 @@ import android.util.Log
 import com.chesstrainer.app.engine.AnalysisResult
 import com.chesstrainer.app.engine.ClassifiedMove
 import com.chesstrainer.app.engine.MoveClassifier
+import com.chesstrainer.app.engine.MoveClass
 import com.chesstrainer.app.engine.MoveCommentary
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.service.AccessibilityData
@@ -87,6 +88,10 @@ class AnalysisCoordinator(
 
         /** Time budget (ms) for the main search when the user is in time pressure. */
         private const val FAST_MOVETIME_MS = 500
+
+        /** Opponent move classes worth re-rendering the coach's commentary for. */
+        private val COACH_REACTS_TO_OPPONENT =
+            setOf(MoveClass.BLUNDER, MoveClass.MISTAKE, MoveClass.MISS, MoveClass.BRILLIANT)
 
         /** Time budget (ms) for analysing the previous position when classifying a played move. */
         private const val CLASSIFY_TIME_MS = 500
@@ -289,6 +294,8 @@ class AnalysisCoordinator(
 
     private var lastMove: InferredMove? = null
     private var lastClassified: ClassifiedMove? = null
+    /** Classification of the user's own most recent move, for the coach's reaction to it. */
+    private var lastUserClassified: ClassifiedMove? = null
     private var castlingRights = "KQkq"
     private var halfMoveClock = 0
     private var fullMoveNumber = 1
@@ -1074,6 +1081,7 @@ class AnalysisCoordinator(
         lastKnownGoodFen = null
         lastMove = null
         lastClassified = null
+        lastUserClassified = null
         castlingRights = "KQkq"
         halfMoveClock = 0
         fullMoveNumber = 1
@@ -1213,6 +1221,7 @@ class AnalysisCoordinator(
             lastKnownGoodFen = newFen
             lastMove = move
             lastClassified = null
+            lastUserClassified = null
             postClearOpponentBadge()
             postOverlayClear()
             val (analysedBefore, classified) =
@@ -1220,6 +1229,7 @@ class AnalysisCoordinator(
             if (!running.get()) return
             previousAnalysis = analysedBefore
             lastClassified = classified
+            lastUserClassified = classified
             return
         }
         // Opponent just moved → user's turn.  The user-facing analysis runs first so the arrows
@@ -1266,6 +1276,14 @@ class AnalysisCoordinator(
         lastClassified = classified
         if (opponentJustMoved && classified != null) {
             postOpponentBadge(move.uci.substring(2, 4), classified.classification.displayName, !userIsWhite)
+            // The coach's line was written before the opponent's move was classified. When that
+            // move turns out to be remarkable, render again so the coach can react to it.
+            if (classified.classification in COACH_REACTS_TO_OPPONENT) {
+                val stillLive = freshAccessibilityPositions()?.let {
+                    BoardPositionParser.positionsToFen(it).substringBefore(' ')
+                }
+                if (stillLive == null || stillLive == placement) render()
+            }
         }
     }
 
@@ -1316,6 +1334,7 @@ class AnalysisCoordinator(
         castlingRights = castlingFromPlacement(board)
         halfMoveClock = 0
         fullMoveNumber = 1
+        lastUserClassified = null
         val fen = composeFen(placement, sideToMove, castlingRights, null, fullMoveNumber)
         currentFen = fen
         currentAnalyses = null
@@ -1452,6 +1471,10 @@ class AnalysisCoordinator(
         }
 
         val best = suggestions[0]
+        // lastMove / lastClassified describe the opponent's move here (it is the user's turn).
+        val opponentClass = lastClassified?.classification
+            ?.takeIf { lastMove?.let { m -> m.white != userIsWhite } == true }
+        val seconds = AccessibilityData.userTimeSeconds
         val commentary = try {
             MoveCommentary.generate(
                 fromSquare = best.from,
@@ -1465,6 +1488,9 @@ class AnalysisCoordinator(
                 rank = 1,
                 promotion = analyses.firstOrNull { it.bestMove.startsWith(best.from + best.to) }
                     ?.bestMove?.getOrNull(4),
+                userLastMove = lastUserClassified?.classification,
+                opponentLastMove = opponentClass,
+                timePressure = seconds != null && seconds <= TIME_PRESSURE_THRESHOLD_SECONDS,
             )
         } catch (e: RuntimeException) {
             Log.w(TAG, "Commentary failed for $fen", e)

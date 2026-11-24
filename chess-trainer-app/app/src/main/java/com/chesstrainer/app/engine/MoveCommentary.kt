@@ -1,16 +1,54 @@
 package com.chesstrainer.app.engine
 
+import java.util.IdentityHashMap
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.random.Random
 
 /**
- * Short, sassy one-liners for the overlay's best move, in the voice of Mittens —
- * a condescending, dry-witted cat who's better than you at chess and knows it.
+ * Short one-liners for the overlay's best move, in the voice of Mittens — a coach with
+ * personality: fun, encouraging, honest about bad moves, and a little too sure of itself.
  *
- * The line is picked deterministically from the position, so re-rendering the same position
- * never makes the commentary flicker between lines.
+ * What is said depends on the game: forced mates, the opponent's last move, the user's own last
+ * move (its [MoveClass]), tactical motifs of the suggested move, the clock and the evaluation.
+ *
+ * Lines are picked at random from their category and never twice in a row from the same
+ * category. The picks are remembered for the current position, so re-rendering it (e.g. after a
+ * deeper analysis) never makes the commentary flicker between lines.
  */
 object MoveCommentary {
+
+    /** Feedback on the last move is only joined with advice when both fit the bubble. */
+    private const val MAX_COMBINED_LENGTH = 100
+
+    /** At least this far ahead / behind (centipawns) counts as winning / losing. */
+    private const val DECISIVE_EVAL_CP = 300
+    private const val EQUAL_EVAL_CP = 30
+
+    /** Source of randomness; replaceable in tests. */
+    internal var random: Random = Random.Default
+
+    /** Position the picks in [positionPicks] belong to. */
+    private var pickedPosition: String? = null
+    /** Line index chosen per category for [pickedPosition]. Categories are compared by identity. */
+    private val positionPicks = IdentityHashMap<Array<String>, Int>()
+    /** Last line index used per category, to avoid saying the same thing twice in a row. */
+    private val lastPicks = IdentityHashMap<Array<String>, Int>()
+
+    private fun pickIndex(position: String, lines: Array<String>): Int {
+        if (position != pickedPosition) {
+            pickedPosition = position
+            positionPicks.clear()
+        }
+        positionPicks[lines]?.let { return it }
+        var index = random.nextInt(lines.size)
+        if (lines.size > 1 && index == lastPicks[lines]) {
+            index = (index + 1 + random.nextInt(lines.size - 1)) % lines.size
+        }
+        positionPicks[lines] = index
+        lastPicks[lines] = index
+        return index
+    }
 
     /**
      * Generates a short commentary (1-2 lines) for the best engine move.
@@ -28,6 +66,11 @@ object MoveCommentary {
      * @param promotion piece the pawn promotes to ('q', 'r', 'b' or 'n'), i.e. the fifth
      *   character of a UCI move such as "e7e8n". Also read from [toSquare] when that carries the
      *   suffix ("e8n"). Defaults to a queen.
+     * @param userLastMove classification of the user's own previous move, when known. On the
+     *   user's turn the coach reacts to it before giving advice.
+     * @param opponentLastMove classification of the move the opponent just played, when known.
+     *   Takes precedence over [label] on the user's turn.
+     * @param timePressure true when the user is short on time; the coach then keeps it brief.
      * @return the commentary, or "" when there is nothing to say (e.g. [rank] != 1)
      */
     fun generate(
@@ -40,13 +83,16 @@ object MoveCommentary {
         isUsersTurn: Boolean,
         rank: Int = 1,
         promotion: Char? = null,
-    ): String {
-        if (rank != 1) return ""
-        val board = parseBoard(fen) ?: return ""
-        val from = squareIndex(fromSquare) ?: return ""
-        val to = squareIndex(toSquare) ?: return ""
+        userLastMove: MoveClass? = null,
+        opponentLastMove: MoveClass? = null,
+        timePressure: Boolean = false,
+    ): String = synchronized(this) {
+        if (rank != 1) return@synchronized ""
+        val board = parseBoard(fen) ?: return@synchronized ""
+        val from = squareIndex(fromSquare) ?: return@synchronized ""
+        val to = squareIndex(toSquare) ?: return@synchronized ""
         val piece = board[from]
-        if (piece == EMPTY) return ""
+        if (piece == EMPTY) return@synchronized ""
 
         val moverIsWhite = piece.isUpperCase()
         val kind = piece.lowercaseChar()
@@ -81,70 +127,114 @@ object MoveCommentary {
 
         val pieceName = pieceName(piece)
         val capturedName = captured?.let { pieceName(it) } ?: "piece"
-        val seed = fen.hashCode() * 31 + fromSquare.hashCode() * 7 + toSquare.hashCode()
+        val position = "$fen|$fromSquare|$toSquare"
 
         fun pick(lines: Array<String>, vararg args: Any): String {
-            val line = lines[abs(seed % lines.size)]
+            val line = lines[pickIndex(position, lines)]
             val text = if (args.isEmpty()) line else String.format(Locale.US, line, *args)
             return text.replaceFirstChar { it.titlecase(Locale.ROOT) }
         }
 
-        return if (isUsersTurn) {
-            when {
-                mateIn != null && mateIn == 1 -> pick(MATE_IN_ONE_LINES)
-                mateIn != null && mateIn in 2..3 -> pick(MATE_SOON_LINES, mateIn)
-                mateIn != null && mateIn > 0 -> pick(MATE_LINES, mateIn)
-                mateIn != null && mateIn < 0 -> pick(GETTING_MATED_LINES)
-
-                // The opponent just slipped: label describes their move.
-                lastLabel == "blunder" -> pick(OPPONENT_BLUNDER_LINES)
-                lastLabel == "mistake" || lastLabel == "miss" -> pick(OPPONENT_MISTAKE_LINES)
-                lastLabel == "brilliant" -> pick(OPPONENT_BRILLIANT_LINES)
-
-                isSacrifice && isCapture ->
-                    pick(SACRIFICE_CAPTURE_LINES, pieceName.uppercase(Locale.ROOT), capturedName)
-                isSacrifice -> pick(SACRIFICE_LINES, pieceName.uppercase(Locale.ROOT))
-                isPromotion && promoteTo != 'q' -> pick(UNDERPROMOTION_LINES, pieceName(promoteTo))
-                isPromotion -> pick(PROMOTION_LINES)
-                isHanging && isHighValue(captured) -> pick(BIG_CAPTURE_LINES, capturedName)
-                isHanging -> pick(FREE_PIECE_LINES, capturedName)
-                winsMaterial -> pick(WINNING_CAPTURE_LINES, pieceName, capturedName)
-                givesCheck -> pick(CHECK_LINES, pieceName)
-                isCapture -> pick(CAPTURE_LINES, pieceName, capturedName)
-                isCastle -> pick(CASTLE_LINES)
-
-                lastLabel == "inaccuracy" -> pick(OPPONENT_INACCURACY_LINES)
-
-                moverEval != null && moverEval > 500 -> pick(WINNING_BIG_LINES)
-                moverEval != null && moverEval < -500 -> pick(LOSING_BIG_LINES)
-                moverEval != null && moverEval in -30..30 -> pick(EQUAL_LINES)
-
-                lastLabel == "best" || lastLabel == "great" || lastLabel == "best move" ->
-                    pick(BEST_MOVE_LINES, pieceName)
-                else -> pick(DEFAULT_LINES, pieceName)
-            }
-        } else {
+        if (!isUsersTurn) {
             // The suggestion is the opponent's best reply; the label describes the user's move.
-            when {
+            val userClass = userLastMove ?: classOf(lastLabel)
+            return@synchronized when {
                 mateIn != null && mateIn > 0 -> pick(THREAT_MATE_LINES)
                 mateIn != null && mateIn < 0 -> pick(USER_MATES_LINES, abs(mateIn))
 
-                lastLabel == "brilliant" -> pick(BRILLIANT_LINES)
-                lastLabel == "great" -> pick(GREAT_LINES)
-                lastLabel == "blunder" -> pick(BLUNDER_LINES)
-                lastLabel == "mistake" || lastLabel == "miss" -> pick(MISTAKE_LINES)
-                lastLabel == "inaccuracy" -> pick(INACCURACY_LINES)
+                userClass != null && userClass.isNotable() -> pick(feedbackLines(userClass))
 
                 capturedIsLost && isHighValue(captured) -> pick(THREAT_BIG_CAPTURE_LINES, capturedName)
                 givesCheck -> pick(THREAT_CHECK_LINES, pieceName)
                 isCapture && !capturedIsLost -> pick(THREAT_TRADE_LINES, capturedName)
                 isCapture -> pick(THREAT_CAPTURE_LINES, capturedName)
 
-                lastLabel == "best" || lastLabel == "excellent" || lastLabel == "good" ||
-                    lastLabel == "book" -> pick(SOLID_LINES)
+                userClass != null -> pick(feedbackLines(userClass))
                 else -> pick(OPPONENT_REPLY_LINES, pieceName)
             }
         }
+
+        val opponentClass = opponentLastMove ?: classOf(lastLabel)
+
+        // 1. Things that must not be drowned out: forced mates and gifts from the opponent.
+        val critical: String? = when {
+            mateIn != null && mateIn == 1 -> pick(MATE_IN_ONE_LINES)
+            mateIn != null && mateIn in 2..3 -> pick(MATE_SOON_LINES, mateIn)
+            mateIn != null && mateIn > 0 -> pick(MATE_LINES, mateIn)
+            mateIn != null && mateIn < 0 -> pick(GETTING_MATED_LINES)
+
+            opponentClass == MoveClass.BLUNDER -> pick(OPPONENT_BLUNDER_LINES)
+            opponentClass == MoveClass.MISTAKE || opponentClass == MoveClass.MISS ->
+                pick(OPPONENT_MISTAKE_LINES)
+            opponentClass == MoveClass.BRILLIANT -> pick(OPPONENT_BRILLIANT_LINES)
+            else -> null
+        }
+        if (critical != null) return@synchronized critical
+
+        // 2. Tactical motifs of the suggested move itself.
+        val motif: String? = when {
+            isSacrifice && isCapture ->
+                pick(SACRIFICE_CAPTURE_LINES, pieceName.uppercase(Locale.ROOT), capturedName)
+            isSacrifice -> pick(SACRIFICE_LINES, pieceName.uppercase(Locale.ROOT))
+            isPromotion && promoteTo != 'q' -> pick(UNDERPROMOTION_LINES, pieceName(promoteTo))
+            isPromotion -> pick(PROMOTION_LINES)
+            isHanging && isHighValue(captured) -> pick(BIG_CAPTURE_LINES, capturedName)
+            isHanging -> pick(FREE_PIECE_LINES, capturedName)
+            winsMaterial -> pick(WINNING_CAPTURE_LINES, pieceName, capturedName)
+            else -> null
+        }
+
+        // 3. No time to read: the motif if there is one, otherwise a nudge to just move.
+        if (timePressure) return@synchronized motif ?: pick(TIME_PRESSURE_LINES)
+
+        // 4. Advice for this move, preceded by a reaction to the user's previous one.
+        val advice = motif ?: when {
+            givesCheck -> pick(CHECK_LINES, pieceName)
+            isCapture -> pick(CAPTURE_LINES, pieceName, capturedName)
+            isCastle -> pick(CASTLE_LINES)
+
+            opponentClass == MoveClass.INACCURACY -> pick(OPPONENT_INACCURACY_LINES)
+
+            moverEval != null && moverEval > DECISIVE_EVAL_CP -> pick(WINNING_BIG_LINES)
+            moverEval != null && moverEval < -DECISIVE_EVAL_CP -> pick(LOSING_BIG_LINES)
+            moverEval != null && moverEval in -EQUAL_EVAL_CP..EQUAL_EVAL_CP -> pick(EQUAL_LINES)
+
+            opponentClass == MoveClass.BEST || opponentClass == MoveClass.GREAT ||
+                lastLabel == "best move" -> pick(BEST_MOVE_LINES, pieceName)
+            else -> pick(DEFAULT_LINES, pieceName)
+        }
+        val feedback = userLastMove?.let { pick(feedbackLines(it)) }
+        when {
+            feedback == null -> advice
+            feedback.length + 1 + advice.length <= MAX_COMBINED_LENGTH -> "$feedback $advice"
+            // Both do not fit: a remarkable last move is worth more than routine advice.
+            userLastMove.isNotable() || motif == null -> feedback
+            else -> advice
+        }
+    }
+
+    private fun classOf(label: String): MoveClass? =
+        MoveClass.values().firstOrNull { it.displayName.lowercase(Locale.ROOT) == label }
+
+    /** Classes the coach always reacts to, as opposed to routine good moves. */
+    private fun MoveClass.isNotable(): Boolean = when (this) {
+        MoveClass.BRILLIANT, MoveClass.GREAT, MoveClass.INACCURACY, MoveClass.MISTAKE,
+        MoveClass.MISS, MoveClass.BLUNDER -> true
+        MoveClass.BEST, MoveClass.EXCELLENT, MoveClass.GOOD, MoveClass.BOOK -> false
+    }
+
+    /** Reactions to a move the user played, by its classification. */
+    private fun feedbackLines(moveClass: MoveClass): Array<String> = when (moveClass) {
+        MoveClass.BRILLIANT -> BRILLIANT_LINES
+        MoveClass.GREAT -> GREAT_LINES
+        MoveClass.BEST -> BEST_LINES
+        MoveClass.EXCELLENT -> EXCELLENT_LINES
+        MoveClass.GOOD -> GOOD_LINES
+        MoveClass.BOOK -> BOOK_LINES
+        MoveClass.INACCURACY -> INACCURACY_LINES
+        MoveClass.MISTAKE -> MISTAKE_LINES
+        MoveClass.MISS -> MISS_LINES
+        MoveClass.BLUNDER -> BLUNDER_LINES
     }
 
     // -------------------------------------------------------------------------------------
@@ -311,6 +401,9 @@ object MoveCommentary {
         "Mate in 1, darling. Don't overthink it.",
         "One move ends the game. This one.",
         "There's a mate in 1. Please tell me you see it.",
+        "MATE IN 1! Don't miss it!",
+        "Finish them! One move.",
+        "Checkmate is on the board. Deliver it.",
     )
 
     private val MATE_SOON_LINES = arrayOf(
@@ -319,6 +412,9 @@ object MoveCommentary {
         "%d moves to checkmate. Stay focused for once.",
         "Mate in %d. I'd resign if I were them.",
         "Mate in %d. Try not to trip at the finish line.",
+        "MATE IN %d! Don't miss it!",
+        "Finish them! Mate in %d.",
+        "Mate in %d. Checks first, questions later.",
     )
 
     private val MATE_LINES = arrayOf(
@@ -326,6 +422,9 @@ object MoveCommentary {
         "Forced mate in %d. The board has spoken.",
         "There's a mate in %d here. You see it, right?",
         "Mate in %d. I believe in you. Mostly.",
+        "MATE IN %d! Don't miss it!",
+        "Finish them! It's mate in %d.",
+        "Mate in %d. Follow the line and it's over.",
     )
 
     private val GETTING_MATED_LINES = arrayOf(
@@ -342,6 +441,11 @@ object MoveCommentary {
         "They just handed you the game. Don't waste it.",
         "A blunder. Even I'm embarrassed for them.",
         "They blundered. Take the gift and say nothing.",
+        "They gave you a gift. Take it!",
+        "FREE STUFF! Grab it!",
+        "Christmas came early. Unwrap it.",
+        "They cracked. Now make it hurt.",
+        "That was a howler. Punish it, no mercy.",
     )
 
     private val OPPONENT_MISTAKE_LINES = arrayOf(
@@ -349,6 +453,10 @@ object MoveCommentary {
         "A mistake. Capitalize before they realize.",
         "Not their finest moment. Press the advantage.",
         "Sloppy by them. Make it count.",
+        "They left the door open. Walk in.",
+        "That was a slip. Your move to cash in.",
+        "They gave you an opening. Use it.",
+        "Mistake by them. This is your moment.",
     )
 
     private val OPPONENT_INACCURACY_LINES = arrayOf(
@@ -356,6 +464,9 @@ object MoveCommentary {
         "Slightly inaccurate by them. You know what to do.",
         "Not optimal. Keep the pressure on.",
         "They blinked first. Good.",
+        "They got a little loose. Tighten the screws.",
+        "Slightly off by them. Nudge the edge your way.",
+        "A soft move from them. Take the initiative.",
     )
 
     private val OPPONENT_BRILLIANT_LINES = arrayOf(
@@ -363,6 +474,9 @@ object MoveCommentary {
         "That was actually brilliant. Annoying, but brilliant.",
         "They found something sharp. Stay composed.",
         "A strong move. Don't panic, just think.",
+        "Okay, that was a great move by them. Respect.",
+        "They found a stunner. Keep calm and defend.",
+        "Credit where it's due. Now dig in.",
     )
 
     private val SACRIFICE_LINES = arrayOf(
@@ -370,6 +484,12 @@ object MoveCommentary {
         "The %s goes. It looks insane but it's winning.",
         "Sac the %s. Tal sends his regards.",
         "%s sacrifice. The kind of move I'd play.",
+        "Throw the %s into the fire. It works!",
+        "Give them the %s. It's a trap, and a good one.",
+        "The %s is a gift they'll regret accepting.",
+        "Material is temporary. Sac the %s!",
+        "Offer the %s. Fortune favors the brave.",
+        "Let the %s go. The attack is worth more.",
     )
 
     // Args are (mover, captured).
@@ -381,6 +501,8 @@ object MoveCommentary {
         "The %s is unguarded. Help yourself.",
         "Hanging %s. How embarrassing for them.",
         "Take the %s. I won't judge the lack of creativity.",
+        "FREE STUFF! Their %s is yours.",
+        "The %s is a gift. Unwrap it.",
     )
 
     private val FREE_PIECE_LINES = arrayOf(
@@ -388,6 +510,10 @@ object MoveCommentary {
         "The %s is undefended. Easy pickings.",
         "Nobody's watching the %s. Collect it.",
         "A free %s. Even a kitten could find this.",
+        "Loose pieces drop off. Take the %s.",
+        "That %s is on the house.",
+        "They left the %s hanging. Say thank you.",
+        "Free %s! Don't ask questions.",
     )
 
     // Args are (mover, captured).
@@ -403,6 +529,8 @@ object MoveCommentary {
         "%s check. Make the king dance.",
         "Put the king in check with the %s.",
         "The %s delivers check. Elegant.",
+        "Check! Send in the %s.",
+        "%s check. Always look at checks first.",
     )
 
     private val CAPTURE_LINES = arrayOf(
@@ -419,6 +547,8 @@ object MoveCommentary {
         "Castle and breathe. The king is safe.",
         "Get the king behind the pawns. Sensible.",
         "Castle. Even I do it sometimes.",
+        "Castle now. The attack can wait a move.",
+        "King to safety, rook to the party.",
     )
 
     private val PROMOTION_LINES = arrayOf(
@@ -426,6 +556,8 @@ object MoveCommentary {
         "That pawn has earned its crown.",
         "Promote. The pawn's glow-up is complete.",
         "Queening time. The board won't know what hit it.",
+        "Push it home. Every pawn dreams of this.",
+        "New queen incoming. Enjoy it.",
     )
 
     private val UNDERPROMOTION_LINES = arrayOf(
@@ -441,6 +573,11 @@ object MoveCommentary {
         "Way ahead. The hard part is not throwing it.",
         "Winning position. I'd say relax, but... don't.",
         "Ahead by a mile. Simplify and convert.",
+        "You're crushing it. Don't get lazy now.",
+        "This is won if you don't blunder.",
+        "Winning. Trade pieces, not pawns.",
+        "Completely winning. Check for their tricks, then cash in.",
+        "The hard part is done. Keep it simple.",
     )
 
     private val LOSING_BIG_LINES = arrayOf(
@@ -449,6 +586,11 @@ object MoveCommentary {
         "Difficult. Play the best defense you can.",
         "Rough spot. Make them work for every point.",
         "Behind. Set traps and hope they're careless.",
+        "Tough spot. Set some traps.",
+        "Play for complications, make them work for it.",
+        "Nobody ever won by resigning. Keep fighting.",
+        "Losing, yes. Lost, not yet. Stay tricky.",
+        "Keep pieces on and keep it messy.",
     )
 
     private val EQUAL_LINES = arrayOf(
@@ -457,6 +599,10 @@ object MoveCommentary {
         "Balanced. Every move shifts the needle.",
         "Even game. Stay patient, stay sharp.",
         "Perfectly equal. Outplay them move by move.",
+        "Dead equal. This is a battle of wits now.",
+        "Even game. One mistake decides it.",
+        "All square. Improve your worst piece.",
+        "Nothing in it. Patience wins these.",
     )
 
     private val BEST_MOVE_LINES = arrayOf(
@@ -465,6 +611,8 @@ object MoveCommentary {
         "Best continuation with the %s.",
         "The %s is the answer here.",
         "Move the %s. Trust the process.",
+        "Go with the %s. No second-guessing.",
+        "The %s move keeps everything under control.",
     )
 
     private val DEFAULT_LINES = arrayOf(
@@ -472,11 +620,17 @@ object MoveCommentary {
         "The %s move. Nothing flashy, just correct.",
         "The %s is your best friend right now.",
         "Move the %s. I wouldn't steer you wrong.",
+        "Bring the %s into the game.",
+        "The %s wants to move. Let it.",
+        "Improve the %s. Small moves add up.",
+        "Quiet %s move. Good positions are built like this.",
     )
 
     // -------------------------------------------------------------------------------------
     // Lines: opponent's turn (the label describes the user's last move)
     // -------------------------------------------------------------------------------------
+
+    // Reactions to the user's own move, by classification (see feedbackLines).
 
     private val BRILLIANT_LINES = arrayOf(
         "Brilliant. I'm genuinely impressed. Don't let it go to your head.",
@@ -484,6 +638,13 @@ object MoveCommentary {
         "A brilliant move. Perhaps I underestimated you.",
         "Brilliant. That's the kind of move I'd play.",
         "Well, well. Brilliant find. Color me surprised.",
+        "THAT'S the move! Nobody sees that coming.",
+        "You just made the engine sweat. Beautiful.",
+        "Chess poetry. Frame this game.",
+        "Sacrifice with STYLE. That's how legends play.",
+        "I didn't even see that. And I'm the coach.",
+        "Brilliant!! Tal would be proud.",
+        "Did you just do that? You did. Wow.",
     )
 
     private val GREAT_LINES = arrayOf(
@@ -491,6 +652,86 @@ object MoveCommentary {
         "Sharp move. That swung things your way.",
         "Great move. I'll allow a small celebration.",
         "You found it. Nicely done, honestly.",
+        "Only move, and you found it. That's pattern recognition.",
+        "Under pressure, you chose perfectly.",
+        "That's the kind of move that wins tournaments.",
+        "Textbook. Absolutely textbook.",
+        "Great find! That was the critical moment.",
+        "Everything else was worse. You nailed it.",
+    )
+
+    private val BEST_LINES = arrayOf(
+        "Engine approved. Keep it up.",
+        "Top choice. You're in the zone.",
+        "That's exactly what Stockfish wanted.",
+        "Clean. No debate.",
+        "Best move. I'd have played the same.",
+        "Spot on. Nothing to add.",
+        "Best move on the board. Again, please.",
+        "You and the engine agree. Good company.",
+    )
+
+    private val EXCELLENT_LINES = arrayOf(
+        "Practically perfect. I'm not complaining.",
+        "Tiny difference from the best. Still strong.",
+        "That works just fine. Trust it.",
+        "Excellent. The engine barely blinked.",
+        "Near perfect. I'll take that every time.",
+        "Excellent choice. Clean and simple.",
+        "As good as best, give or take a hair.",
+    )
+
+    private val GOOD_LINES = arrayOf(
+        "Solid move. Not flashy, but it works.",
+        "Good enough to hold the position.",
+        "Reasonable. The position is still yours.",
+        "Good move. See? You can play chess when you try.",
+        "Decent. No harm done.",
+        "Sensible chess. Keep building.",
+        "Fine move. Good chess is mostly this.",
+    )
+
+    private val BOOK_LINES = arrayOf(
+        "Theory. You know your openings.",
+        "By the book. Literally.",
+        "Opening prep paying off.",
+        "Still in theory. Somebody did their homework.",
+        "Book move. The masters agree with you.",
+        "Straight out of the opening manual.",
+    )
+
+    private val INACCURACY_LINES = arrayOf(
+        "Slight inaccuracy. You can do better. I know because I can.",
+        "Not your best work. The position forgives you, this time.",
+        "A small slip. Nothing fatal, but I noticed.",
+        "Playable, but there was something cleaner.",
+        "Hmm, there was something better there.",
+        "Small slip. The position still holds, but tighten up.",
+        "Not the worst, but let's find the sharper moves.",
+        "You're leaving something on the table.",
+        "Close, but not quite. Slow down a touch.",
+    )
+
+    private val MISTAKE_LINES = arrayOf(
+        "A mistake. Not the end of the world, but close.",
+        "There was something better. Shake it off.",
+        "That wasn't optimal. Tighten up from here.",
+        "A slip. The position is still playable, barely.",
+        "That's gonna cost you. Let's recover.",
+        "Ouch. The advantage just slipped.",
+        "Your opponent is smiling right now.",
+        "We need to talk about that one...",
+        "Mistake. Check what they threaten before you move.",
+    )
+
+    private val MISS_LINES = arrayOf(
+        "There was a tactic there! Did you see it?",
+        "You had a shot and missed it. It happens.",
+        "The position was screaming for a tactic.",
+        "Missed chance. Checks, captures, threats. Every move.",
+        "That was your moment. Stay alert for the next one.",
+        "A win walked right past you. Keep looking.",
+        "You let them off the hook. Reel them back in.",
     )
 
     private val BLUNDER_LINES = arrayOf(
@@ -499,28 +740,23 @@ object MoveCommentary {
         "That was painful to watch. Damage control time.",
         "You blundered. Take a breath and find the best defense.",
         "I'd look away but I'm literally your coach.",
+        "Oh no. OH NO.",
+        "That... changed everything. Stay focused.",
+        "The engine just had a heart attack.",
+        "We don't talk about that move.",
+        "Deep breath. We're still playing.",
+        "Blunder. Even world champions hang pieces. Reset.",
     )
 
-    private val MISTAKE_LINES = arrayOf(
-        "A mistake. Not the end of the world, but close.",
-        "There was something better. Shake it off.",
-        "That wasn't optimal. Watch their reply carefully.",
-        "A slip. The position is still playable, barely.",
-    )
-
-    private val INACCURACY_LINES = arrayOf(
-        "Slight inaccuracy. You can do better. I know because I can.",
-        "Not your best work. The position forgives you, this time.",
-        "A small slip. Nothing fatal, but I noticed.",
-        "Playable, but there was something cleaner.",
-    )
-
-    private val SOLID_LINES = arrayOf(
-        "Solid. Nothing flashy, but correct. I approve.",
-        "Good move. See? You can play chess when you try.",
-        "Clean and simple. Well played.",
-        "Textbook. I'd have played the same.",
-        "Perfectly reasonable. Now let's see their response.",
+    private val TIME_PRESSURE_LINES = arrayOf(
+        "Clock's ticking! Trust your instincts.",
+        "Speed mode. Go with your gut!",
+        "No time to calculate, just play!",
+        "Seconds left. Safe moves, fast hands.",
+        "Tick tock. Play the arrow and hit the clock.",
+        "Low on time! Don't hang anything, just move.",
+        "Blitz brain on. Move now, think later.",
+        "Time trouble! Keep it simple.",
     )
 
     private val THREAT_MATE_LINES = arrayOf(
@@ -535,6 +771,8 @@ object MoveCommentary {
         "Mate in %d for you. Play carefully and it's over.",
         "Forced mate in %d. I'd purr if I could.",
         "They're done. Mate in %d if you don't panic.",
+        "MATE IN %d! Don't miss it!",
+        "Finish them! Mate in %d.",
     )
 
     private val THREAT_BIG_CAPTURE_LINES = arrayOf(

@@ -510,7 +510,8 @@ class OverlayService : Service() {
             typeface = Typeface.defaultFromStyle(Typeface.ITALIC)
             // Keep the bubble compact: wrap instead of widening it.
             maxWidth = ctx.dpInt(220f)
-            maxLines = 3
+            // Room for a reaction to the last move plus advice for this one.
+            maxLines = 4
             ellipsize = android.text.TextUtils.TruncateAt.END
             val h = ctx.dpInt(8f)
             val v = ctx.dpInt(6f)
