@@ -123,6 +123,9 @@ class AnalysisCoordinator(
         /** A position analysed and shown less than this long ago is not searched again. */
         private const val STALE_ANALYSIS_MS = 2000L
 
+        /** How often the search of one placement is repeated after it gave no analysis. */
+        private const val MAX_ANALYSIS_RETRIES = 2
+
         /**
          * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
          * to execute files from app-writable storage (targetSdk >= 29), so the binary must be run
@@ -340,11 +343,24 @@ class AnalysisCoordinator(
     private var turnSourcesUnavailable = false
 
     /**
-     * Set when a new position has been detected while the previous analysis is still running.
-     * The analysis loop checks this and returns early so stale results are never displayed.
+     * Placement the worker's main search is running for, null while no main search is running.
+     * Written by the worker, read by the capture thread ([interruptStaleSearch]).
+     */
+    @Volatile
+    private var searchingPlacement: String? = null
+
+    /**
+     * Set by the capture thread ([interruptStaleSearch]) when the board changed while the main
+     * search of [searchingPlacement] was still running; the search is interrupted at the same
+     * time. The worker checks it once the search returns and drops the (cut short) result, so
+     * the new position is analysed from the next frame.
      */
     @Volatile
     private var positionStale = false
+
+    /** Placement whose search last gave no analysis, and how often it was retried. Worker only. */
+    private var failedPlacement: String? = null
+    private var failedRetries = 0
 
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
@@ -697,6 +713,65 @@ class AnalysisCoordinator(
         return analyses
     }
 
+    /**
+     * [analyzeMulti] for the user-facing search of [placement]. While it runs, the capture
+     * thread can cut it short when the board moves on ([interruptStaleSearch]); the caller must
+     * check [positionStale] afterwards.
+     */
+    private fun analyzeInterruptibly(fen: String, placement: String, searchMs: Int): List<AnalysisResult>? {
+        positionStale = false
+        searchingPlacement = placement
+        try {
+            return analyzeMulti(fen, searchMs)
+        } finally {
+            searchingPlacement = null
+        }
+    }
+
+    /**
+     * Capture thread: called for a frame that arrives while the worker is busy. If the worker
+     * is in the main search and accessibility data shows another placement than the one being
+     * searched, the search is stopped from here (the worker itself is blocked inside it and
+     * cannot do so), which makes it return within moments.
+     */
+    private fun interruptStaleSearch() {
+        val searching = searchingPlacement ?: return
+        val live = try {
+            freshAccessibilityPositions()?.let { BoardPositionParser.positionsToFen(it).substringBefore(' ') }
+        } catch (e: RuntimeException) {
+            null
+        } ?: return
+        if (live == searching) return
+        positionStale = true
+        engine?.interruptSearch()
+    }
+
+    /**
+     * Called after the user-facing search of [placement]. A search that gave nothing (engine
+     * died or timed out, answer dropped by [validatedAnalyses]) leaves the user without arrows
+     * until the board changes, because [stablePlacement] already equals the placement. It is
+     * therefore forgotten so the next frame searches again, at most [MAX_ANALYSIS_RETRIES]
+     * times per placement.
+     */
+    private fun retryIfAnalysisFailed(placement: String, analyses: List<AnalysisResult>?) {
+        if (!analyses.isNullOrEmpty()) {
+            failedPlacement = null
+            failedRetries = 0
+            return
+        }
+        if (failedPlacement != placement) {
+            failedPlacement = placement
+            failedRetries = 0
+        }
+        if (failedRetries >= MAX_ANALYSIS_RETRIES) {
+            Log.w(TAG, "No analysis after $failedRetries retries, giving up on: $placement")
+            return
+        }
+        failedRetries++
+        Log.w(TAG, "No analysis, retry $failedRetries of $MAX_ANALYSIS_RETRIES on the next frame: $placement")
+        stablePlacement = null
+    }
+
     // -------------------------------------------------------------------------------------
     // Frame intake (capture thread)
     // -------------------------------------------------------------------------------------
@@ -709,7 +784,12 @@ class AnalysisCoordinator(
             return
         }
 
-        if (!processing.compareAndSet(false, true)) return
+        if (!processing.compareAndSet(false, true)) {
+            // The worker is busy; if that is a search of a position no longer on the board,
+            // stop it from this thread so the worker gets to the new position quickly.
+            interruptStaleSearch()
+            return
+        }
 
         // Check if accessibility data is available (higher accuracy than vision). When it is
         // fresh and complete enough, piece recognition is skipped for this frame; the frame is
@@ -1254,6 +1334,11 @@ class AnalysisCoordinator(
             }
         } else if (wasUnset) {
             Log.i(TAG, "Board orientation: white at bottom = $bottomIsWhite ($reason)")
+            // A placement seen while the orientation was unknown was accepted as stable but
+            // possibly never analysed (onPositionChanged gives up without an orientation). It
+            // matches the default drawn before, so the branch above does not reset it; forget
+            // it here so the current position is analysed now, unless it already has arrows.
+            if (currentAnalyses.isNullOrEmpty()) stablePlacement = null
         }
     }
 
@@ -1319,7 +1404,6 @@ class AnalysisCoordinator(
     private fun onPositionChanged(placement: String, fromAccessibility: Boolean) {
         EngineStats.positionsSeen++
         positionStale = false
-        engine?.interruptSearch()
         checkTurnTrackingSources()
         val orientationKnown = whiteAtBottom != null || lastKnownOrientation != null
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
@@ -1450,7 +1534,7 @@ class AnalysisCoordinator(
         val newAnalyses = recentlyShown(newFen) ?: run {
             val searchMs = searchTimeMs()
             postOverlayThinking(searchMs)
-            analyzeMulti(newFen, searchMs)
+            analyzeInterruptibly(newFen, placement, searchMs)
         }
         if (!running.get()) return
 
@@ -1477,12 +1561,15 @@ class AnalysisCoordinator(
         val live = freshAccessibilityPositions()?.let {
             BoardPositionParser.positionsToFen(it).substringBefore(' ')
         }
-        if (live != null && live != placement) {
+        if (positionStale || (live != null && live != placement)) {
+            // An interrupted search is too shallow to keep for classifying the next move.
+            if (positionStale) currentAnalyses = null
             stablePlacement = null
             postOverlayClear()
             return
         }
         render()
+        retryIfAnalysisFailed(placement, newAnalyses)
 
         // Only now, with the arrows on screen, classify the opponent's move for its badge.
         val (analysedBefore, classified) =
@@ -1589,7 +1676,7 @@ class AnalysisCoordinator(
             postClearOpponentBadge()
             val searchMs = searchTimeMs()
             postOverlayThinking(searchMs)
-            analyzeMulti(fen, searchMs)
+            analyzeInterruptibly(fen, placement, searchMs)
         }
         if (!running.get()) return
         previousFen = null
@@ -1614,12 +1701,15 @@ class AnalysisCoordinator(
         val live = freshAccessibilityPositions()?.let {
             BoardPositionParser.positionsToFen(it).substringBefore(' ')
         }
-        if (live != null && live != placement) {
+        if (positionStale || (live != null && live != placement)) {
+            // An interrupted search is too shallow to keep for classifying the next move.
+            if (positionStale) currentAnalyses = null
             stablePlacement = null
             postOverlayClear()
             return
         }
         render()
+        retryIfAnalysisFailed(placement, analyses)
     }
 
     private fun resetGameState() {

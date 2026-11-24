@@ -604,11 +604,12 @@ class OverlayService : Service() {
         dropCoachMessage(restoreWaiting = true)
 
         val commentary = lines.first().commentary
-        // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis).
+        // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis),
+        // but never the thinking text: its countdown has stopped and would stay frozen on screen.
         if (commentary.isNotEmpty()) {
             view.text = commentary
-        } else if (view.text.isNullOrEmpty() || view.text == WAITING_TEXT) {
-            view.text = thinkingText()
+        } else if (view.text.isNullOrEmpty() || view.text.toString().startsWith(THINKING_PREFIX)) {
+            view.text = WAITING_TEXT
         }
 
         arrowView?.setArrows(
@@ -1321,10 +1322,11 @@ class ArrowView(
     }
 
     /**
-     * Draws the premove number ("2", "3", ...) in a small disc at the top-left corner of the
-     * destination square: at the arrow tip, yet clear of the classification badge, which sits at
-     * the top-right corner. A premove landing where an earlier one already has its number uses
-     * the bottom-left corner instead. The number of a forced-mate waypoint is a little larger
+     * Draws the premove number ("2", "3", ...) in a small disc at the bottom-left corner of the
+     * destination square: at the arrow tip, clear of the classification badge at the top-right
+     * corner, and clear of the (wide) mate pill at the top-right corner of the square to the
+     * left. A premove landing where an earlier one already has its number uses the top-left
+     * corner instead. The number of a forced-mate waypoint is a little larger
      * and fully opaque, as it is the order to premove in.
      * @param index position of [arrow] in [premoves]
      */
@@ -1338,7 +1340,7 @@ class ArrowView(
         val offset = square * 0.45f
         val taken = (0 until index).any { premoves[it].to == arrow.to }
         val cx = (end.x - offset).coerceIn(half, max(half, width - half))
-        val cy = (if (taken) end.y + offset else end.y - offset).coerceIn(half, max(half, height - half))
+        val cy = (if (taken) end.y - offset else end.y + offset).coerceIn(half, max(half, height - half))
 
         stepBadgePaint.style = Paint.Style.FILL
         stepBadgePaint.color = withAlpha(arrow.color, badgeAlpha)
@@ -1410,7 +1412,9 @@ class ArrowView(
 
     /**
      * Draws a small classification icon at the top-right corner of the opponent's destination
-     * square, so the user can see how good or bad the opponent's last move was.
+     * square, so the user can see how good or bad the opponent's last move was. When a suggested
+     * move targets that square (a capture of the piece), its own badge owns the top-right corner
+     * and this one moves to the bottom-right corner.
      */
     private fun drawOpponentBadge(canvas: Canvas, board: RectF, square: Float) {
         val sq = opBadgeSquare ?: return
@@ -1421,7 +1425,9 @@ class ArrowView(
         val half = sizePx / 2f
         val offset = square * 0.45f
         val cx = (center.x + offset).coerceIn(half, max(half, width - half))
-        val cy = (center.y - offset).coerceIn(half, max(half, height - half))
+        val suggestionOnSquare = arrows.any { it.to == sq }
+        val cy = (if (suggestionOnSquare) center.y + offset else center.y - offset)
+            .coerceIn(half, max(half, height - half))
 
         val drawable = getCachedDrawable(MoveColors.drawableResForLabel(label)) ?: return
         val left = (cx - half).roundToInt()

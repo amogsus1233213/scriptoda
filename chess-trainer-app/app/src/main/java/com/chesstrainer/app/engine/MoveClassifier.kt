@@ -122,11 +122,11 @@ object MoveClassifier {
 
         val classification = when {
             isBookMove -> MoveClass.BOOK
-            // Brilliant: best + sacrifice + only good move + eval guards
-            isBest && sacrifice && onlyMove && brilliantEvalOk(evalBefore, evalAfter)
+            // Brilliant: best + sound sacrifice + eval guards (not already winning)
+            isBest && sacrifice && brilliantEvalOk(evalBefore, evalAfter)
                 -> MoveClass.BRILLIANT
-            // Great: best + only good move (not a sacrifice), OR best + big eval swing
-            isBest && onlyMove && !sacrifice -> MoveClass.GREAT
+            // Great: best + only good move (sacrificial or not), OR best + big eval swing
+            isBest && onlyMove -> MoveClass.GREAT
             isBest && isGreatSwing(evalAfter, evalBeforeOpponentMove) -> MoveClass.GREAT
             // Best: engine's top move, doesn't qualify for Brilliant or Great
             isBest -> MoveClass.BEST
@@ -187,7 +187,7 @@ object MoveClassifier {
         else -> MoveClass.BLUNDER
     }
 
-    /** Eval guards for a brilliant move; sacrifice and only-move checks are done by the caller. */
+    /** Eval guards for a brilliant move; the sacrifice check is done by the caller. */
     private fun brilliantEvalOk(evalBefore: Int, evalAfter: Int): Boolean {
         if (evalAfter < HOLDING_MIN_EVAL) return false
         return evalBefore < BRILLIANT_MAX_EVAL_BEFORE
@@ -362,7 +362,9 @@ internal class Board private constructor(
 
         val after = applyMove(uci) ?: return false
         val landed = after.squares[move.to]
-        val atRisk = value(landed) - capturedValue
+        // A promotion risks only the pawn that was moved, not the piece it turned into.
+        val riskedValue = if (move.promotion != null) value('p') else value(landed)
+        val atRisk = riskedValue - capturedValue
         if (atRisk < minMaterial) return false
 
         val defended = after.attackerValues(move.to, byWhite = moverWhite).isNotEmpty()
