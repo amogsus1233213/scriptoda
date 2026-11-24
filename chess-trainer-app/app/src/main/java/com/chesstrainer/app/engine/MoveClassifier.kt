@@ -52,6 +52,8 @@ object MoveClassifier {
 
     /** For an "only move", every alternative must be at least this bad for the mover. */
     private const val ONLY_MOVE_ALTERNATIVE_MAX = -200
+    /** Minimum gap (cp) between best and second-best to qualify as "only move". */
+    private const val ONLY_MOVE_GAP = 100
 
     /** Eval swing (mover's POV, vs. before the opponent's last move) that makes a move "great". */
     private const val GREAT_MIN_SWING = 150
@@ -107,11 +109,19 @@ object MoveClassifier {
 
         val cpLoss = if (isBest) 0 else maxOf(0, clamp(evalBefore) - clamp(evalAfter))
 
+        // Cache expensive checks (engine calls) for use in multiple conditions
+        val onlyMove by lazy { isOnlyMove(engine, fen, played, depth, multiPvBefore) }
+        val sacrifice by lazy { board?.isSacrifice(played, SACRIFICE_MIN_MATERIAL) == true }
+
         val classification = when {
             isBookMove -> MoveClass.BOOK
-            isBest && isBrilliant(played, board, evalBefore, evalAfter) -> MoveClass.BRILLIANT
-            isGreat(cpLoss, evalAfter, evalBeforeOpponentMove) -> MoveClass.GREAT
-            isBest && isOnlyMove(engine, fen, played, depth, multiPvBefore) -> MoveClass.GREAT
+            // Brilliant: best + sacrifice + only good move + eval guards
+            isBest && sacrifice && onlyMove && brilliantEvalOk(evalBefore, evalAfter)
+                -> MoveClass.BRILLIANT
+            // Great: best + only good move (not a sacrifice), OR best + big eval swing
+            isBest && onlyMove && !sacrifice -> MoveClass.GREAT
+            isBest && isGreatSwing(evalAfter, evalBeforeOpponentMove) -> MoveClass.GREAT
+            // Best: engine's top move, doesn't qualify for Brilliant or Great
             isBest -> MoveClass.BEST
             isMiss(cpLoss, evalBefore, evalAfter, board, best) -> MoveClass.MISS
             else -> byCpLoss(cpLoss)
@@ -135,10 +145,10 @@ object MoveClassifier {
         else -> MoveClass.BLUNDER
     }
 
-    private fun isBrilliant(move: String, board: Board?, evalBefore: Int, evalAfter: Int): Boolean {
+    /** Eval guards for a brilliant move; sacrifice and only-move checks are done by the caller. */
+    private fun brilliantEvalOk(evalBefore: Int, evalAfter: Int): Boolean {
         if (evalAfter < HOLDING_MIN_EVAL) return false
-        if (evalBefore >= BRILLIANT_MAX_EVAL_BEFORE) return false
-        return board?.isSacrifice(move, SACRIFICE_MIN_MATERIAL) == true
+        return evalBefore < BRILLIANT_MAX_EVAL_BEFORE
     }
 
     /** True if [move] holds the position while every alternative loses. */
@@ -157,12 +167,15 @@ object MoveClassifier {
         if (lines.size < 2) return false
         val (bestLine, secondLine) = lines
         if (bestLine.bestMove.trim().lowercase() != move) return false
-        return bestLine.eval >= HOLDING_MIN_EVAL && secondLine.eval <= ONLY_MOVE_ALTERNATIVE_MAX
+        if (bestLine.eval < HOLDING_MIN_EVAL) return false
+        val gap = bestLine.eval - secondLine.eval
+        // Only move if the gap is large enough, or the second-best leads to a losing position
+        return gap >= ONLY_MOVE_GAP || secondLine.eval <= ONLY_MOVE_ALTERNATIVE_MAX
     }
 
-    private fun isGreat(cpLoss: Int, evalAfter: Int, evalBeforeOpponentMove: Int?): Boolean {
+    /** True when a best move produces a big positive eval swing (punishing an opponent error). */
+    private fun isGreatSwing(evalAfter: Int, evalBeforeOpponentMove: Int?): Boolean {
         if (evalBeforeOpponentMove == null) return false
-        if (cpLoss >= EXCELLENT_MAX) return false
         if (evalAfter < GREAT_MIN_EVAL) return false
         return clamp(evalAfter) - clamp(evalBeforeOpponentMove) >= GREAT_MIN_SWING
     }
