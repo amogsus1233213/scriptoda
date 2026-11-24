@@ -82,6 +82,9 @@ class AnalysisCoordinator(
         /** Time budget (ms) for the main multi-PV search; 0 means use depth only. */
         private const val SEARCH_TIME_MS = 3000
 
+        /** Time budget (ms) for analysing the previous position when classifying a played move. */
+        private const val CLASSIFY_TIME_MS = 500
+
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
 
@@ -238,8 +241,8 @@ class AnalysisCoordinator(
      */
     private var whiteAtBottom: Boolean? = null
     /**
-     * Last non-null value of [whiteAtBottom] before a reset. Used as a better fallback than
-     * hardcoded `true` when orientation is temporarily unknown (e.g. right after [resetGameState]).
+     * Last value [whiteAtBottom] was set to. Used as a better fallback than hardcoded `true`
+     * when orientation is temporarily unknown. Cleared by [resetGameState].
      */
     private var lastKnownOrientation: Boolean? = null
     private var orientationVotes = 0
@@ -638,7 +641,7 @@ class AnalysisCoordinator(
         stablePlacement = finalPlacement
         candidateHistory.clear()
         candidateFramesSinceStable = 0
-        onPositionChanged(finalPlacement)
+        onPositionChanged(finalPlacement, fromAccessibility = false)
     }
 
     /**
@@ -729,7 +732,7 @@ class AnalysisCoordinator(
         candidateHistory.clear()
         candidateFramesSinceStable = 0
         stablePlacement = placement
-        onPositionChanged(placement)
+        onPositionChanged(placement, fromAccessibility = true)
     }
 
     /**
@@ -1009,10 +1012,12 @@ class AnalysisCoordinator(
             crossCheckContrary = 0
             crossCheckedPlacement = null
             if (absolute) {
-                // Accessibility placements are absolute (not rotated), so tracking state is still
-                // valid — just redraw the arrows with the new orientation.
-                val analyses = currentAnalyses
-                if (analyses != null) render() else postOverlayClear()
+                // Accessibility placements are absolute (not rotated), so the tracked position is
+                // still valid, but the analyses were computed assuming the other side is the
+                // user's. Drop them and force a re-analysis of the current placement.
+                currentAnalyses = null
+                stablePlacement = null
+                postOverlayClear()
             } else {
                 resetTracking()
                 postOverlayClear()
@@ -1070,7 +1075,11 @@ class AnalysisCoordinator(
     // Move tracking (worker thread)
     // -------------------------------------------------------------------------------------
 
-    private fun onPositionChanged(placement: String) {
+    /**
+     * @param fromAccessibility true when [placement] comes from accessibility data (exact), false
+     *   when it was read from the screen by vision (may contain misreads).
+     */
+    private fun onPositionChanged(placement: String, fromAccessibility: Boolean) {
         EngineStats.positionsSeen++
         positionStale = false
         engine?.interruptSearch()
@@ -1094,8 +1103,10 @@ class AnalysisCoordinator(
             // Guard against vision misreads caused by our own arrow overlay.
             // When the board differs from the last known-good position by only
             // a few squares and no legal move can be inferred, it is almost
-            // certainly the arrow graphics being read as pieces.
-            if (placement != START_PLACEMENT && lastKnownGoodFen != null) {
+            // certainly the arrow graphics being read as pieces. Accessibility data is exact
+            // and never sees the overlay, so there such a difference is real (e.g. a capture and
+            // recapture seen as one change) and must resync instead of being dropped.
+            if (!fromAccessibility && placement != START_PLACEMENT && lastKnownGoodFen != null) {
                 val goodPlacement = lastKnownGoodFen!!.substringBefore(' ')
                 val goodBoard = parsePlacement(goodPlacement)
                 if (goodBoard != null) {
@@ -1138,31 +1149,9 @@ class AnalysisCoordinator(
             beforeFen = withEnPassant(beforeFen, move.to)
             beforeAnalysis = null
         }
-        if (beforeAnalysis == null) beforeAnalysis = analyze(beforeFen)
-        if (!running.get()) return
-
-        val e = engine
+        // Classifying the played move is deferred until after the user-facing analysis below
+        // (see classifyMove); only capture what it needs before currentAnalyses is dropped.
         val multiPvForClassifier = if (multiPvInvalidated) null else currentAnalyses?.takeIf { it.size >= 2 }
-        val classified = if (e != null && e.isReady() && beforeAnalysis != null) {
-            try {
-                MoveClassifier.classify(
-                    engine = e,
-                    fen = beforeFen,
-                    playedMove = move.uci,
-                    analysisBefore = beforeAnalysis,
-                    depth = 12,
-                    isBookMove = false,
-                    evalBeforeOpponentMove = olderAnalysis?.let { -it.eval },
-                    multiPvBefore = multiPvForClassifier,
-                )
-            } catch (ex: IllegalStateException) {
-                Log.w(TAG, "Could not classify ${move.uci}", ex)
-                null
-            }
-        } else {
-            null
-        }
-        if (!running.get()) return
 
         castlingRights = updatedCastlingRights(castlingRights, move, after)
         val prevBoard = currentFen?.let { parsePlacement(it.substringBefore(' ')) }
@@ -1184,21 +1173,25 @@ class AnalysisCoordinator(
         val opponentJustMoved = move.white != userIsWhite
 
         if (isOpponentTurn) {
-            // User just moved → opponent's turn now.  Clear overlay and skip analysis.
+            // User just moved → opponent's turn now.  Clear overlay and skip analysis of the new
+            // position; the user's move is still classified (time-limited) for later feedback.
             previousFen = beforeFen
             previousAnalysis = beforeAnalysis
             currentAnalyses = null
             lastKnownGoodFen = newFen
             lastMove = move
-            lastClassified = classified
+            lastClassified = null
             postClearOpponentBadge()
             postOverlayClear()
+            val (analysedBefore, classified) =
+                classifyMove(beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
+            if (!running.get()) return
+            previousAnalysis = analysedBefore
+            lastClassified = classified
             return
         }
-        // Opponent just moved → user's turn.  Show badge for opponent's move, then analyse.
-        if (opponentJustMoved && classified != null) {
-            postOpponentBadge(move.uci.substring(2, 4), classified.classification.displayName, !userIsWhite)
-        }
+        // Opponent just moved → user's turn.  The user-facing analysis runs first so the arrows
+        // appear as soon as possible; the opponent's move is classified afterwards.
         postOverlayThinking()
         val newAnalyses = analyzeMulti(newFen)
         if (!running.get()) return
@@ -1208,7 +1201,7 @@ class AnalysisCoordinator(
         currentAnalyses = newAnalyses
         if (!newAnalyses.isNullOrEmpty()) lastKnownGoodFen = newFen
         lastMove = move
-        lastClassified = classified
+        lastClassified = null
         EngineStats.movesAnalyzed++
         EngineStats.lastFen = newFen
         EngineStats.whiteAtBottom = whiteAtBottom
@@ -1222,7 +1215,65 @@ class AnalysisCoordinator(
             EngineStats.currentEvalCp = null
             EngineStats.currentMateIn = null
         }
+        // Do not draw arrows for a position that already changed while the engine was busy.
+        val live = freshAccessibilityPositions()?.let {
+            BoardPositionParser.positionsToFen(it).substringBefore(' ')
+        }
+        if (live != null && live != placement) {
+            stablePlacement = null
+            postOverlayClear()
+            return
+        }
         render()
+
+        // Only now, with the arrows on screen, classify the opponent's move for its badge.
+        val (analysedBefore, classified) =
+            classifyMove(beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
+        if (!running.get()) return
+        previousAnalysis = analysedBefore
+        lastClassified = classified
+        if (opponentJustMoved && classified != null) {
+            postOpponentBadge(move.uci.substring(2, 4), classified.classification.displayName, !userIsWhite)
+        }
+    }
+
+    /**
+     * Classifies [move], played in [beforeFen]. [beforeAnalysis] is the best line of [beforeFen]
+     * if already known; otherwise it is computed with a [CLASSIFY_TIME_MS] time limit so this
+     * never holds up the worker for long. Returns the analysis used and the classification.
+     */
+    private fun classifyMove(
+        beforeFen: String,
+        move: InferredMove,
+        beforeAnalysis: AnalysisResult?,
+        olderAnalysis: AnalysisResult?,
+        multiPvBefore: List<AnalysisResult>?,
+    ): Pair<AnalysisResult?, ClassifiedMove?> {
+        val e = engine ?: return beforeAnalysis to null
+        if (!running.get()) return beforeAnalysis to null
+        val analysis = beforeAnalysis ?: try {
+            e.analyzeMultiPv(beforeFen, depth, 1, moveTimeMs = CLASSIFY_TIME_MS)?.firstOrNull()
+        } catch (ex: RuntimeException) {
+            Log.e(TAG, "Analysis failed for $beforeFen", ex)
+            null
+        }
+        if (analysis == null || !running.get() || !e.isReady()) return analysis to null
+        val classified = try {
+            MoveClassifier.classify(
+                engine = e,
+                fen = beforeFen,
+                playedMove = move.uci,
+                analysisBefore = analysis,
+                depth = 12,
+                isBookMove = false,
+                evalBeforeOpponentMove = olderAnalysis?.let { -it.eval },
+                multiPvBefore = multiPvBefore,
+            )
+        } catch (ex: IllegalStateException) {
+            Log.w(TAG, "Could not classify ${move.uci}", ex)
+            null
+        }
+        return analysis to classified
     }
 
     /** Starts tracking from [placement] without a known previous move. */
@@ -1266,11 +1317,21 @@ class AnalysisCoordinator(
             EngineStats.currentEvalCp = null
             EngineStats.currentMateIn = null
         }
+        // Do not draw arrows for a position that already changed while the engine was busy.
+        val live = freshAccessibilityPositions()?.let {
+            BoardPositionParser.positionsToFen(it).substringBefore(' ')
+        }
+        if (live != null && live != placement) {
+            stablePlacement = null
+            postOverlayClear()
+            return
+        }
         render()
     }
 
     private fun resetGameState() {
-        if (whiteAtBottom != null) lastKnownOrientation = whiteAtBottom
+        // A previous game's orientation must not leak into the next one.
+        lastKnownOrientation = null
         whiteAtBottom = null
         orientationVotes = 0
         orientationConfidence = CONFIDENCE_LOW
@@ -1303,6 +1364,8 @@ class AnalysisCoordinator(
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val flipped = !userIsWhite
         val usersTurn = whiteToMove == userIsWhite
+        // Never draw the opponent's best move: suggestions are only shown on the user's turn.
+        if (!usersTurn) { postOverlayClear(); return }
 
         if (analyses.isNullOrEmpty()) {
             postOverlayClear()
