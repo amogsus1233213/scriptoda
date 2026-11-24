@@ -1446,9 +1446,18 @@ class AnalysisCoordinator(
             val evalCp = result.eval.coerceIn(-StockfishEngine.MATE_SCORE, StockfishEngine.MATE_SCORE) * sign
             val mateIn = result.mate?.let { it * sign }
 
+            // result.mate is from the side to move's POV, which is the user here (usersTurn).
+            val userMate = result.mate?.takeIf { it > 0 }
+
             val label: String
             val color: Int
             when {
+                // A forced mate must never hide behind a generic "Best move" / "Excellent".
+                userMate != null -> {
+                    if (rank > 1 && bestEval - result.eval > QUALITY_CUTOFF_CP) return@mapIndexedNotNull null
+                    label = mateLabel(userMate)
+                    color = if (userMate == 1) MoveColors.MATE else MoveColors.BEST
+                }
                 rank == 1 -> {
                     label = "Best move"
                     color = MoveColors.BEST
@@ -1486,14 +1495,16 @@ class AnalysisCoordinator(
         val seconds = AccessibilityData.userTimeSeconds
         // Engine line behind the best suggestion: its PV lets the coach explain the plan.
         val bestAnalysis = analyses.firstOrNull { it.bestMove.startsWith(best.from + best.to) }
-        val commentary = try {
+        // Mate distance for the side to move (the user). Taken straight from the engine line when
+        // it is known; SuggestedLineData holds it from white's POV, hence the sign otherwise.
+        val moverMate = bestAnalysis?.mate ?: best.mateIn?.let { it * sign }
+        val generated = try {
             MoveCommentary.generate(
                 fromSquare = best.from,
                 toSquare = best.to,
                 label = best.label,
                 evalCp = best.evalCp,
-                // SuggestedLineData holds mate from white's POV; commentary wants side to move's.
-                mateIn = best.mateIn?.let { it * sign },
+                mateIn = moverMate,
                 fen = fen,
                 isUsersTurn = usersTurn,
                 rank = 1,
@@ -1507,10 +1518,22 @@ class AnalysisCoordinator(
             Log.w(TAG, "Commentary failed for $fen", e)
             ""
         }
+        // A forced mate is the most important thing the coach can say. If the generator had
+        // nothing (or failed), say it plainly rather than leaving the previous text on screen.
+        val commentary = if (generated.isBlank() && moverMate != null && moverMate > 0) {
+            val square = best.to.uppercase(java.util.Locale.ROOT)
+            if (moverMate == 1) "Checkmate in one! Play to $square."
+            else "Forced mate in $moverMate. Start with the move to $square."
+        } else {
+            generated
+        }
         suggestions[0] = best.copy(commentary = commentary)
 
         postMultiSuggestion(suggestions, flipped)
     }
+
+    /** Arrow label for a forced mate in [moves] by the side to move. */
+    private fun mateLabel(moves: Int): String = if (moves == 1) "Mate in 1!" else "Mate in $moves"
 
     private fun postMultiSuggestion(suggestions: List<SuggestedLineData>, flipped: Boolean) {
         if (!running.get()) return
