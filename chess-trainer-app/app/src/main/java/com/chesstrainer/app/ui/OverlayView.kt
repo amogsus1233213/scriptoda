@@ -277,7 +277,7 @@ class OverlayService : Service() {
     fun showThinking() {
         mainHandler.post {
             currentLines = emptyList()
-            arrowView?.invalidate()
+            arrowView?.setArrows(emptyList())
             val view = commentaryView ?: return@post
             view.text = THINKING_TEXT
             panelRoot?.post { clampAndUpdate() }
