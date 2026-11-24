@@ -74,7 +74,7 @@ class AnalysisCoordinator(
     companion object {
         private const val TAG = "AnalysisCoordinator"
 
-        const val DEFAULT_DEPTH = 18
+        const val DEFAULT_DEPTH = 22
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
         private const val NUM_LINES = 3
@@ -1057,7 +1057,6 @@ class AnalysisCoordinator(
 
     private fun onPositionChanged(placement: String) {
         EngineStats.positionsSeen++
-        val orientationKnown = whiteAtBottom != null
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val prevFen = currentFen
         val after = parsePlacement(placement) ?: return
@@ -1070,15 +1069,6 @@ class AnalysisCoordinator(
         }
 
         if (move == null) {
-            if (!orientationKnown) {
-                // Orientation unknown — track the position silently without classifying.
-                currentFen = composeFen(
-                    placement,
-                    if (placement == START_PLACEMENT) true else userIsWhite,
-                    castlingFromPlacement(after), null, 1,
-                )
-                return
-            }
             resyncTo(placement, after, if (placement == START_PLACEMENT) true else userIsWhite)
             return
         }
@@ -1094,20 +1084,6 @@ class AnalysisCoordinator(
             consecutiveSameSideMoves = 0
         }
         lastInferredMoverWasWhite = move.white
-
-        // --- Don't classify when orientation is unknown ---
-        if (!orientationKnown) {
-            // Track position and inferred move, but don't post badges or analyse.
-            if (prevFen == null) return
-            castlingRights = updatedCastlingRights(castlingRights, move, after)
-            if (!move.white) fullMoveNumber++
-            currentFen = composeFen(placement, !move.white, castlingRights, enPassantTarget(move, after), fullMoveNumber)
-            lastKnownGoodFen = currentFen
-            lastMove = move
-            lastClassified = null
-            Log.d(TAG, "Orientation unknown — deferring move classification for ${move.uci}")
-            return
-        }
 
         // The side that actually moved is authoritative; fix the previous FEN if we guessed wrong.
         var beforeFen: String = prevFen ?: return
