@@ -6,8 +6,8 @@ import kotlin.math.abs
 import kotlin.random.Random
 
 /**
- * Short one-liners for the overlay's best move, in the voice of Mittens — a coach with
- * personality: fun, encouraging, honest about bad moves, and a little too sure of itself.
+ * Short coach commentary for the overlay's best move: one or two brief sentences, calm and
+ * direct, naming the pieces, the tactic and the threat. No jokes, no long explanations.
  *
  * What is said depends on the game: forced mates, the opponent's last move, the user's own last
  * move (its [MoveClass]), tactical motifs of the suggested move, the clock and the evaluation.
@@ -199,8 +199,8 @@ object MoveCommentary {
         // 2. Tactical motifs of the suggested move itself.
         val motif: String? = when {
             isSacrifice && isCapture ->
-                pick(SACRIFICE_CAPTURE_LINES, pieceName.uppercase(Locale.ROOT), capturedName)
-            isSacrifice -> pick(SACRIFICE_LINES, pieceName.uppercase(Locale.ROOT))
+                pick(SACRIFICE_CAPTURE_LINES, pieceName, capturedName)
+            isSacrifice -> pick(SACRIFICE_LINES, pieceName)
             isPromotion && promoteTo != 'q' -> pick(UNDERPROMOTION_LINES, pieceName(promoteTo))
             isPromotion -> pick(PROMOTION_LINES)
             isHanging && isHighValue(captured) -> pick(BIG_CAPTURE_LINES, capturedName)
@@ -326,41 +326,39 @@ object MoveCommentary {
             ?.let { String.format(Locale.US, "%.1f", it / 100.0) }
 
         val reaction = when (classification) {
-            MoveClass.BRILLIANT ->
-                "Incredible! $played is a sacrifice that only works because it's the only " +
-                    "winning move. The engine bows."
-            MoveClass.GREAT -> "Perfect! $played was the only good move here and you found it."
-            MoveClass.BEST -> "That's exactly what the engine recommends. $played — clean play."
-            MoveClass.EXCELLENT -> "$played is almost as good as the best. Tiny difference, don't worry."
-            MoveClass.GOOD -> "$played is a solid move. Nothing wrong with it."
-            MoveClass.BOOK -> "$played — straight out of the opening book."
+            MoveClass.BRILLIANT -> "Brilliant. $played was hard to find."
+            MoveClass.GREAT -> "Great move. $played was the only good one."
+            MoveClass.BEST -> "$played is the best move. Clean."
+            MoveClass.EXCELLENT -> "$played is nearly best. Fine."
+            MoveClass.GOOD -> "$played is solid. Nothing wrong with it."
+            MoveClass.BOOK -> "$played is book. Still theory."
 
             MoveClass.INACCURACY -> when {
-                best == null -> "$played was okay, but there was something stronger."
-                pawns == null -> "$played was okay, but $best was stronger."
-                else -> "$played was okay, but $best was stronger. About $pawns pawn difference."
+                best == null -> "Inaccuracy. There was something stronger than $played."
+                pawns == null -> "Inaccuracy. $best was stronger."
+                else -> "Inaccuracy. $best was stronger, by about $pawns pawns."
             }
             MoveClass.MISTAKE -> {
                 val cost = when {
-                    hadMate -> "$played let a forced mate slip."
+                    hadMate -> "Mistake. $played let a forced mate slip."
                     pawns == null -> "$played was a mistake."
-                    else -> "$played cost you about $pawns pawns."
+                    else -> "Mistake. $played cost about $pawns pawns."
                 }
-                if (best == null) cost else "$cost $best was the right call."
+                if (best == null) cost else "$cost $best was better."
             }
             MoveClass.BLUNDER -> {
-                val needed = if (best == null) "" else " $best was what you needed."
+                val needed = if (best == null) "" else " $best was the move."
                 val gone = when {
                     hadMate -> " You had a forced mate."
                     pawns == null -> ""
-                    else -> " That's $pawns pawns gone."
+                    else -> " That's about $pawns pawns gone."
                 }
-                "$played threw away the game.$needed$gone"
+                "$played is a blunder.$needed$gone"
             }
             MoveClass.MISS -> when {
-                best == null -> "You missed a tactic there! That was worth grabbing."
-                hadMate -> "You missed $best! That was a forced mate."
-                else -> "You missed $best! That was a tactic worth grabbing."
+                best == null -> "You missed a tactic there."
+                hadMate -> "You missed $best. That was a forced mate."
+                else -> "You missed $best. That was a tactic."
             }
         }
 
@@ -370,12 +368,12 @@ object MoveCommentary {
 
     /** Brief, unsurprised nods for when the user plays the move the coach suggested. */
     private val FOLLOWED_SUGGESTION_LINES = arrayOf(
-        "Good, that's the plan.",
-        "Exactly.",
+        "Good. That's the plan.",
+        "Exactly. Keep going.",
         "That's the one.",
-        "Just as we discussed.",
-        "Right on plan.",
-        "Yes. Keep going.",
+        "Right. Stay on plan.",
+        "Good move. Carry on.",
+        "Yes. That works.",
     )
 
     /** What the move did to the game as a whole, or null when there is nothing worth adding. */
@@ -388,9 +386,9 @@ object MoveCommentary {
             classification == MoveClass.BEST
         return when {
             wasWinning && isWinning -> "Still in control."
-            wasWinning && evalAfter <= LEVEL_CP -> "You had the advantage and let it slip!"
-            wasLosing && strongMove -> "Fighting spirit! You're not going down easy."
-            wasLevel && isWinning -> "BOOM! You just took over this game."
+            wasWinning && evalAfter <= LEVEL_CP -> "The advantage is gone."
+            wasLosing && strongMove -> "Good defense. Keep fighting."
+            wasLevel && isWinning -> "You're on top now."
             else -> null
         }
     }
@@ -859,209 +857,195 @@ object MoveCommentary {
     // Plan lines. Moves are inserted in algebraic notation ("Nf3"), pieces by name ("knight").
 
     private val MATE_NOW_PLAN_LINES = arrayOf(
-        "%s. Checkmate.",
-        "Mate in 1: %s.",
-        "%s. Game over.",
-        "Play %s. Mate.",
+        "%s is checkmate. Play it.",
+        "Mate in 1 — %s ends it.",
+        "Play %s. That's checkmate.",
     )
 
     // Args are (move, their reply, mating move).
     private val MATE_IN_TWO_PLAN_LINES = arrayOf(
-        "Mate in 2: %1\$s, then %3\$s.",
-        "%1\$s, then %3\$s. Mate.",
-        "Mate in 2. %1\$s, %2\$s, %3\$s.",
+        "Mate in 2 — %1\$s, then %3\$s.",
+        "%1\$s first. After %2\$s, %3\$s is mate.",
+        "Mate in 2. %1\$s forces it, %3\$s finishes.",
     )
 
     // Args are (move, their reply, follow-up, moves to mate).
     private val MATE_LINE_PLAN_LINES = arrayOf(
-        "Mate in %4\$d: %1\$s, then %3\$s.",
-        "Mate in %4\$d. Start %1\$s.",
-        "%1\$s, then %3\$s. Mate in %4\$d.",
+        "Mate in %4\$d — %1\$s forces it, then %3\$s.",
+        "%1\$s starts a forced mate in %4\$d. After %2\$s, play %3\$s.",
+        "Mate in %4\$d. %1\$s, and if %2\$s, %3\$s.",
     )
 
     private val MATE_FORCED_PLAN_LINES = arrayOf(
-        "Mate in %2\$d. Start %1\$s.",
-        "%s. Forced mate in %d.",
+        "Mate in %2\$d — %1\$s forces it.",
+        "%s starts a forced mate in %d.",
     )
 
-    private val OPPONENT_BLUNDER_PREFIXES = arrayOf("Blunder.", "They blundered.", "They hung it.")
-    private val OPPONENT_MISTAKE_PREFIXES = arrayOf("Mistake.", "They slipped.", "Punish it.")
+    private val OPPONENT_BLUNDER_PREFIXES = arrayOf("They blundered.", "That's a blunder by them.", "Blunder. Punish it.")
+    private val OPPONENT_MISTAKE_PREFIXES = arrayOf("They slipped.", "Mistake by them.", "That was a mistake. Punish it.")
 
     // Args are (sacrifice, follow-up).
     private val SAC_WINS_BACK_PLAN_LINES = arrayOf(
-        "%s. If taken, %s wins more.",
-        "Sacrifice: %s. Then %s.",
+        "Sacrifice with %s. If they take, %s wins back more.",
+        "%s is a sound sacrifice. %s wins it back with interest.",
     )
 
     private val SAC_ATTACK_PLAN_LINES = arrayOf(
-        "%s. If taken, %s with check.",
-        "Sacrifice: %s, then %s. Attack.",
+        "Sacrifice with %s. If they take, %s comes with check.",
+        "%s opens their king. After they take, %s keeps the attack going.",
     )
 
     // Args are (captured piece, move, follow-up).
     private val CAPTURE_THEN_MORE_PLAN_LINES = arrayOf(
-        "Take the %1\$s: %2\$s. Then %3\$s.",
-        "%2\$s. If they recapture, %3\$s.",
+        "Take the %1\$s with %2\$s. If they recapture, %3\$s wins more.",
+        "%2\$s wins the %1\$s. When they take back, %3\$s picks up more.",
     )
 
     // Args are (move, captured piece).
     private val FREE_CAPTURE_PLAN_LINES = arrayOf(
-        "%s. Free %s.",
-        "Take the %2\$s. %1\$s.",
-        "Hanging %2\$s. %1\$s.",
-        "%s. The %s is undefended.",
+        "%s wins the %s for free. Nothing defends it.",
+        "Their %2\$s is hanging. %1\$s just takes it.",
+        "%s takes a free %s. They can't recapture.",
     )
 
     private val AHEAD_CAPTURE_PLAN_LINES = arrayOf(
-        "%s. Win the %s.",
-        "Take the %2\$s: %1\$s.",
-        "%s wins the %s.",
+        "%s wins the %s. They can take back, but you come out ahead.",
+        "Take the %2\$s with %1\$s. Good trade, you gain material.",
     )
 
     // Args are (move, first target, second target).
     private val FORK_WINS_PLAN_LINES = arrayOf(
-        "%s. Fork the %s and %s.",
-        "Fork: %s. %s or %s falls.",
-        "%s forks %s and %s. One falls.",
+        "%s forks the %s and %s. They can't save both.",
+        "Fork with %s — the %s and %s are both hit. One falls.",
     )
 
     private val FORK_PLAN_LINES = arrayOf(
-        "%s. Fork the %s and %s.",
-        "Fork: %s hits %s and %s.",
-        "Double attack: %s. %s and %s.",
+        "%s forks the %s and %s. Double attack.",
+        "Fork with %s. It hits the %s and the %s at once.",
     )
 
     // Args are (move, piece in front, piece behind).
     private val PIN_WINS_PLAN_LINES = arrayOf(
-        "%s. Pin. Win the %s.",
-        "Pin the %2\$s to the %3\$s: %1\$s.",
-        "%s. The pinned %s falls.",
+        "%s pins the %s to the %s. Take it next move.",
+        "Pin the %2\$s to the %3\$s with %1\$s. It can't move, so you win it.",
     )
 
     private val PIN_PLAN_LINES = arrayOf(
-        "%s. Pin the %s.",
-        "Pin the %2\$s to the %3\$s: %1\$s.",
-        "%s pins the %s. Pile on.",
+        "%s pins the %s to the %s. Pile up on it.",
+        "Pin with %s. Their %s is stuck in front of the %s.",
     )
 
     private val SKEWER_PLAN_LINES = arrayOf(
-        "%s. Skewer the %s and %s.",
-        "Skewer: %1\$s. Win the %3\$s.",
+        "%s skewers the %s. When it moves, the %s falls.",
+        "Skewer with %s. The %s has to step aside and you take the %s.",
     )
 
     // Args are (move, follow-up, target).
     private val IF_THEY_TAKE_PLAN_LINES = arrayOf(
-        "%s. If taken, %s wins the %s.",
-        "%s. They take, then %s.",
+        "Play %s. If they take, %s wins the %s.",
+        "%s sets a trap. If they capture, %s picks up the %s.",
     )
 
     private val TRADE_THEN_WIN_PLAN_LINES = arrayOf(
-        "Trade: %s. Then %s wins the %s.",
-        "%s first, then %s.",
+        "Trade with %s first. Then %s wins the %s.",
+        "%s clears the way. Next comes %s, winning the %s.",
     )
 
     private val SETS_UP_PLAN_LINES = arrayOf(
-        "%s. Threat: %s.",
-        "%s, then %s wins the %s.",
-        "%1\$s. The %3\$s falls.",
+        "%s sets up %s. They can't save the %s.",
+        "%s threatens %s, and the %s has no escape.",
+        "Play %s. Next is %s, winning the %s.",
     )
 
     private val KING_STEPS_OUT_PLAN_LINES = arrayOf(
-        "Check. King out: %s.",
-        "Step out of check. %s.",
+        "You're in check. %s steps out safely.",
+        "%s gets the king out of check.",
     )
 
     private val TAKE_CHECKER_PLAN_LINES = arrayOf(
-        "Check. Take it: %s.",
-        "%s. Remove the checker.",
+        "You're in check. %s removes the attacker.",
+        "%s takes the checking piece. Problem solved.",
     )
 
     private val BLOCK_CHECK_PLAN_LINES = arrayOf(
-        "Check. Block: %s.",
-        "Block with %s.",
+        "You're in check. Block it with %s.",
+        "%s blocks the check and holds things together.",
     )
 
     // Args are (move, piece).
     private val RESCUE_PLAN_LINES = arrayOf(
-        "%s. Save the %s.",
-        "Move the %2\$s. %1\$s.",
-        "Don't hang the %2\$s. %1\$s.",
+        "Your %2\$s is under attack. %1\$s moves it to safety.",
+        "%s gets the %s out of danger.",
+        "Don't hang the %2\$s. %1\$s saves it.",
     )
 
     private val HITS_PIECE_PLAN_LINES = arrayOf(
-        "%s. Hit the %s.",
-        "Attack the %2\$s: %1\$s.",
-        "%s. Tempo on the %s.",
+        "%s hits their %s. It has to move and you gain a tempo.",
+        "%s attacks the %s. Make them react.",
     )
 
     private val HITS_LOOSE_PLAN_LINES = arrayOf(
-        "%s. The %s is loose.",
-        "Loose %2\$s. %1\$s.",
-        "Attack the loose %2\$s: %1\$s.",
+        "%s attacks their undefended %s. They have to deal with it.",
+        "Their %2\$s is loose. %1\$s goes after it.",
     )
 
     private val COVERS_PLAN_LINES = arrayOf(
-        "%s. Defend the %s.",
-        "Cover the %2\$s. %1\$s.",
+        "%s defends your %s, which was hanging.",
+        "Your %2\$s needed cover. %1\$s protects it.",
     )
 
     // Args are (move, piece).
     private val CENTER_OPENS_PLAN_LINES = arrayOf(
-        "%s. Center, and frees the %s.",
-        "%s. Open up the %s.",
+        "%s takes the center and opens a line for your %s.",
+        "%s claims the center and lets the %s out.",
     )
 
     private val CENTER_PLAN_LINES = arrayOf(
-        "%s. Take the center.",
-        "Center. %s.",
-        "%s. Claim space.",
+        "%s takes the center. Develop behind it.",
+        "%s grabs central space. Good opening move.",
     )
 
     private val PASSED_PAWN_PLAN_LINES = arrayOf(
-        "Push the pawn. %s.",
-        "%s. Passed pawn. Push.",
-        "Push. %s.",
+        "Push the passed pawn with %s. No pawn can stop it.",
+        "%s advances the passed pawn. It gets more dangerous every step.",
     )
 
     // Args are (move, "diagonal" | "file", piece).
     private val OPENS_LINE_PLAN_LINES = arrayOf(
-        "%s. Open the %s for the %s.",
-        "%s opens the %s.",
+        "%s opens the %s for your %s.",
+        "Play %s. It clears the %s and activates the %s.",
     )
 
     private val DEVELOP_CENTER_PLAN_LINES = arrayOf(
-        "%s. Develop.",
-        "Develop the knight. %s.",
-        "%s. Knight to the center.",
+        "%s develops the knight toward the center.",
+        "%s brings a piece out and controls the center.",
     )
 
     // Args are (move, piece).
     private val DEVELOP_PLAN_LINES = arrayOf(
-        "%s. Develop the %s.",
-        "Develop. %s.",
-        "Get the %2\$s out: %1\$s.",
+        "%s develops the %s. Get your pieces out.",
+        "%s brings the %s into the game. Development first.",
     )
 
     private val OPEN_FILE_PLAN_LINES = arrayOf(
-        "%s. Rook to the open file.",
-        "Open file. %s.",
-        "Take the file: %s.",
+        "%s puts the rook on the open file. It's much more active there.",
+        "%s takes the open file. Rooks belong there.",
     )
 
     private val HALF_OPEN_FILE_PLAN_LINES = arrayOf(
-        "%s. Half-open file.",
-        "%s. Pressure the pawn.",
+        "%s puts the rook on the half-open file. It presses on their pawn.",
+        "%s lines the rook up against their pawn.",
     )
 
     private val SEVENTH_RANK_PLAN_LINES = arrayOf(
-        "%s. Rook to the seventh.",
-        "Seventh rank. %s.",
+        "%s puts the rook on the seventh. Their pawns become targets.",
+        "%s invades the seventh rank and attacks their pawns.",
     )
 
     private val DEFENSE_PLAN_LINES = arrayOf(
-        "%s. Hold.",
-        "Defend. %s.",
-        "%s. Stay solid.",
+        "%s holds the position. Stay solid.",
+        "%s is the toughest defense. Wait for your chance.",
+        "%s keeps things together. Don't let them break through.",
     )
 
     // -------------------------------------------------------------------------------------
@@ -1223,234 +1207,231 @@ object MoveCommentary {
     // -------------------------------------------------------------------------------------
 
     private val MATE_IN_ONE_LINES = arrayOf(
-        "Mate in 1.",
         "Mate in 1. Play it.",
-        "Checkmate. Play it.",
-        "Mate. One move.",
-        "Deliver mate.",
-        "Mate on the board.",
-        "Finish it.",
-        "End it.",
+        "Checkmate is one move away.",
+        "Mate in 1. Don't overthink it.",
+        "One move ends the game.",
+        "Checkmate is on the board. Deliver it.",
+        "Mate in 1. Finish the game.",
+        "There's a mate in 1. Find it.",
+        "Mate on the board. End it.",
     )
 
     private val MATE_SOON_LINES = arrayOf(
-        "Mate in %d.",
-        "Forced mate in %d.",
-        "Mate in %d. Checks only.",
-        "Mate in %d. Stay precise.",
-        "Mate in %d. Finish it.",
-        "%d moves to mate.",
-        "Mate in %d. Don't drift.",
-        "Mate in %d. Calculate it.",
+        "Mate in %d. Just play the line.",
+        "Forced mate in %d. Checks only.",
+        "%d moves to checkmate. Stay precise.",
+        "Mate in %d. Don't get creative.",
+        "Mate in %d. Finish it cleanly.",
+        "Forced mate in %d. Calculate it once, then play.",
+        "Mate in %d. Keep giving checks.",
+        "Mate in %d. The king can't escape.",
     )
 
     private val MATE_LINES = arrayOf(
-        "Mate in %d.",
-        "Forced mate in %d.",
-        "Mate in %d. Follow the line.",
-        "Mate in %d. Keep checking.",
-        "Mate in %d. No rush.",
-        "Mate in %d. Stay accurate.",
-        "Mate in %d. King's trapped.",
+        "Mate in %d. The king has nowhere to go.",
+        "Forced mate in %d. Follow the line.",
+        "There's a mate in %d here. Take your time.",
+        "Mate in %d. Keep the checks coming.",
+        "Mate in %d. Stay accurate and it's over.",
+        "Forced mate in %d. No need to rush.",
+        "Mate in %d. Don't let the king out.",
     )
 
     private val GETTING_MATED_LINES = arrayOf(
-        "Forced mate against you.",
-        "You're getting mated.",
-        "They have mate. Delay it.",
-        "Mate is coming. Defend longest.",
-        "Lost. Make them prove it.",
-        "No defense. Set a trap.",
+        "Forced mate against you. Play the longest defense.",
+        "You're getting mated. Make them find every move.",
+        "They have a forced mate. Delay it and hope.",
+        "Mate is coming. Set a trap on the way.",
+        "This is lost. Make them prove it.",
     )
 
     private val OPPONENT_BLUNDER_LINES = arrayOf(
-        "Blunder. Punish it.",
-        "They blundered.",
-        "They hung it. Take.",
-        "Blunder. Collect.",
-        "Free material. Take it.",
-        "They cracked. Punish.",
-        "Blunder. Find the win.",
-        "That loses. Punish it.",
-        "Big error. Cash in.",
+        "They blundered. Punish it.",
+        "That was a blunder. Take what they gave you.",
+        "They just hung material. Collect it.",
+        "Blunder by them. Find the win.",
+        "They cracked. Don't let them off.",
+        "Big mistake by them. Cash in now.",
+        "That loses for them. Play it accurately.",
+        "They blundered. Look for the forcing move.",
+        "Free material on offer. Take it.",
     )
 
     private val OPPONENT_MISTAKE_LINES = arrayOf(
-        "Mistake. Press.",
-        "They slipped. Punish it.",
-        "Mistake. Take the initiative.",
-        "Loose move. Press now.",
-        "They erred. Make it count.",
-        "Mistake. Look for tactics.",
-        "Weak defense. Push.",
-        "An opening. Use it.",
+        "They slipped. Press the advantage.",
+        "Mistake by them. Make it count.",
+        "That was loose. Take the initiative.",
+        "They left an opening. Use it.",
+        "Mistake by them. Look for tactics.",
+        "Not their best. Push while you can.",
+        "They erred. Punish it before they regroup.",
+        "That was a slip. Your chance to take over.",
     )
 
     private val OPPONENT_INACCURACY_LINES = arrayOf(
-        "Small slip. Press.",
-        "Inaccuracy. Keep the pressure.",
-        "Slightly off. Take the initiative.",
-        "Soft move. Improve your position.",
-        "They drifted. Squeeze.",
-        "Inaccurate. Grab space.",
-        "Small edge. Build on it.",
+        "Small slip by them. Keep the pressure on.",
+        "Slightly inaccurate. Take the initiative.",
+        "They drifted a little. Squeeze.",
+        "Soft move from them. Improve your position.",
+        "Not their best. Grab some space.",
+        "A small edge for you. Build on it.",
+        "They got loose. Tighten the grip.",
     )
 
     private val OPPONENT_BRILLIANT_LINES = arrayOf(
-        "Strong move. Defend carefully.",
-        "Good move by them. Stay calm.",
-        "Sharp. Calculate before replying.",
-        "Strong. Don't panic.",
-        "They found it. Dig in.",
-        "Dangerous. Check the threats.",
-        "Respect that. Defend.",
+        "Strong move by them. Defend carefully.",
+        "They found something sharp. Stay calm.",
+        "Good move by them. Calculate before you reply.",
+        "That was strong. Don't panic, just think.",
+        "They found the best idea. Dig in.",
+        "Dangerous move. Check every threat first.",
+        "Credit to them. Now defend accurately.",
     )
 
     private val SACRIFICE_LINES = arrayOf(
-        "Sacrifice the %s.",
-        "Sac the %s.",
-        "Give up the %s.",
-        "%s sacrifice. It works.",
-        "Sac the %s. Attack.",
-        "Offer the %s.",
-        "Sac the %s. It's sound.",
-        "Sac the %s for the attack.",
-        "%s sacrifice. Calculate it.",
+        "Sacrifice the %s. It's sound.",
+        "Sac the %s. The attack is worth more.",
+        "Give up the %s. It looks risky, but it wins.",
+        "%s sacrifice. Calculate it, then play it.",
+        "Sac the %s for the initiative.",
+        "Let the %s go. You get more back.",
+        "Sacrifice the %s. Trust the calculation.",
+        "The %s sacrifice works. Play it.",
     )
 
     // Args are (mover, captured).
-    private val SACRIFICE_CAPTURE_LINES = SACRIFICE_LINES + "Give the %s for the %s."
+    private val SACRIFICE_CAPTURE_LINES = SACRIFICE_LINES + "Give the %s for the %s. It works."
 
     private val BIG_CAPTURE_LINES = arrayOf(
-        "Take the %s.",
-        "Free %s. Take it.",
-        "Hanging %s. Take.",
-        "The %s is loose. Take.",
-        "Win the %s.",
-        "Undefended %s. Capture.",
-        "Take the %s. It's free.",
-        "Grab the %s.",
+        "Their %s is hanging. Take it.",
+        "Free %s. Nothing defends it.",
+        "The %s is undefended. Capture it.",
+        "Take the %s. They can't recapture.",
+        "Hanging %s. Win it now.",
+        "They left the %s loose. Take it.",
+        "Win the %s. It's completely free.",
     )
 
     private val FREE_PIECE_LINES = arrayOf(
-        "Free %s.",
-        "Take the %s.",
-        "Loose %s. Take it.",
-        "Hanging %s.",
-        "Win the %s.",
-        "Undefended %s. Take.",
-        "Collect the %s.",
-        "The %s hangs. Take.",
+        "Free %s. Take it.",
+        "The %s is undefended. Collect it.",
+        "Nobody guards the %s. Take it.",
+        "Loose %s. Win it.",
+        "They left the %s hanging. Capture it.",
+        "Take the %s. They can't take back.",
+        "Hanging %s. Don't miss it.",
+        "The %s is free. Grab it.",
     )
 
     // Args are (mover, captured).
     private val WINNING_CAPTURE_LINES = arrayOf(
-        "%s takes %s. Wins material.",
-        "Take the %2\$s. You come out ahead.",
-        "Win the %2\$s.",
-        "%s takes %s. Favorable trade.",
-        "Capture the %2\$s. Good trade.",
+        "%s takes %s. You win material.",
+        "Take the %2\$s with the %1\$s. You come out ahead.",
+        "Win the %2\$s. Whatever they take back is worth less.",
+        "%s for the %s is a good trade.",
+        "Capture the %2\$s. Good trade, you're up material.",
     )
 
     private val CHECK_LINES = arrayOf(
-        "Check with the %s.",
-        "%s check.",
-        "Check. Keep the initiative.",
-        "%s check. Force the king.",
-        "Check. Drive the king out.",
-        "Give check with the %s.",
+        "Check with the %s. Keep the initiative.",
+        "%s check. Force the king to move.",
+        "Give check with the %s. Keep them busy.",
+        "%s check. Drive the king out.",
+        "Check with the %s. Don't give them time.",
+        "%s check first. Then see what's loose.",
     )
 
     // Args are (mover, captured).
     private val CAPTURE_LINES = arrayOf(
-        "%s takes %s.",
-        "Take the %2\$s.",
-        "Capture the %2\$s.",
-        "Take with the %1\$s.",
-        "Take it.",
+        "%s takes %s. Simple and good.",
+        "Take the %2\$s with the %1\$s.",
+        "Capture the %2\$s. Nothing more to it.",
+        "%s takes the %s. Keep it clean.",
+        "Take the %2\$s. No need to complicate.",
     )
 
     private val CASTLE_LINES = arrayOf(
-        "Castle now.",
-        "Castle.",
-        "Castle. King safety.",
-        "Get the king safe. Castle.",
-        "Castle. Connect the rooks.",
-        "Castle before attacking.",
-        "Tuck the king away.",
+        "Castle now. Get the king safe.",
+        "Castle. The king is safer and the rook joins in.",
+        "Castle before you attack.",
+        "Tuck the king away. Then connect the rooks.",
+        "Castle. King safety comes first.",
+        "Get the king out of the center. Castle.",
+        "Castle now. The attack can wait a move.",
     )
 
     private val PROMOTION_LINES = arrayOf(
-        "Promote.",
-        "Queen the pawn.",
-        "Push. New queen.",
-        "Promote to a queen.",
-        "Queen it.",
-        "Promote now.",
+        "Promote the pawn. New queen.",
+        "Push it home and take a queen.",
+        "Promote to a queen. Play it now.",
+        "Queen the pawn. Don't wait.",
+        "Promotion. Take the new queen.",
+        "The pawn goes through. Make a queen.",
     )
 
     private val UNDERPROMOTION_LINES = arrayOf(
-        "Promote to a %s.",
-        "Underpromote to a %s.",
-        "Take a %s, not a queen.",
-        "Make it a %s.",
+        "Promote to a %s, not a queen.",
+        "Underpromote to a %s. The queen is wrong here.",
+        "Make it a %s. That's the accurate move.",
+        "Take a %s instead of a queen. It's stronger.",
     )
 
     private val WINNING_BIG_LINES = arrayOf(
-        "Winning. Trade down.",
-        "Trade down. You're winning.",
-        "Winning. Simplify.",
-        "Convert. No risks.",
-        "Winning. Check their threats.",
-        "Trade pieces, not pawns.",
-        "Keep it simple.",
-        "Winning. Don't rush.",
-        "Ahead. Trade pieces.",
-        "Winning. Stay careful.",
+        "You're winning. Trade down.",
+        "Big advantage. Simplify and convert.",
+        "Winning position. Trade pieces, not pawns.",
+        "You're well ahead. Check their threats, then cash in.",
+        "Winning. Keep it simple and safe.",
+        "Ahead by a lot. Don't rush it.",
+        "This is won if you stay careful.",
+        "You're winning. No risks needed.",
+        "Trade down. Every exchange helps you.",
+        "Winning. Play clean, boring moves.",
     )
 
     private val LOSING_BIG_LINES = arrayOf(
-        "Losing. Complicate.",
-        "Behind. Keep pieces on.",
-        "Defend. Set traps.",
-        "Tough. Find counterplay.",
-        "Don't trade. Create threats.",
-        "Behind. Stay active.",
+        "Tough position. Look for counterplay.",
+        "You're behind. Keep pieces on the board.",
+        "Losing, not lost. Set some traps.",
+        "Difficult. Play the toughest defense.",
+        "Behind. Avoid trades and create threats.",
+        "Make them work for it. Stay active.",
+        "Down a lot. Complicate the position.",
         "Hold on. Look for tricks.",
-        "Losing. Make it messy.",
-        "Fight. Seek counterplay.",
+        "Keep it messy. Simple positions lose here.",
     )
 
     private val EQUAL_LINES = arrayOf(
-        "Equal. Stay solid.",
-        "Level. Improve your worst piece.",
-        "Equal. No rush.",
-        "Balanced. Be patient.",
-        "Even. Find a plan.",
-        "Equal. Watch for tactics.",
-        "Level game. Play accurately.",
-        "Equal. Build slowly.",
+        "Equal position. Play accurately.",
+        "Level game. Improve your worst piece.",
+        "Balanced. Be patient and find a plan.",
+        "Even game. One mistake decides it.",
+        "Equal. Stay solid and watch for tactics.",
+        "Nothing in it. Build slowly.",
+        "Level. No rush, keep improving.",
+        "Equal position. Look for a small edge.",
     )
 
     private val BEST_MOVE_LINES = arrayOf(
-        "Play the %s.",
-        "Move the %s.",
-        "%s move. Best.",
-        "Best is the %s.",
-        "%s move. Keep control.",
-        "Go with the %s.",
-        "The %s. Stay on plan.",
+        "Play the %s. This is the move.",
+        "The %s move is best here.",
+        "Move the %s. It keeps control.",
+        "Best is the %s. Stay on plan.",
+        "Go with the %s. No second-guessing.",
+        "The %s. It keeps everything together.",
+        "%s move. Clean and correct.",
     )
 
     private val DEFAULT_LINES = arrayOf(
-        "Play the %s.",
-        "Move the %s.",
-        "Improve the %s.",
-        "%s move.",
-        "Activate the %s.",
-        "Quiet %s move.",
-        "Reposition the %s.",
-        "The %s. Solid.",
+        "Play the %s here. Solid move.",
+        "Move the %s. Nothing flashy, just correct.",
+        "Improve the %s. Small moves add up.",
+        "Bring the %s into the game.",
+        "Reposition the %s. It's better placed there.",
+        "Quiet %s move. Build the position.",
+        "The %s move keeps things solid.",
+        "Play the %s. Keep improving.",
     )
 
     // -------------------------------------------------------------------------------------
@@ -1460,180 +1441,176 @@ object MoveCommentary {
     // Reactions to the user's own move, by classification (see feedbackLines).
 
     private val BRILLIANT_LINES = arrayOf(
-        "Brilliant.",
-        "Brilliant find.",
-        "Brilliant. Well calculated.",
-        "Outstanding move.",
-        "Brilliant. Deep idea.",
-        "Exceptional.",
-        "Brilliant. Hard to see.",
-        "Master-level move.",
-        "Brilliant. Exactly right.",
+        "Brilliant. That was hard to see.",
+        "Brilliant move. Well calculated.",
+        "Brilliant find. Not many see that.",
+        "Outstanding. That's a deep idea.",
+        "Brilliant. Exactly the right moment.",
+        "Excellent calculation. Brilliant move.",
+        "Brilliant. That's master-level play.",
+        "Great vision. A brilliant move.",
+        "Brilliant. The engine agrees.",
     )
 
     private val GREAT_LINES = arrayOf(
-        "Great move.",
-        "Only move. Found it.",
-        "Great find.",
-        "Strong. That was critical.",
-        "Great. Well spotted.",
-        "Precise.",
-        "Great move. Key moment.",
-        "Sharp. Well played.",
-        "Exactly. Nothing else worked.",
+        "Great move. That was the critical moment.",
+        "Only move, and you found it.",
+        "Great find. Everything else was worse.",
+        "Strong. That swung it your way.",
+        "Great move. Well spotted.",
+        "Precise. That was the one.",
+        "Great move under pressure.",
+        "Sharp. Nothing else worked.",
+        "Great find. Good pattern recognition.",
     )
 
     private val BEST_LINES = arrayOf(
-        "Best move.",
-        "Correct.",
-        "Good.",
-        "Best. Keep going.",
-        "Right move.",
-        "Accurate.",
-        "That's it.",
-        "Exactly.",
-        "Best. Carry on.",
+        "Best move. Keep going.",
+        "Correct. That's the engine's choice.",
+        "Good. That's the top move.",
+        "Right move. Nothing to add.",
+        "Accurate. Carry on.",
+        "That's it. Best on the board.",
+        "Exactly right. Keep it up.",
+        "Best move. Stay on plan.",
     )
 
     private val EXCELLENT_LINES = arrayOf(
-        "Excellent.",
-        "Very good.",
-        "Strong move.",
-        "Nearly best. Fine.",
-        "Excellent. Carry on.",
-        "Good choice.",
-        "That works.",
-        "Solid and strong.",
+        "Excellent. Nearly the best move.",
+        "Very good. Tiny difference from best.",
+        "Strong move. That works.",
+        "Excellent choice. Carry on.",
+        "Good. Almost perfect.",
+        "That works well. Keep going.",
+        "Excellent. Solid and strong.",
     )
 
     private val GOOD_LINES = arrayOf(
-        "Good.",
-        "Solid.",
-        "Fine.",
-        "That works.",
-        "Good move.",
-        "Reasonable.",
-        "Sound.",
-        "Playable. Keep building.",
+        "Good. Solid move.",
+        "That works. Nothing wrong with it.",
+        "Fine move. Keep building.",
+        "Reasonable. The position holds.",
+        "Good move. No harm done.",
+        "Sound. Carry on.",
+        "Solid. Good chess is mostly this.",
+        "Good enough. Stay focused.",
     )
 
     private val BOOK_LINES = arrayOf(
-        "Book.",
-        "Theory.",
-        "Book move.",
-        "Main line.",
-        "Still theory.",
-        "Known position.",
+        "Book move. Still theory.",
+        "Theory. You know the opening.",
+        "Main line. Good.",
+        "Still in book. Keep developing.",
+        "Book. Standard opening play.",
+        "Known position. Carry on.",
     )
 
     private val INACCURACY_LINES = arrayOf(
-        "Inaccuracy.",
-        "Hmm. There was better.",
-        "Slightly off.",
-        "Imprecise.",
-        "Inaccurate. Look deeper.",
-        "Not the best.",
-        "Small slip.",
-        "Inaccuracy. Slow down.",
-        "There was a stronger move.",
+        "Inaccuracy. There was something stronger.",
+        "Hmm. There was a better move.",
+        "Slightly off. Nothing serious.",
+        "Imprecise. Look a bit deeper.",
+        "Small slip. The position still holds.",
+        "Not the best. Slow down a touch.",
+        "Inaccuracy. You left something on the table.",
+        "Playable, but there was better.",
+        "A bit loose. Tighten up.",
     )
 
     private val MISTAKE_LINES = arrayOf(
-        "Mistake.",
-        "That's a mistake.",
-        "Mistake. Check their threats.",
-        "Wrong move.",
-        "That costs you.",
-        "Mistake. Tighten up.",
-        "Careless.",
-        "Mistake. Calculate first.",
-        "No. There was better.",
+        "Mistake. That costs you.",
+        "That's a mistake. Check their threats first.",
+        "Mistake. There was a much better move.",
+        "Wrong move. Tighten up from here.",
+        "Careless. Calculate before you move.",
+        "Mistake. The position got worse.",
+        "That hurt your position. Regroup.",
+        "No. There was better. Reset and focus.",
+        "Mistake. Look at their reply before moving.",
     )
 
     private val MISS_LINES = arrayOf(
-        "Missed it.",
-        "Missed a tactic.",
-        "Miss. Check captures first.",
-        "Missed chance.",
-        "Miss. Look for forcing moves.",
-        "There was a tactic.",
-        "Missed. Checks, captures, threats.",
-        "Opportunity gone.",
-        "Miss. Slow down.",
+        "You missed a tactic there.",
+        "Missed chance. Check captures first.",
+        "There was a tactic. Look for forcing moves.",
+        "Missed it. Checks, captures, threats, every move.",
+        "A shot was there. Stay alert for the next.",
+        "Missed opportunity. Slow down and look.",
+        "You let them off the hook.",
+        "There was more in the position. Look deeper.",
     )
 
     private val BLUNDER_LINES = arrayOf(
-        "Blunder.",
-        "That's a blunder.",
-        "Blunder. Defend now.",
-        "Blunder. Check before moving.",
-        "Serious error.",
-        "Blunder. Damage control.",
-        "That loses.",
-        "Blunder. Reset and defend.",
-        "Bad. Look at their reply.",
+        "Blunder. That changes the game.",
+        "That's a blunder. Find the best defense.",
+        "Blunder. Check their reply before you move.",
+        "Serious error. Damage control now.",
+        "Blunder. Take a breath and defend.",
+        "That was a blunder. Stay in the game.",
+        "Bad move. Look at what they have now.",
+        "Blunder. Reset and fight on.",
+        "That hurts. Make it hard for them.",
     )
 
     private val TIME_PRESSURE_LINES = arrayOf(
-        "Low time. Move.",
-        "Play it. Hit the clock.",
-        "No time. Keep it simple.",
-        "Move now.",
-        "Clock. Safe moves only.",
-        "Low time. Don't hang anything.",
-        "Quick. Play the move.",
-        "Time. Just play.",
+        "Low on time. Play it and hit the clock.",
+        "No time to calculate. Keep it simple.",
+        "Clock is running. Safe moves only.",
+        "Short on time. Don't hang anything.",
+        "Move now. Play the arrow.",
+        "Time trouble. Simple and safe.",
+        "Seconds left. Just play the move.",
+        "Low time. Trust the move and go.",
     )
 
     private val THREAT_MATE_LINES = arrayOf(
-        "They have mate.",
-        "Forced mate against you.",
-        "Mate threat. Defend.",
-        "They mate. Delay it.",
+        "They have a forced mate. Brace for it.",
+        "Mate threat against you. Longest defense.",
+        "They have mate. Make them find it.",
+        "Forced mate for them. Delay it.",
     )
 
     private val USER_MATES_LINES = arrayOf(
-        "Mate in %d.",
-        "You have mate in %d.",
-        "Mate in %d. Stay precise.",
-        "Forced mate in %d.",
-        "Mate in %d. Finish it.",
-        "Mate in %d. Checks only.",
+        "You have mate in %d. Stay precise.",
+        "Mate in %d for you. Don't rush.",
+        "Forced mate in %d. Checks only.",
+        "Mate in %d. Finish it cleanly.",
+        "They're done. Mate in %d.",
+        "Mate in %d. Calculate, then play.",
     )
 
     private val THREAT_BIG_CAPTURE_LINES = arrayOf(
-        "Your %s hangs.",
-        "Watch your %s.",
-        "They take the %s.",
-        "Your %s is loose.",
-        "Your %s is attacked.",
+        "Your %s is hanging. They can take it.",
+        "Watch your %s. It isn't safe there.",
+        "They threaten your %s. Be ready.",
+        "Your %s is under attack. Expect them to take.",
     )
 
     private val THREAT_TRADE_LINES = arrayOf(
-        "Expect a %s trade.",
-        "They trade the %s. Recapture.",
-        "They take the %s. Take back.",
-        "%s trade coming. Recapture.",
+        "Expect them to take the %s. You can take back.",
+        "They'll trade on the %s. Recapture.",
+        "A %s trade is coming. Nothing to fear.",
+        "They can swap off the %s. Be ready to recapture.",
     )
 
     private val THREAT_CHECK_LINES = arrayOf(
-        "%s check coming.",
-        "Expect a %s check.",
-        "Watch the %s check.",
-        "Their %s gives check.",
+        "Expect a %s check. Stay calm.",
+        "%s check is coming. Have your reply ready.",
+        "Their %s is about to give check.",
+        "Watch for the %s check next.",
     )
 
     private val THREAT_CAPTURE_LINES = arrayOf(
-        "They take the %s.",
-        "Your %s is under attack.",
-        "Watch the %s.",
-        "Expect them to take the %s.",
+        "They'll probably take the %s.",
+        "Your %s is under attack. Watch it.",
+        "Expect them to take the %s next.",
+        "The %s is likely coming off.",
     )
 
     private val OPPONENT_REPLY_LINES = arrayOf(
-        "Expect a %s move.",
-        "Watch their %s.",
-        "Their %s moves next.",
-        "Likely reply: the %s.",
+        "Expect a %s move from them.",
+        "Watch their %s. It's their best reply.",
+        "They'll likely answer with the %s.",
+        "Their best reply uses the %s.",
     )
 }
