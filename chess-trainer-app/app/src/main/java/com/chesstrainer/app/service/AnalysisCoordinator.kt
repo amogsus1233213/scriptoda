@@ -1838,8 +1838,11 @@ class AnalysisCoordinator(
         } else {
             generated
         }
-        suggestions[0] = best.copy(commentary = commentary)
-        // Forced mate only: the user's later moves of the mating line, as numbered waypoints.
+        // Forced mate by the user: the best arrow is move 1 of the numbered sequence, so the
+        // overlay badges its source piece with "1". Any other line keeps step 0 (no numbering).
+        val mateStep = if (moverMate != null && moverMate > 0) 1 else 0
+        suggestions[0] = best.copy(commentary = commentary, step = mateStep)
+        // Forced mate only: the user's later moves of the mating line, numbered 2, 3, ...
         suggestions += premoveLines(bestAnalysis, best, sign)
 
         postMultiSuggestion(suggestions, flipped)
@@ -1857,9 +1860,12 @@ class AnalysisCoordinator(
      * be drawn with their number. The PV alternates user move, opponent reply, ..., so the
      * user's moves sit at the even indices.
      *
-     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]) in gold,
-     * as waypoints on the destination squares: the start square of a later move is often still
-     * empty on the board, so an arrow from it would mislead.
+     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]) in gold.
+     * Each line carries both squares of its UCI move: `from` is the piece to move (the overlay
+     * numbers it with `step`), `to` is where it goes. `step` runs 2, 3, ...; step 1 is the best
+     * arrow itself, set in [render]. Note that `from` is the square in the position after the
+     * earlier moves: a piece that moves twice in the mate has its later `from` on the earlier
+     * move's `to`, which may be empty on the current board.
      * Any other line shows no follow-up moves at all: numbered steps are reserved for forced
      * mates, so an ordinary suggestion is just its one arrow.
      * @param sign +1 if the user (side to move) is white, -1 if black
@@ -2145,8 +2151,13 @@ class AnalysisCoordinator(
         val rank: Int,
         /** Short coach commentary; only set on the best line. */
         val commentary: String = "",
-        /** 1 = the move to play now; 2, 3, ... = the user's later moves of the same line. */
-        val step: Int = 1,
+        /**
+         * Place in a forced mate the user delivers: 1 = the move to play now, 2, 3, ... = the
+         * user's later moves of that mate. 0 = not part of a mate sequence (ordinary arrow).
+         * For every step >= 1, [from] is the piece to move (where the overlay puts the number)
+         * and [to] is where it goes.
+         */
+        val step: Int = 0,
     )
 
     private data class InferredMove(
