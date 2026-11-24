@@ -989,6 +989,10 @@ class ArrowView(
         const val MATE_PREMOVE_SCALE = 0.7f
         /** Diameter of the order number on a piece of a forced-mate sequence. */
         const val STEP_BADGE_DP = 19f
+        /** Dark disc behind the order number on a forced-mate arrow: 22dp across. */
+        const val ARROW_STEP_RADIUS_DP = 11f
+        const val ARROW_STEP_BACKDROP_ALPHA = 180
+        const val ARROW_STEP_TEXT_SP = 14f
         /** Premove arrows of an ordinary plan: about 30% opacity. */
         const val PREMOVE_PLAN_ALPHA = 77
         const val PREMOVE_BADGE_DP = 16f
@@ -1086,6 +1090,21 @@ class ArrowView(
         color = Color.parseColor("#1B1B1B")
         textAlign = Paint.Align.CENTER
         typeface = Typeface.DEFAULT_BOLD
+    }
+
+    // Order number on the body of a forced-mate arrow: white bold digit on a dark disc.
+    private val arrowStepBackdropPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#1B1B1B")
+        alpha = ARROW_STEP_BACKDROP_ALPHA
+    }
+    private val arrowStepTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+        textSize = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_SP, ARROW_STEP_TEXT_SP, context.resources.displayMetrics,
+        )
     }
 
     private val matePillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -1265,6 +1284,8 @@ class ArrowView(
         // 3-4. Solid colored shaft and arrowhead on top.
         canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
         canvas.drawPath(headPath, headPaint)
+
+        drawArrowStepNumber(canvas, arrow, start, end)
     }
 
     /**
@@ -1322,6 +1343,23 @@ class ArrowView(
         canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
         canvas.drawPath(headPath, headPaint)
         canvas.restoreToCount(saveCount)
+
+        drawArrowStepNumber(canvas, arrow, start, end)
+    }
+
+    /**
+     * Draws the order number of a forced-mate move ("1", "2", "3", ...) on the body of its own
+     * arrow: white and bold on a dark translucent disc, halfway between the move's start
+     * ([fromPt]) and destination ([toPt]). Called right after the arrow is drawn, so the number
+     * keeps its arrow's place in the z-order. Nothing is drawn for a move outside a forced mate.
+     */
+    private fun drawArrowStepNumber(canvas: Canvas, arrow: ArrowData, fromPt: PointF, toPt: PointF) {
+        if (!isMateStep(arrow)) return
+        val midX = (fromPt.x + toPt.x) / 2f
+        val midY = (fromPt.y + toPt.y) / 2f
+        canvas.drawCircle(midX, midY, ARROW_STEP_RADIUS_DP * density, arrowStepBackdropPaint)
+        val fm = arrowStepTextPaint.fontMetrics
+        canvas.drawText(arrow.step.toString(), midX, midY - (fm.ascent + fm.descent) / 2f, arrowStepTextPaint)
     }
 
     /**
