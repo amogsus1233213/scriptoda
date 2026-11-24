@@ -785,7 +785,7 @@ class ArrowView(
 
     private companion object {
         const val MAX_ARROWS = 5
-        val STYLE_RANK_1 = ArrowStyle(255, 0.14f, 0.40f, 0.22f, 22f)  // Best: fully opaque
+        val STYLE_RANK_1 = ArrowStyle(255, 0.19f, 0.48f, 0.28f, 22f)  // Best: fully opaque, thicker
         val STYLE_RANK_2 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_3 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_4 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)

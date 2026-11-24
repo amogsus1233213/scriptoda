@@ -9,9 +9,7 @@ import android.util.AtomicFile
 import android.util.Log
 import com.chesstrainer.app.engine.AnalysisResult
 import com.chesstrainer.app.engine.ClassifiedMove
-import com.chesstrainer.app.engine.MoveClass
 import com.chesstrainer.app.engine.MoveClassifier
-import java.util.EnumSet
 import com.chesstrainer.app.engine.MoveCommentary
 import com.chesstrainer.app.engine.StockfishEngine
 import com.chesstrainer.app.service.AccessibilityData
@@ -86,11 +84,6 @@ class AnalysisCoordinator(
 
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
-
-        private val NOTABLE_CLASSIFICATIONS = EnumSet.of(
-            MoveClass.BRILLIANT, MoveClass.GREAT, MoveClass.BLUNDER,
-            MoveClass.MISTAKE, MoveClass.MISS, MoveClass.INACCURACY,
-        )
 
         /**
          * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
@@ -1295,7 +1288,6 @@ class AnalysisCoordinator(
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         val flipped = !userIsWhite
         val usersTurn = whiteToMove == userIsWhite
-        val classified = lastClassified
 
         if (analyses.isNullOrEmpty()) {
             postOverlayClear()
@@ -1317,13 +1309,7 @@ class AnalysisCoordinator(
             val color: Int
             when {
                 rank == 1 -> {
-                    label = if (classified != null &&
-                        classified.classification in NOTABLE_CLASSIFICATIONS
-                    ) {
-                        classified.classification.displayName
-                    } else {
-                        "Best move"
-                    }
+                    label = "Best move"
                     color = MoveColors.BEST
                 }
                 else -> {
