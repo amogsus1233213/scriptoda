@@ -25,7 +25,13 @@ data class AnalysisResult(
     val eval: Int,              // centipawns from side-to-move POV
     val mate: Int?,             // moves to mate (positive = winning), null if no mate
     val depth: Int,
-    val pv: List<String>        // principal variation moves
+    val pv: List<String>,       // principal variation moves
+    /**
+     * How far the score of this line moved (max - min, centipawns) over the last few search
+     * depths. Small = the evaluation has settled, so the later PV moves can be trusted as a plan.
+     * Null when unknown (too few depths, a mate score, or not the best line).
+     */
+    val evalSwing: Int? = null,
 )
 
 /**
@@ -53,6 +59,8 @@ class StockfishEngine(private val binaryPath: String) {
         private const val QUIT_WAIT_MS = 1_000L
         private const val DESTROY_WAIT_MS = 500L
         private const val POLL_INTERVAL_MS = 100L
+        /** Number of final search depths compared by [AnalysisResult.evalSwing]. */
+        private const val SWING_DEPTHS = 4
 
         /** Sentinel pushed by the reader thread when the engine's stdout closes. */
         private val EOF_MARKER = String(charArrayOf('\u0000'))
@@ -210,6 +218,8 @@ class StockfishEngine(private val binaryPath: String) {
 
             val deadline = deadlineAfter(if (moveTimeMs > 0) moveTimeMs.toLong() + ANALYSIS_TIMEOUT_MS else ANALYSIS_TIMEOUT_MS)
             val infos = HashMap<Int, InfoLine>()
+            // Exact scores of the best line, one per depth, to tell how settled the eval is.
+            val bestLineHistory = ArrayList<InfoLine>()
             var bestMove: String? = null
 
             while (bestMove == null) {
@@ -218,6 +228,7 @@ class StockfishEngine(private val binaryPath: String) {
                     bestMove = line.split(WHITESPACE).getOrNull(1) ?: "(none)"
                 } else if (line.startsWith("info ")) {
                     val info = parseInfo(line) ?: continue
+                    recordBestLine(bestLineHistory, info)
                     val existing = infos[info.multiPv]
                     if (shouldReplace(existing, info)) infos[info.multiPv] = info
                 }
@@ -233,6 +244,7 @@ class StockfishEngine(private val binaryPath: String) {
                             bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
                         } else if (stopLine.startsWith("info ")) {
                             val info = parseInfo(stopLine) ?: continue
+                            recordBestLine(bestLineHistory, info)
                             val existing = infos[info.multiPv]
                             if (shouldReplace(existing, info)) infos[info.multiPv] = info
                         }
@@ -247,7 +259,7 @@ class StockfishEngine(private val binaryPath: String) {
                 }
             }
 
-            return buildResults(bestMove, infos)
+            return buildResults(bestMove, infos, bestLineHistory)
         }
     }
 
@@ -304,6 +316,27 @@ class StockfishEngine(private val binaryPath: String) {
         return candidate.pv.isNotEmpty() || existing.pv.isEmpty()
     }
 
+    /** Keeps the latest exact score of the best line (multipv 1) for each depth, in depth order. */
+    private fun recordBestLine(history: MutableList<InfoLine>, info: InfoLine) {
+        if (info.multiPv != 1 || info.isBound) return
+        val last = history.lastOrNull()
+        when {
+            last == null || info.depth > last.depth -> history.add(info)
+            info.depth == last.depth -> history[history.size - 1] = info
+            // A lower depth than the last one seen: stale or out of order, ignore.
+        }
+    }
+
+    /**
+     * Score range of the best line over its last [SWING_DEPTHS] depths, or null if that cannot
+     * be told (too few depths or a mate score among them).
+     */
+    private fun evalSwing(history: List<InfoLine>): Int? {
+        if (history.size < SWING_DEPTHS) return null
+        val scores = history.takeLast(SWING_DEPTHS).map { it.cp ?: return null }
+        return scores.max() - scores.min()
+    }
+
     private fun parseInfo(line: String): InfoLine? {
         val tokens = line.split(WHITESPACE)
         var depth: Int? = null
@@ -355,7 +388,11 @@ class StockfishEngine(private val binaryPath: String) {
         return InfoLine(d, multiPv, cp, mate, bound, pv)
     }
 
-    private fun buildResults(bestMoveToken: String, infos: Map<Int, InfoLine>): List<AnalysisResult> {
+    private fun buildResults(
+        bestMoveToken: String,
+        infos: Map<Int, InfoLine>,
+        bestLineHistory: List<InfoLine> = emptyList(),
+    ): List<AnalysisResult> {
         val bestMove = if (bestMoveToken == "(none)" || bestMoveToken == "0000") "" else bestMoveToken
 
         if (infos.isEmpty()) {
@@ -392,7 +429,8 @@ class StockfishEngine(private val binaryPath: String) {
                 eval = eval,
                 mate = info.mate,
                 depth = info.depth,
-                pv = pv
+                pv = pv,
+                evalSwing = if (index == 1) evalSwing(bestLineHistory) else null,
             )
         }
     }

@@ -12,6 +12,7 @@ import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -127,6 +128,11 @@ data class SuggestedLine(
     val labelColor: Int,
     val rank: Int,           // 1 = best move, 2 = second best, ... 5 = fifth best
     val commentary: String = "", // short coach comment, only shown for the best line
+    /**
+     * Place in the user's own move sequence: 1 = the move to play now, 2 and up = the user's
+     * later moves of the best line (premoves), drawn faded with their number.
+     */
+    val step: Int = 1,
 )
 
 private fun Context.dp(value: Float): Float =
@@ -310,7 +316,9 @@ class OverlayService : Service() {
 
     /** Shows up to five suggested lines (ordered by [SuggestedLine.rank]) as arrows + commentary. */
     fun showMultiSuggestion(lines: List<SuggestedLine>, isFlipped: Boolean) {
-        val snapshot = lines.sortedBy { it.rank }.take(maxSuggestedLines)
+        // Premove arrows (step > 1) belong to the best line and do not count as suggested lines.
+        val snapshot = lines.filter { it.step <= 1 }.sortedBy { it.rank }.take(maxSuggestedLines) +
+            lines.filter { it.step > 1 }.sortedBy { it.step }
         mainHandler.post {
             val wasEmpty = currentLines.isEmpty()
             currentLines = snapshot
@@ -607,7 +615,7 @@ class OverlayService : Service() {
                 // Suggestions are the user's own moves and the user sits at the bottom, so the
                 // user is white unless the board is flipped. mateIn is from white's POV.
                 val userMate = it.mateIn?.let { m -> if (currentFlipped) -m else m }?.takeIf { m -> m > 0 }
-                ArrowData(it.from, it.to, it.labelColor, it.rank, it.label, currentFlipped, userMate)
+                ArrowData(it.from, it.to, it.labelColor, it.rank, it.label, currentFlipped, userMate, it.step)
             },
         )
         // Text length may have changed the panel size; keep it on screen.
@@ -933,6 +941,12 @@ data class ArrowData(
     val isFlipped: Boolean,
     /** Moves until the mover delivers mate (> 0), or null when the move is not a forced mate. */
     val mateIn: Int? = null,
+    /**
+     * 1 = the move to play now (the normal arrow). 2, 3, ... = the user's later moves of the
+     * same line, drawn as faded, dashed premove arrows with this number at the tip. For those,
+     * a non-null [mateIn] marks a forced-mate sequence (clearer than an ordinary plan).
+     */
+    val step: Int = 1,
 )
 
 /**
@@ -959,6 +973,19 @@ class ArrowView(
 
     private companion object {
         const val MAX_ARROWS = 5
+        /** Most premove arrows (step 2 and up) drawn besides the [MAX_ARROWS] suggestions. */
+        const val MAX_PREMOVES = 4
+
+        /** Premove arrows of a forced mate: the 2nd move, then every later one. */
+        const val PREMOVE_MATE_ALPHA_2 = 100
+        const val PREMOVE_MATE_ALPHA_3 = 70
+        /** Premove arrows of an ordinary plan: about 30% opacity. */
+        const val PREMOVE_PLAN_ALPHA = 77
+        /** The number badge stays more readable than its arrow. */
+        const val PREMOVE_BADGE_ALPHA = 215
+        const val PREMOVE_BADGE_DP = 16f
+        /** Geometry of a premove arrow: the look of an alternative move, a little slimmer. */
+        val STYLE_PREMOVE = ArrowStyle(255, 0.12f, 0.36f, 0.20f, PREMOVE_BADGE_DP)
         val STYLE_RANK_1 = ArrowStyle(255, 0.19f, 0.48f, 0.28f, 22f)  // Best: fully opaque, thicker
         val STYLE_RANK_2 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_3 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
@@ -987,6 +1014,8 @@ class ArrowView(
     private var landscapeBounds: RectF? = null
 
     private var arrows: List<ArrowData> = emptyList()
+    /** The user's later moves of the best line, in step order; drawn beneath [arrows]. */
+    private var premoves: List<ArrowData> = emptyList()
 
     // Opponent move classification badge (shown on the square the opponent's piece landed on)
     private var opBadgeSquare: String? = null
@@ -1014,6 +1043,22 @@ class ArrowView(
     }
     private val layerBounds = RectF()
 
+    // Dashed shaft (and its outline) of a premove arrow; the dash pattern is set per draw.
+    private val premoveShaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val premoveBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.BLACK
+    }
+    private val premovePath = Path()
+    private var premoveDash: DashPathEffect? = null
+    private var premoveDashSquare = 0f
+    private val stepBadgePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val stepBadgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1B1B1B")
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
+
     private val matePillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val matePillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#1B1B1B")
@@ -1034,17 +1079,21 @@ class ArrowView(
         invalidate()
     }
 
-    /** Replaces all arrows. Only the five best-ranked arrows are drawn. */
+    /**
+     * Replaces all arrows. Only the five best-ranked arrows are drawn, plus up to
+     * [MAX_PREMOVES] premove arrows ([ArrowData.step] > 1).
+     */
     fun setArrows(arrows: List<ArrowData>) {
-        this.arrows = arrows
+        val all = arrows
             .map { it.copy(from = it.from.lowercase(Locale.ROOT), to = it.to.lowercase(Locale.ROOT)) }
-            .sortedBy { it.rank }
-            .take(MAX_ARROWS)
+        this.arrows = all.filter { it.step <= 1 }.sortedBy { it.rank }.take(MAX_ARROWS)
+        premoves = all.filter { it.step > 1 }.sortedBy { it.step }.take(MAX_PREMOVES)
         invalidate()
     }
 
     fun clearArrows() {
         arrows = emptyList()
+        premoves = emptyList()
         opBadgeSquare = null
         opBadgeLabel = null
         invalidate()
@@ -1077,8 +1126,11 @@ class ArrowView(
         val board = boardRectInView() ?: return
         val square = board.width() / 8f
         if (hasArrows) {
+            // Premoves first (last step lowest), so the moves to play now stay on top.
+            for (i in premoves.indices.reversed()) drawPremoveArrow(canvas, premoves[i], board, square)
             val drawOrder = arrows.sortedByDescending { it.rank }
             for (arrow in drawOrder) drawArrow(canvas, arrow, board, square)
+            for (i in premoves.indices.reversed()) drawStepBadge(canvas, premoves[i], i, board, square)
             for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
         }
         drawOpponentBadge(canvas, board, square)
@@ -1134,6 +1186,105 @@ class ArrowView(
         // 3-4. Solid colored shaft and arrowhead on top.
         canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
         canvas.drawPath(headPath, headPaint)
+    }
+
+    /**
+     * Draws a later move of the best line ([ArrowData.step] > 1): a dashed, faded arrow. The
+     * whole arrow (outline included) is composed opaque in one layer and faded once, so the
+     * dashes, the head and the outline do not show through each other.
+     */
+    private fun drawPremoveArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
+        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
+        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val dx = end.x - start.x
+        val dy = end.y - start.y
+        val length = hypot(dx, dy)
+        if (length < 1f) return
+
+        val style = STYLE_PREMOVE
+        val alpha = when {
+            arrow.mateIn == null -> PREMOVE_PLAN_ALPHA
+            arrow.step <= 2 -> PREMOVE_MATE_ALPHA_2
+            else -> PREMOVE_MATE_ALPHA_3
+        }
+        val color = withAlpha(arrow.color, 255)
+
+        val angle = atan2(dy, dx)
+        val headLength = min(square * style.headLengthFactor, length * 0.6f)
+        val headHalfWidth = square * style.headHalfWidthFactor
+        val baseX = end.x - headLength * cos(angle)
+        val baseY = end.y - headLength * sin(angle)
+        val shaftWidth = square * style.shaftFactor
+        val borderExtra = BORDER_EXTRA_DP * density * 0.6f
+
+        if (premoveDash == null || premoveDashSquare != square) {
+            premoveDash = DashPathEffect(floatArrayOf(square * 0.22f, square * 0.12f), 0f)
+            premoveDashSquare = square
+        }
+        premoveShaftPaint.pathEffect = premoveDash
+        premoveShaftPaint.strokeWidth = shaftWidth
+        premoveShaftPaint.color = color
+        premoveBorderPaint.pathEffect = premoveDash
+        premoveBorderPaint.strokeWidth = shaftWidth + borderExtra
+        borderHeadPaint.strokeWidth = borderExtra
+        headPaint.color = color
+
+        // Dashes run from the head back to the start, so a full dash always meets the head.
+        premovePath.reset()
+        premovePath.moveTo(baseX, baseY)
+        premovePath.lineTo(start.x, start.y)
+
+        val perpX = -sin(angle) * headHalfWidth
+        val perpY = cos(angle) * headHalfWidth
+        headPath.reset()
+        headPath.moveTo(end.x, end.y)
+        headPath.lineTo(baseX + perpX, baseY + perpY)
+        headPath.lineTo(baseX - perpX, baseY - perpY)
+        headPath.close()
+
+        val pad = max(headHalfWidth, shaftWidth) + borderExtra * 2f
+        layerBounds.set(
+            min(start.x, end.x) - pad,
+            min(start.y, end.y) - pad,
+            max(start.x, end.x) + pad,
+            max(start.y, end.y) + pad,
+        )
+        val saveCount = canvas.saveLayerAlpha(layerBounds, alpha)
+        canvas.drawPath(premovePath, premoveBorderPaint)
+        canvas.drawPath(headPath, borderHeadPaint)
+        canvas.drawPath(premovePath, premoveShaftPaint)
+        canvas.drawPath(headPath, headPaint)
+        canvas.restoreToCount(saveCount)
+    }
+
+    /**
+     * Draws the premove number ("2", "3", ...) in a small disc at the top-left corner of the
+     * destination square: at the arrow tip, yet clear of the classification badge, which sits at
+     * the top-right corner. A premove landing where an earlier one already has its number uses
+     * the bottom-left corner instead.
+     * @param index position of [arrow] in [premoves]
+     */
+    private fun drawStepBadge(canvas: Canvas, arrow: ArrowData, index: Int, board: RectF, square: Float) {
+        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val size = PREMOVE_BADGE_DP * density
+        if (size <= 0f) return
+        val half = size / 2f
+        val offset = square * 0.45f
+        val taken = (0 until index).any { premoves[it].to == arrow.to }
+        val cx = (end.x - offset).coerceIn(half, max(half, width - half))
+        val cy = (if (taken) end.y + offset else end.y - offset).coerceIn(half, max(half, height - half))
+
+        stepBadgePaint.style = Paint.Style.FILL
+        stepBadgePaint.color = withAlpha(arrow.color, PREMOVE_BADGE_ALPHA)
+        canvas.drawCircle(cx, cy, half, stepBadgePaint)
+        stepBadgePaint.style = Paint.Style.STROKE
+        stepBadgePaint.strokeWidth = 1.2f * density
+        stepBadgePaint.color = withAlpha(Color.parseColor("#1B1B1B"), PREMOVE_BADGE_ALPHA)
+        canvas.drawCircle(cx, cy, half, stepBadgePaint)
+
+        stepBadgeTextPaint.textSize = size * 0.72f
+        val fm = stepBadgeTextPaint.fontMetrics
+        canvas.drawText(arrow.step.toString(), cx, cy - (fm.ascent + fm.descent) / 2f, stepBadgeTextPaint)
     }
 
     private fun getCachedDrawable(resId: Int): Drawable? =

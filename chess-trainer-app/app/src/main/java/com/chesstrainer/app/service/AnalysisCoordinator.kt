@@ -2,6 +2,7 @@ package com.chesstrainer.app.service
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
@@ -100,6 +101,17 @@ class AnalysisCoordinator(
 
         /** Alternative lines worse than this (cp) are not drawn as arrows. */
         private const val QUALITY_CUTOFF_CP = 150
+
+        /** Extra user moves of a forced mate drawn as numbered premove arrows (after move 1). */
+        private const val MAX_MATE_PREMOVES = 4
+        /** Extra user moves of an ordinary best line drawn as faint "plan" arrows. */
+        private const val MAX_PLAN_PREMOVES = 2
+        /** A plan is only shown from a search at least this deep... */
+        private const val PLAN_MIN_DEPTH = 10
+        /** ...whose score moved by no more than this over its last depths (a settled eval). */
+        private const val PLAN_MAX_SWING_CP = 60
+        /** Neutral color of the plan arrows of a non-mate line. */
+        private val PLAN_COLOR = Color.parseColor("#E6E6E6")
 
         /**
          * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
@@ -1746,6 +1758,8 @@ class AnalysisCoordinator(
             generated
         }
         suggestions[0] = best.copy(commentary = commentary)
+        // The rest of the plan: the user's later moves of the best line, as numbered arrows.
+        suggestions += premoveLines(bestAnalysis, best, sign)
 
         postMultiSuggestion(suggestions, flipped)
         // Remember what is on screen so the same position is not re-analysed right away. The
@@ -1756,6 +1770,78 @@ class AnalysisCoordinator(
             shownAnalyses = analyses
         }
     }
+
+    /**
+     * The user's follow-up moves (2nd, 3rd, ...) from the principal variation behind [best], to
+     * be drawn as numbered premove arrows. The PV alternates user move, opponent reply, ..., so
+     * the user's moves sit at the even indices.
+     *
+     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]) in gold.
+     * Any other line shows at most [MAX_PLAN_PREMOVES] faint neutral arrows, and only when the
+     * evaluation has settled, as a line the engine is still changing its mind about is no plan.
+     * @param sign +1 if the user (side to move) is white, -1 if black
+     */
+    private fun premoveLines(
+        analysis: AnalysisResult?,
+        best: SuggestedLineData,
+        sign: Int,
+    ): List<SuggestedLineData> {
+        analysis ?: return emptyList()
+        val pv = analysis.pv
+        // The PV must be the line of the arrow on screen, not a leftover of another move.
+        if (pv.firstOrNull()?.startsWith(best.from + best.to) != true) return emptyList()
+
+        val mate = analysis.mate
+        val userMate = mate?.takeIf { it > 0 }
+        val count = when {
+            userMate != null -> minOf(userMate - 1, MAX_MATE_PREMOVES)
+            mate != null -> 0 // getting mated: nothing to plan
+            analysis.depth < PLAN_MIN_DEPTH -> 0
+            (analysis.evalSwing ?: Int.MAX_VALUE) > PLAN_MAX_SWING_CP -> 0
+            else -> MAX_PLAN_PREMOVES
+        }
+
+        val lines = ArrayList<SuggestedLineData>(count.coerceAtLeast(0))
+        for (step in 2..count + 1) {
+            val index = (step - 1) * 2
+            val move = pv.getOrNull(index) ?: break
+            if (!isUciMove(move) || !isUciMove(pv[index - 1])) break
+            // The very last move of a non-mate PV is the least searched; only show a planned
+            // move the engine has looked beyond.
+            if (userMate == null && index == pv.lastIndex) break
+            if (userMate != null) {
+                // Mate distance left once the earlier moves are played, so the last arrow is M1.
+                val left = userMate - (step - 1)
+                lines += SuggestedLineData(
+                    from = move.substring(0, 2),
+                    to = move.substring(2, 4),
+                    evalCp = best.evalCp,
+                    mateIn = left * sign,
+                    label = mateLabel(left),
+                    labelColor = MoveColors.MATE,
+                    rank = 1,
+                    step = step,
+                )
+            } else {
+                lines += SuggestedLineData(
+                    from = move.substring(0, 2),
+                    to = move.substring(2, 4),
+                    evalCp = best.evalCp,
+                    mateIn = null,
+                    label = "Plan",
+                    labelColor = PLAN_COLOR,
+                    rank = 1,
+                    step = step,
+                )
+            }
+        }
+        return lines
+    }
+
+    /** True for a well-formed UCI move such as "e2e4" or "e7e8q". */
+    private fun isUciMove(move: String): Boolean =
+        move.length in 4..5 && squareIndex(move.substring(0, 2)) != null &&
+            squareIndex(move.substring(2, 4)) != null
 
     /** Arrow label for a forced mate in [moves] by the side to move. */
     private fun mateLabel(moves: Int): String = if (moves == 1) "Mate in 1!" else "Mate in $moves"
@@ -1776,6 +1862,7 @@ class AnalysisCoordinator(
                         labelColor = s.labelColor,
                         rank = s.rank,
                         commentary = s.commentary,
+                        step = s.step,
                     )
                 }
                 overlay.showMultiSuggestion(lines, flipped)
@@ -1997,6 +2084,8 @@ class AnalysisCoordinator(
         val rank: Int,
         /** Short coach commentary; only set on the best line. */
         val commentary: String = "",
+        /** 1 = the move to play now; 2, 3, ... = the user's later moves of the same line. */
+        val step: Int = 1,
     )
 
     private data class InferredMove(
