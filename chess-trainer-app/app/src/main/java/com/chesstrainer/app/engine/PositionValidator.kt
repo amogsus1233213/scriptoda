@@ -15,13 +15,17 @@ object PositionValidator {
     private val WHITESPACE = Regex("\\s+")
 
     /**
-     * Returns why [fen] must not be sent to the engine, or null when it is well formed:
-     * six fields, a side to move of "w" or "b", eight ranks of exactly eight squares made of
-     * known piece letters, and exactly one king per side.
+     * Returns why [fen] must not be sent to the engine, or null when it is usable: a placement
+     * and a side to move of "w" or "b" (the castling, en passant and counter fields may be
+     * missing, the engine defaults them), eight ranks of exactly eight squares made of known
+     * piece letters, and exactly one king per side.
+     *
+     * Only positions the engine cannot search are rejected here. Anything merely suspicious must
+     * be logged by the caller and analysed anyway: a rejected position shows the user nothing.
      */
     fun fenError(fen: String): String? {
         val parts = fen.trim().split(WHITESPACE)
-        if (parts.size != 6) return "expected 6 fields, found ${parts.size}"
+        if (parts.size < 2 || parts.size > 6) return "expected 2 to 6 fields, found ${parts.size}"
         val side = parts[1]
         if (side != "w" && side != "b") return "side to move is '$side', expected 'w' or 'b'"
 
@@ -60,7 +64,8 @@ object PositionValidator {
     /**
      * Returns why [move] cannot be the engine's answer for [fen], or null when it is plausible:
      * four or five characters, valid from/to squares, an optional promotion letter, and a piece
-     * of the side to move on the from-square that does not land on one of its own pieces.
+     * of the side to move on the from-square that lands neither on one of its own pieces nor on
+     * a king (the engine only "captures" a king in a position with the wrong side to move).
      *
      * This is not a full legality check; it is meant to catch a bestmove that belongs to another
      * position. [fen] must be the position the move is played in.
@@ -84,6 +89,7 @@ object PositionValidator {
         if (target != null && target.isUpperCase() == piece.isUpperCase()) {
             return "own piece on ${m.substring(2, 4)}"
         }
+        if (target != null && target.lowercaseChar() == 'k') return "captures the king on ${m.substring(2, 4)}"
         if (m.length == 5 && piece.lowercaseChar() != 'p') return "promotion by a non-pawn"
         return null
     }

@@ -510,9 +510,11 @@ class AnalysisCoordinator(
     }
 
     /**
-     * False (and logged) when [fen] must not be analysed: it is malformed
-     * ([PositionValidator.fenError]) or the side not to move is in check, which means the side to
-     * move is wrong. Either way the engine would return garbage that must not be shown.
+     * False (and logged) only when [fen] cannot be searched at all: it is malformed
+     * ([PositionValidator.fenError]). Skipping a position leaves the user without arrows, so
+     * anything that is merely suspicious is logged and analysed anyway. That includes the side
+     * not to move being in check (a wrongly tracked side to move): [resyncTo] corrects it where
+     * it can, and an engine answer that takes the king is dropped by [validatedAnalyses].
      */
     private fun isAnalyzable(fen: String): Boolean {
         val error = PositionValidator.fenError(fen)
@@ -521,8 +523,7 @@ class AnalysisCoordinator(
             return false
         }
         if (PositionValidator.sideNotToMoveInCheck(fen)) {
-            Log.w(TAG, "Skipping analysis, side not to move is in check (wrong side to move?): $fen")
-            return false
+            Log.w(TAG, "Side not to move is in check (wrong side to move?), analysing anyway: $fen")
         }
         return true
     }
@@ -675,6 +676,7 @@ class AnalysisCoordinator(
             Log.e(TAG, "Multi-PV analysis failed for $fen", ex)
             null
         }
+        if (raw.isNullOrEmpty()) Log.w(TAG, "Engine returned no analysis (ready=${e.isReady()}) for $fen")
         val analyses = validatedAnalyses(fen, raw)
         checkEvalSanity(fen, analyses?.firstOrNull())
         return analyses
@@ -1540,9 +1542,10 @@ class AnalysisCoordinator(
         // The move that led here is unknown, so a reaction to an earlier move no longer applies.
         postClearCoachMessage()
         var fen = composeFen(placement, sideToMove, castlingRights, null, fullMoveNumber)
-        // Without a move-list side to move, sideToMove is a fallback. If it leaves the other
-        // side in check the position is impossible, and the turn must be the other side's.
-        if (AccessibilityData.whiteToMove == null && PositionValidator.sideNotToMoveInCheck(fen)) {
+        // If sideToMove leaves the other side in check the position is impossible, and the turn
+        // must be the other side's. This holds whatever the source: the board is exact, while
+        // the move list it is read next to can lag one ply behind it.
+        if (PositionValidator.sideNotToMoveInCheck(fen)) {
             val other = composeFen(placement, !sideToMove, castlingRights, null, fullMoveNumber)
             if (!PositionValidator.sideNotToMoveInCheck(other)) {
                 Log.w(TAG, "Resync: ${if (sideToMove) "black" else "white"} is in check, so it " +
@@ -1740,10 +1743,13 @@ class AnalysisCoordinator(
         suggestions[0] = best.copy(commentary = commentary)
 
         postMultiSuggestion(suggestions, flipped)
-        // Remember what is on screen so the same position is not re-analysed right away.
-        shownKey = positionKey(fen)
-        shownAtMs = SystemClock.elapsedRealtime()
-        shownAnalyses = analyses
+        // Remember what is on screen so the same position is not re-analysed right away. The
+        // age counts from the search: redrawing a reused analysis must not extend its life.
+        if (analyses !== shownAnalyses || shownKey != positionKey(fen)) {
+            shownKey = positionKey(fen)
+            shownAtMs = SystemClock.elapsedRealtime()
+            shownAnalyses = analyses
+        }
     }
 
     /** Arrow label for a forced mate in [moves] by the side to move. */
