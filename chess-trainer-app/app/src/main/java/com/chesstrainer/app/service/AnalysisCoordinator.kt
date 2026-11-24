@@ -665,13 +665,16 @@ class AnalysisCoordinator(
         return SEARCH_TIME_MS
     }
 
-    /** Analyses [fen] with [NUM_LINES] principal variations, ordered best first. */
-    private fun analyzeMulti(fen: String): List<AnalysisResult>? {
+    /**
+     * Analyses [fen] with [NUM_LINES] principal variations, ordered best first, searching for
+     * [searchMs] (the same budget the overlay was told to count down from).
+     */
+    private fun analyzeMulti(fen: String, searchMs: Int = searchTimeMs()): List<AnalysisResult>? {
         val e = engine ?: return null
         if (!running.get()) return null
         if (!isAnalyzable(fen)) return null
         val raw = try {
-            e.analyzeMultiPv(fen, depth, NUM_LINES, moveTimeMs = searchTimeMs())
+            e.analyzeMultiPv(fen, depth, NUM_LINES, moveTimeMs = searchMs)
         } catch (ex: RuntimeException) {
             Log.e(TAG, "Multi-PV analysis failed for $fen", ex)
             null
@@ -1433,8 +1436,9 @@ class AnalysisCoordinator(
         // appear as soon as possible; the opponent's move is classified afterwards.
         // A position shown moments ago (duplicate or flickering events) is not searched again.
         val newAnalyses = recentlyShown(newFen) ?: run {
-            postOverlayThinking()
-            analyzeMulti(newFen)
+            val searchMs = searchTimeMs()
+            postOverlayThinking(searchMs)
+            analyzeMulti(newFen, searchMs)
         }
         if (!running.get()) return
 
@@ -1571,8 +1575,9 @@ class AnalysisCoordinator(
         val analyses = recentlyShown(fen) ?: run {
             postOverlayClear()
             postClearOpponentBadge()
-            postOverlayThinking()
-            analyzeMulti(fen)
+            val searchMs = searchTimeMs()
+            postOverlayThinking(searchMs)
+            analyzeMulti(fen, searchMs)
         }
         if (!running.get()) return
         previousFen = null
@@ -1817,8 +1822,17 @@ class AnalysisCoordinator(
         mainHandler.post { OverlayService.instance?.clearCoachMessage() }
     }
 
-    private fun postOverlayThinking() {
-        mainHandler.post { OverlayService.instance?.showThinking() }
+    /**
+     * Puts the overlay into its "thinking" state for a search of [searchMs], which it counts
+     * down live. The deadline is taken here, as the search starts right after this call.
+     */
+    private fun postOverlayThinking(searchMs: Int) {
+        val deadline = SystemClock.elapsedRealtime() + searchMs
+        mainHandler.post {
+            // Whatever the main thread's delay ate is taken off the countdown.
+            val remaining = deadline - SystemClock.elapsedRealtime()
+            OverlayService.instance?.showThinking(if (searchMs >= 1000) remaining.coerceAtLeast(0L) else 0L)
+        }
     }
 
     /**

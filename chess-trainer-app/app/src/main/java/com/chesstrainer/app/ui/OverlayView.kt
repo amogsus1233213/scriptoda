@@ -27,6 +27,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.TypedValue
@@ -145,7 +146,12 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "chess_overlay"
         private const val NOTIFICATION_ID = 2002
         private const val WAITING_TEXT = "Engine is waiting for a move..."
-        private const val THINKING_TEXT = "Calculating (~5s)..."
+        /** Shown while the engine searches; a live countdown ("Calculating... 4s") is appended. */
+        private const val THINKING_PREFIX = "Calculating..."
+
+        /** Searches shorter than this are over too soon to count down; no seconds are shown. */
+        private const val MIN_COUNTDOWN_MS = 1_000L
+        private const val COUNTDOWN_TICK_MS = 1_000L
 
         /** How long the coach's reaction to the user's own move stays in the bubble. */
         private const val COACH_MESSAGE_MS = 8_000L
@@ -200,6 +206,27 @@ class OverlayService : Service() {
     private var coachMessage: String? = null
     /** True between [showThinking] and the next suggestion or clearing. Main thread only. */
     private var thinking = false
+
+    /**
+     * [SystemClock.elapsedRealtime] at which the running search is expected to finish, or 0 when
+     * no countdown is shown (not thinking, or a search too short to count). Main thread only.
+     */
+    private var thinkingDeadlineMs = 0L
+
+    /** Refreshes the countdown once a second while [thinking]. Main thread only. */
+    private val countdownTick = object : Runnable {
+        override fun run() {
+            if (!thinking || thinkingDeadlineMs == 0L) return
+            val view = commentaryView ?: return
+            // A reaction to the user's own move keeps the bubble until it expires.
+            if (coachMessage == null) view.text = thinkingText()
+            val remaining = thinkingDeadlineMs - SystemClock.elapsedRealtime()
+            if (remaining <= 0L) return
+            // Wake up exactly when the displayed number of seconds drops by one.
+            val untilNextSecond = remaining % COUNTDOWN_TICK_MS
+            mainHandler.postDelayed(this, if (untilNextSecond == 0L) COUNTDOWN_TICK_MS else untilNextSecond)
+        }
+    }
     private val expireCoachMessage = Runnable { dropCoachMessage(restoreWaiting = true) }
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
@@ -247,6 +274,8 @@ class OverlayService : Service() {
         // Callers may still hold this instance for a moment; make late API calls no-ops.
         commentaryView = null
         coachMessage = null
+        thinking = false
+        thinkingDeadlineMs = 0L
         currentLines = emptyList()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -291,20 +320,49 @@ class OverlayService : Service() {
     }
 
     /**
-     * Shows "Engine is calculating..." in the panel and clears stale arrows. A reaction to the
-     * user's own move that is still on screen stays there while the engine thinks: the opponent
-     * often replies at once, and the reaction must not vanish before it could be read. The
-     * next suggestion (or the reaction's own timeout) replaces it.
+     * Shows "Calculating... 5s" in the panel, counting down live once a second until the search
+     * of [durationMs] is due, and clears stale arrows. Searches shorter than [MIN_COUNTDOWN_MS]
+     * (time pressure) just show "Calculating...". The countdown stops when the next suggestion
+     * or clearing arrives. A reaction to the user's own move that is still on screen stays there
+     * while the engine thinks: the opponent often replies at once, and the reaction must not
+     * vanish before it could be read. The next suggestion (or the reaction's own timeout, after
+     * which the running countdown shows) replaces it.
      */
-    fun showThinking() {
+    fun showThinking(durationMs: Long = 0L) {
+        // Taken on the caller's thread, as the search starts now, not when the main thread runs this.
+        val deadline = if (durationMs >= MIN_COUNTDOWN_MS) SystemClock.elapsedRealtime() + durationMs else 0L
         mainHandler.post {
             currentLines = emptyList()
             thinking = true
+            thinkingDeadlineMs = deadline
+            mainHandler.removeCallbacks(countdownTick)
             arrowView?.setArrows(emptyList())
             val view = commentaryView ?: return@post
-            view.text = coachMessage ?: THINKING_TEXT
+            view.text = coachMessage ?: thinkingText()
             panelRoot?.post { clampAndUpdate() }
+            // Sets the text again (a no-op) and schedules the following ticks.
+            countdownTick.run()
         }
+    }
+
+    /**
+     * Text for the thinking state: "Calculating... 4s" while a countdown is running, plain
+     * "Calculating..." without one or once the search is overdue. Main thread only.
+     */
+    private fun thinkingText(): String {
+        if (!thinking || thinkingDeadlineMs == 0L) return THINKING_PREFIX
+        val remaining = thinkingDeadlineMs - SystemClock.elapsedRealtime()
+        if (remaining <= 0L) return THINKING_PREFIX
+        // Round up, so a 5 s search starts at "5s" and ends on "1s".
+        val seconds = (remaining + COUNTDOWN_TICK_MS - 1) / COUNTDOWN_TICK_MS
+        return "$THINKING_PREFIX ${seconds}s"
+    }
+
+    /** Ends the thinking state and its countdown. Main thread only. */
+    private fun stopThinking() {
+        thinking = false
+        thinkingDeadlineMs = 0L
+        mainHandler.removeCallbacks(countdownTick)
     }
 
     /**
@@ -522,7 +580,8 @@ class OverlayService : Service() {
      */
     private fun renderMultiSuggestion(autoExpand: Boolean) {
         val lines = currentLines
-        thinking = false
+        // Results (or a clearing) are in: the countdown is over.
+        stopThinking()
         val view = commentaryView ?: return
         if (lines.isEmpty()) {
             // A reaction to the user's own move outlives the clearing of the arrows.
@@ -540,7 +599,7 @@ class OverlayService : Service() {
         if (commentary.isNotEmpty()) {
             view.text = commentary
         } else if (view.text.isNullOrEmpty() || view.text == WAITING_TEXT) {
-            view.text = THINKING_TEXT
+            view.text = thinkingText()
         }
 
         arrowView?.setArrows(
@@ -566,7 +625,7 @@ class OverlayService : Service() {
         if (!restoreWaiting) return
         val view = commentaryView ?: return
         if (view.text.toString() == message) {
-            view.text = if (thinking) THINKING_TEXT else WAITING_TEXT
+            view.text = if (thinking) thinkingText() else WAITING_TEXT
             panelRoot?.post { clampAndUpdate() }
         }
     }
