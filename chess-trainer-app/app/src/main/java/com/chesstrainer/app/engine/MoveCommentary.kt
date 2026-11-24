@@ -290,8 +290,9 @@ object MoveCommentary {
      * @param cpLoss centipawns lost compared with [bestMove]
      * @param evalBefore centipawns from the user's POV before the move
      * @param evalAfter centipawns from the user's POV after the move
-     * @param fen position before the move. When given, moves are written in algebraic notation
-     *   ("Nxd4"); otherwise as plain squares ("f3d4").
+     * @param fen position before the move. When given, moves are described by the piece that
+     *   moves ("that knight move", "taking with the queen"); otherwise just as "that move".
+     *   Squares and algebraic notation never appear in the text.
      * @param wasSuggested true when [playedMove] is the move the coach was showing as its top
      *   suggestion. Following the arrow is no surprise, so the coach only nods briefly.
      * @return one to three short sentences, never empty
@@ -316,10 +317,14 @@ object MoveCommentary {
             FOLLOWED_SUGGESTION_LINES[index]
         }
         val board = fen?.let { parseBoard(it) }
-        val played = describeMove(playedMove, board)
+        val playedSan = describeMove(playedMove, board)
         val sameMove = playedMove.trim().equals(bestMove.trim(), ignoreCase = true)
         // Only name the better move when there is one to name.
-        val best = bestMove.trim().takeIf { it.length >= 4 && !sameMove }?.let { describeMove(it, board) }
+        val bestSan = bestMove.trim().takeIf { it.length >= 4 && !sameMove }?.let { describeMove(it, board) }
+        // Plain English only: "that knight move", "taking with the queen". Never notation.
+        val played = thatMove(playedSan)
+        // Without a board the better move cannot be described, so it is left out.
+        val best = bestSan?.takeIf { sanToPiece(it) != "piece" }?.let { betterMove(it, playedSan) }
         val hadMate = evalBefore >= MATE_EVAL_CP && evalAfter < MATE_EVAL_CP
         // Null when a pawn count would be noise: a thrown-away mate or an absurdly large loss.
         val pawns = cpLoss.takeIf { !hadMate && it in 1..MAX_QUOTED_LOSS_CP }
@@ -355,12 +360,11 @@ object MoveCommentary {
                 }
                 "$played is a blunder.$needed$gone"
             }
-            MoveClass.MISS -> when {
-                best == null -> "You missed a tactic there."
-                hadMate -> "You missed $best. That was a forced mate."
-                else -> "You missed $best. That was a tactic."
+            MoveClass.MISS -> {
+                val what = if (hadMate) "That was a forced mate." else "That was a tactic."
+                if (bestSan == null) "You missed a tactic there." else "${missedMove(bestSan)} $what"
             }
-        }
+        }.let { capitalizeSentences(it) }
 
         val context = positionalContext(classification, evalBefore, evalAfter)
         return if (context == null) reaction else "$reaction $context"
@@ -393,9 +397,104 @@ object MoveCommentary {
         }
     }
 
+    // -------------------------------------------------------------------------------------
+    // Plain-English move descriptions. The coach talks about pieces and actions ("the knight
+    // takes", "push the pawn"), never about squares or algebraic notation.
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * The piece a move in algebraic notation is made with: "Qh7+" -> "queen", "Nxd4" -> "knight",
+     * "e4" / "exd5" / "e8=Q" -> "pawn", "O-O" / "O-O-O" -> "castling". Anything that is not
+     * algebraic notation (e.g. a raw UCI move such as "g1f3") gives "piece".
+     */
+    internal fun sanToPiece(san: String): String {
+        val move = san.trim()
+        return when {
+            move.startsWith("O-O") || move.startsWith("0-0") -> "castling"
+            UCI_MOVE.matches(move) -> "piece"
+            move.startsWith('K') -> "king"
+            move.startsWith('Q') -> "queen"
+            move.startsWith('R') -> "rook"
+            move.startsWith('B') -> "bishop"
+            move.startsWith('N') -> "knight"
+            move.firstOrNull() in 'a'..'h' -> "pawn"
+            else -> "piece"
+        }
+    }
+
+    private val UCI_MOVE = Regex("[a-h][1-8][a-h][1-8][qrbnQRBN]?")
+
+    /** The mover as it reads inside a sentence: "the knight", "castling". */
+    private fun sanToMover(san: String): String =
+        sanToPiece(san).let { if (it == "castling") it else "the $it" }
+
+    /** A move the user played, as a subject: "that knight move", "that pawn push", "castling". */
+    private fun thatMove(san: String): String {
+        val piece = sanToPiece(san)
+        return when {
+            piece == "castling" -> "castling"
+            piece == "piece" -> "that move"
+            '=' in san -> "that promotion"
+            'x' in san -> "that $piece capture"
+            piece == "pawn" -> "that pawn push"
+            else -> "that $piece move"
+        }
+    }
+
+    /** What a move does, as an action: "taking with the knight", "pushing the pawn". */
+    private fun moveAction(san: String): String {
+        val piece = sanToPiece(san)
+        return when {
+            piece == "castling" -> "castling"
+            piece == "piece" -> "another move"
+            '=' in san -> "promoting the pawn"
+            'x' in san -> "taking with the $piece"
+            piece == "pawn" -> "pushing the pawn"
+            else -> "moving the $piece"
+        }
+    }
+
+    /**
+     * The better move [bestSan], told apart from the move that was played: when both read the
+     * same ("moving the knight"), it becomes "a different knight move".
+     */
+    private fun betterMove(bestSan: String, playedSan: String): String {
+        val action = moveAction(bestSan)
+        if (action != moveAction(playedSan)) return action
+        val piece = sanToPiece(bestSan)
+        return when {
+            piece == "castling" -> "castling the other way"
+            piece == "piece" -> "another move"
+            '=' in bestSan -> "a different promotion"
+            'x' in bestSan -> "a different $piece capture"
+            else -> "a different $piece move"
+        }
+    }
+
+    /** "You missed it. The knight takes." / "You missed the queen check." */
+    private fun missedMove(san: String): String {
+        val piece = sanToPiece(san)
+        return when {
+            piece == "castling" -> "You missed castling."
+            piece == "piece" -> "You missed the best move."
+            '=' in san -> "You missed it. The pawn promotes."
+            'x' in san -> "You missed it. The $piece takes."
+            san.endsWith('+') -> "You missed the $piece check."
+            piece == "pawn" -> "You missed the pawn push."
+            else -> "You missed the $piece move."
+        }
+    }
+
+    /** Upper-cases the first letter of the text and of every sentence in it. */
+    private fun capitalizeSentences(text: String): String =
+        SENTENCE_START.replace(text) { it.value.uppercase(Locale.ROOT) }
+
+    private val SENTENCE_START = Regex("(?:^|(?<=[.!?] ))[a-z]")
+
     /**
      * Writes a UCI move in algebraic notation ("Nxd4", "exd5", "O-O", "e8=Q+") for [board], the
-     * position before the move. Falls back to the UCI text when the board is unknown or does not
+     * position before the move. Internal use only: the result is turned into a piece name with
+     * [sanToPiece] before it reaches any commentary text. Falls back to the UCI text when the board is unknown or does not
      * match the move. Disambiguation ignores pins, and mate is marked as a plain check.
      */
     private fun describeMove(uci: String, board: CharArray?): String {
@@ -462,12 +561,29 @@ object MoveCommentary {
         val to: Int,
         /** Lowercase piece a pawn promotes to, or null. */
         val promotion: Char?,
-        /** Algebraic notation, e.g. "Nxd4+". */
+        /** Algebraic notation, e.g. "Nxd4+". Never shown; see [mover]. */
         val san: String,
         val check: Boolean,
         val before: CharArray,
         val after: CharArray,
-    )
+    ) {
+        /** The piece that moves, as it reads inside a sentence: "the knight", "castling". */
+        val mover: String get() = sanToMover(san)
+    }
+
+    /**
+     * The piece playing the follow-up [next], told apart from the one that played [first]:
+     * "the same knight", "the other knight", "another pawn", or simply "the queen".
+     */
+    private fun followUp(first: Step, next: Step): String {
+        val piece = sanToPiece(next.san)
+        return when {
+            piece != sanToPiece(first.san) || piece == "castling" -> next.mover
+            next.from == first.to -> "the same $piece"
+            piece == "pawn" -> "another pawn"
+            else -> "the other $piece"
+        }
+    }
 
     /** @param tactical true when the explanation is about winning something concrete. */
     private class Plan(val text: String, val tactical: Boolean)
@@ -526,21 +642,19 @@ object MoveCommentary {
     }
 
     private fun fmt(position: String, lines: Array<String>, vararg args: Any): String =
-        String.format(Locale.US, lines[pickIndex(position, lines)], *args)
+        capitalizeSentences(String.format(Locale.US, lines[pickIndex(position, lines)], *args))
 
-    /** Spells out a forced mate: the move, the expected defence and the finishing blow. */
+    /** Spells out a forced mate by the pieces that deliver it. No squares, no notation. */
     private fun explainMate(position: String, steps: List<Step>, mateIn: Int): String {
-        fun mating(step: Step) = step.san.trimEnd('+') + "#"
         val first = steps[0]
-        val reply = steps.getOrNull(1)
-        val next = steps.getOrNull(2)
+        // The mating side's next move; null when the same piece simply keeps going.
+        val next = steps.getOrNull(2)?.takeIf { it.from != first.to }
         return when {
-            mateIn == 1 -> fmt(position, MATE_NOW_PLAN_LINES, mating(first))
-            mateIn == 2 && reply != null && next != null ->
-                fmt(position, MATE_IN_TWO_PLAN_LINES, first.san, reply.san, mating(next))
-            reply != null && next != null ->
-                fmt(position, MATE_LINE_PLAN_LINES, first.san, reply.san, next.san, mateIn)
-            else -> fmt(position, MATE_FORCED_PLAN_LINES, first.san, mateIn)
+            mateIn == 1 -> fmt(position, MATE_NOW_PLAN_LINES, first.mover)
+            mateIn == 2 && next != null ->
+                fmt(position, MATE_IN_TWO_PLAN_LINES, first.mover, followUp(first, next))
+            next != null -> fmt(position, MATE_LINE_PLAN_LINES, first.mover, followUp(first, next), mateIn)
+            else -> fmt(position, MATE_FORCED_PLAN_LINES, first.mover, mateIn)
         }
     }
 
@@ -570,6 +684,9 @@ object MoveCommentary {
         val safe = loss == 0
         val net = materialSwing(steps)
         val theyTake = r1 != null && r1.captured != null && r1.to == m1.to
+        // Pieces, not notation: "the knight" and, for the follow-up, e.g. "the queen".
+        val mover = m1.mover
+        val then = m2?.let { followUp(m1, it) } ?: "the next move"
 
         fun tactical(lines: Array<String>, vararg args: Any) = Plan(fmt(position, lines, *args), true)
         fun quiet(lines: Array<String>, vararg args: Any) = Plan(fmt(position, lines, *args), false)
@@ -577,8 +694,8 @@ object MoveCommentary {
         // --- Tactics the engine's line confirms ---------------------------------------------
 
         if (isSacrifice && theyTake && m2 != null) {
-            if (m2.captured != null && net >= 1) return tactical(SAC_WINS_BACK_PLAN_LINES, m1.san, m2.san)
-            if (m2.check) return tactical(SAC_ATTACK_PLAN_LINES, m1.san, m2.san)
+            if (m2.captured != null && net >= 1) return tactical(SAC_WINS_BACK_PLAN_LINES, mover, then)
+            if (m2.check) return tactical(SAC_ATTACK_PLAN_LINES, mover, then)
         }
 
         val forked = forkTargets(after, m1.to, white)
@@ -588,9 +705,9 @@ object MoveCommentary {
             val victim = pieceName(m1.captured)
             return when {
                 theyTake && m2?.captured != null && net >= CLEAR_GAIN ->
-                    tactical(CAPTURE_THEN_MORE_PLAN_LINES, victim, m1.san, m2.san)
-                !canBeRecaptured -> tactical(FREE_CAPTURE_PLAN_LINES, m1.san, victim)
-                else -> tactical(AHEAD_CAPTURE_PLAN_LINES, m1.san, victim)
+                    tactical(CAPTURE_THEN_MORE_PLAN_LINES, victim, mover, then)
+                !canBeRecaptured -> tactical(FREE_CAPTURE_PLAN_LINES, mover, victim)
+                else -> tactical(AHEAD_CAPTURE_PLAN_LINES, mover, victim)
             }
         }
 
@@ -598,25 +715,25 @@ object MoveCommentary {
             val target = pieceName(m2.captured)
             return when {
                 forked.size >= 2 && m2.to in forked ->
-                    tactical(FORK_WINS_PLAN_LINES, m1.san, pieceName(after[forked[0]]), pieceName(after[forked[1]]))
+                    tactical(FORK_WINS_PLAN_LINES, mover, pieceName(after[forked[0]]), pieceName(after[forked[1]]))
                 pin != null && !pin.skewer && m2.to == pin.front ->
-                    tactical(PIN_WINS_PLAN_LINES, m1.san, pieceName(after[pin.front]), pieceName(after[pin.rear]))
-                theyTake -> tactical(IF_THEY_TAKE_PLAN_LINES, m1.san, m2.san, target)
-                m1.captured != null -> tactical(TRADE_THEN_WIN_PLAN_LINES, m1.san, m2.san, target)
-                else -> tactical(SETS_UP_PLAN_LINES, m1.san, m2.san, target)
+                    tactical(PIN_WINS_PLAN_LINES, mover, pieceName(after[pin.front]), pieceName(after[pin.rear]))
+                theyTake -> tactical(IF_THEY_TAKE_PLAN_LINES, mover, then, target)
+                m1.captured != null -> tactical(TRADE_THEN_WIN_PLAN_LINES, mover, then, target)
+                else -> tactical(SETS_UP_PLAN_LINES, mover, then, target)
             }
         }
 
         // --- Tactics visible on the board (the piece must be safe where it lands) ------------
 
         if (safe && forked.size >= 2) {
-            return tactical(FORK_PLAN_LINES, m1.san, pieceName(after[forked[0]]), pieceName(after[forked[1]]))
+            return tactical(FORK_PLAN_LINES, mover, pieceName(after[forked[0]]), pieceName(after[forked[1]]))
         }
         if (safe && pin != null) {
             val front = pieceName(after[pin.front])
             val rear = pieceName(after[pin.rear])
-            return if (pin.skewer) tactical(SKEWER_PLAN_LINES, m1.san, front, rear)
-            else tactical(PIN_PLAN_LINES, m1.san, front, rear)
+            return if (pin.skewer) tactical(SKEWER_PLAN_LINES, mover, front, rear)
+            else tactical(PIN_PLAN_LINES, mover, front, rear)
         }
 
         // --- Quiet ideas ----------------------------------------------------------------------
@@ -624,16 +741,16 @@ object MoveCommentary {
         val inCheck = kingSquare(board, white)?.let { isAttacked(board, it, !white) } ?: false
         if (inCheck) {
             return when {
-                kind == 'k' && m1.captured == null -> quiet(KING_STEPS_OUT_PLAN_LINES, m1.san)
-                m1.captured != null -> quiet(TAKE_CHECKER_PLAN_LINES, m1.san)
-                else -> quiet(BLOCK_CHECK_PLAN_LINES, m1.san)
+                kind == 'k' && m1.captured == null -> quiet(KING_STEPS_OUT_PLAN_LINES)
+                m1.captured != null -> quiet(TAKE_CHECKER_PLAN_LINES, mover)
+                else -> quiet(BLOCK_CHECK_PLAN_LINES, mover)
             }
         }
 
         if (kind != 'k' && safe && materialLostOn(board, m1.from, white, pieceValue(m1.piece)) > 0 &&
             pieceValue(m1.piece) >= 3 && m1.captured == null
         ) {
-            return quiet(RESCUE_PLAN_LINES, m1.san, name)
+            return quiet(RESCUE_PLAN_LINES, name)
         }
 
         if (safe) {
@@ -649,8 +766,8 @@ object MoveCommentary {
                 .maxByOrNull { pieceValue(after[it]) }
             if (threatened != null) {
                 val target = pieceName(after[threatened])
-                return if (attackers(after, threatened, !white).isEmpty()) quiet(HITS_LOOSE_PLAN_LINES, m1.san, target)
-                else quiet(HITS_PIECE_PLAN_LINES, m1.san, target)
+                return if (attackers(after, threatened, !white).isEmpty()) quiet(HITS_LOOSE_PLAN_LINES, mover, target)
+                else quiet(HITS_PIECE_PLAN_LINES, mover, target)
             }
 
             // A friendly piece that was about to be lost is now covered.
@@ -660,7 +777,7 @@ object MoveCommentary {
                     after[sq] == c && materialLostOn(board, sq, white, pieceValue(c)) > 0 &&
                     materialLostOn(after, sq, white, pieceValue(c)) == 0
             }
-            if (covered != null) return quiet(COVERS_PLAN_LINES, m1.san, pieceName(board[covered]))
+            if (covered != null) return quiet(COVERS_PLAN_LINES, mover, pieceName(board[covered]))
         }
 
         val opening = board.count { it.lowercaseChar() in "nbrq" } >= OPENING_PIECE_COUNT
@@ -672,10 +789,10 @@ object MoveCommentary {
             val central = file in 3..4 && rank in 3..4
             val relativeRank = if (white) rank else 7 - rank
             return when {
-                opening && central && opened != null -> quiet(CENTER_OPENS_PLAN_LINES, m1.san, opened.second)
-                opening && central -> quiet(CENTER_PLAN_LINES, m1.san)
-                relativeRank >= 5 && safe && isPassedPawn(after, m1.to, white) -> quiet(PASSED_PAWN_PLAN_LINES, m1.san)
-                opened != null -> quiet(OPENS_LINE_PLAN_LINES, m1.san, opened.first, opened.second)
+                opening && central && opened != null -> quiet(CENTER_OPENS_PLAN_LINES, opened.second)
+                opening && central -> quiet(CENTER_PLAN_LINES)
+                relativeRank >= 5 && safe && isPassedPawn(after, m1.to, white) -> quiet(PASSED_PAWN_PLAN_LINES)
+                opened != null -> quiet(OPENS_LINE_PLAN_LINES, opened.first, opened.second)
                 else -> defensivePlan(position, m1, moverEval)
             }
         }
@@ -684,20 +801,20 @@ object MoveCommentary {
             val homeRank = if (white) 0 else 7
             if (opening && (kind == 'n' || kind == 'b') && m1.from / 8 == homeRank) {
                 val central = kind == 'n' && file in 2..5 && rank in 2..5
-                return if (central) quiet(DEVELOP_CENTER_PLAN_LINES, m1.san) else quiet(DEVELOP_PLAN_LINES, m1.san, name)
+                return if (central) quiet(DEVELOP_CENTER_PLAN_LINES) else quiet(DEVELOP_PLAN_LINES, name)
             }
             if (kind == 'r' && m1.from % 8 != file) {
                 val onFile = (0..7).map { after[it * 8 + file] }
                 val ownPawn = if (white) 'P' else 'p'
                 when {
-                    onFile.none { it.lowercaseChar() == 'p' } -> return quiet(OPEN_FILE_PLAN_LINES, m1.san)
-                    ownPawn !in onFile -> return quiet(HALF_OPEN_FILE_PLAN_LINES, m1.san)
+                    onFile.none { it.lowercaseChar() == 'p' } -> return quiet(OPEN_FILE_PLAN_LINES)
+                    ownPawn !in onFile -> return quiet(HALF_OPEN_FILE_PLAN_LINES)
                 }
             }
             if (kind == 'r' && m1.from / 8 != rank && rank == (if (white) 6 else 1) &&
                 (0..7).any { after[rank * 8 + it] == (if (white) 'p' else 'P') }
             ) {
-                return quiet(SEVENTH_RANK_PLAN_LINES, m1.san)
+                return quiet(SEVENTH_RANK_PLAN_LINES)
             }
         }
 
@@ -708,7 +825,7 @@ object MoveCommentary {
     private fun defensivePlan(position: String, m1: Step, moverEval: Int?): Plan? {
         if (moverEval == null || moverEval > -DEFENSIVE_EVAL_CP || moverEval < -DECISIVE_EVAL_CP) return null
         if (m1.captured != null || m1.check) return null
-        return Plan(fmt(position, DEFENSE_PLAN_LINES, m1.san), false)
+        return Plan(fmt(position, DEFENSE_PLAN_LINES, m1.mover), false)
     }
 
     /** Squares the piece on [square] attacks (occupied or not). */
@@ -854,54 +971,58 @@ object MoveCommentary {
         return ranks.none { rank -> (f - 1..f + 1).any { it in 0..7 && board[rank * 8 + it] == enemyPawn } }
     }
 
-    // Plan lines. Moves are inserted in algebraic notation ("Nf3"), pieces by name ("knight").
+    // Plan lines. Moves are never written in notation: a "mover" argument is the piece that moves
+    // ("the knight", "castling"), every other piece is given by its bare name ("knight"). A mover
+    // may start a sentence anywhere in a line; fmt() capitalizes it.
 
+    // Arg is the mover.
     private val MATE_NOW_PLAN_LINES = arrayOf(
-        "%s is checkmate. Play it.",
-        "Mate in 1 — %s ends it.",
-        "Play %s. That's checkmate.",
+        "%s delivers checkmate. Play it.",
+        "Mate in 1. %s ends it.",
+        "Checkmate with %s. Play it.",
     )
 
-    // Args are (move, their reply, mating move).
+    // Args are (mover, the piece that finishes).
     private val MATE_IN_TWO_PLAN_LINES = arrayOf(
-        "Mate in 2 — %1\$s, then %3\$s.",
-        "%1\$s first. After %2\$s, %3\$s is mate.",
-        "Mate in 2. %1\$s forces it, %3\$s finishes.",
+        "Mate in 2. %s first, then %s finishes.",
+        "%s first. After their reply, %s mates.",
+        "Mate in 2. %s forces it, %s finishes.",
     )
 
-    // Args are (move, their reply, follow-up, moves to mate).
+    // Args are (mover, the piece that follows up, moves to mate).
     private val MATE_LINE_PLAN_LINES = arrayOf(
-        "Mate in %4\$d — %1\$s forces it, then %3\$s.",
-        "%1\$s starts a forced mate in %4\$d. After %2\$s, play %3\$s.",
-        "Mate in %4\$d. %1\$s, and if %2\$s, %3\$s.",
+        "Mate in %3\$d. %1\$s forces it, then %2\$s follows.",
+        "%1\$s starts a forced mate in %3\$d. %2\$s comes next.",
+        "Mate in %3\$d. %1\$s first, then %2\$s.",
     )
 
+    // Args are (mover, moves to mate).
     private val MATE_FORCED_PLAN_LINES = arrayOf(
-        "Mate in %2\$d — %1\$s forces it.",
+        "Mate in %2\$d. %1\$s forces it.",
         "%s starts a forced mate in %d.",
     )
 
     private val OPPONENT_BLUNDER_PREFIXES = arrayOf("They blundered.", "That's a blunder by them.", "Blunder. Punish it.")
     private val OPPONENT_MISTAKE_PREFIXES = arrayOf("They slipped.", "Mistake by them.", "That was a mistake. Punish it.")
 
-    // Args are (sacrifice, follow-up).
+    // Args are (sacrificed mover, follow-up mover).
     private val SAC_WINS_BACK_PLAN_LINES = arrayOf(
-        "Sacrifice with %s. If they take, %s wins back more.",
-        "%s is a sound sacrifice. %s wins it back with interest.",
+        "Sacrifice %s. If they take, %s wins back more.",
+        "Sacrifice %s. It's sound. %s wins it back with interest.",
     )
 
     private val SAC_ATTACK_PLAN_LINES = arrayOf(
-        "Sacrifice with %s. If they take, %s comes with check.",
-        "%s opens their king. After they take, %s keeps the attack going.",
+        "Sacrifice %s. If they take, %s comes with check.",
+        "Sacrifice %s. It opens their king, and %s keeps the attack going.",
     )
 
-    // Args are (captured piece, move, follow-up).
+    // Args are (captured piece, mover, follow-up mover).
     private val CAPTURE_THEN_MORE_PLAN_LINES = arrayOf(
         "Take the %1\$s with %2\$s. If they recapture, %3\$s wins more.",
         "%2\$s wins the %1\$s. When they take back, %3\$s picks up more.",
     )
 
-    // Args are (move, captured piece).
+    // Args are (mover, captured piece).
     private val FREE_CAPTURE_PLAN_LINES = arrayOf(
         "%s wins the %s for free. Nothing defends it.",
         "Their %2\$s is hanging. %1\$s just takes it.",
@@ -913,10 +1034,10 @@ object MoveCommentary {
         "Take the %2\$s with %1\$s. Good trade, you gain material.",
     )
 
-    // Args are (move, first target, second target).
+    // Args are (mover, first target, second target).
     private val FORK_WINS_PLAN_LINES = arrayOf(
         "%s forks the %s and %s. They can't save both.",
-        "Fork with %s — the %s and %s are both hit. One falls.",
+        "Fork with %s. The %s and %s are both hit. One falls.",
     )
 
     private val FORK_PLAN_LINES = arrayOf(
@@ -924,7 +1045,7 @@ object MoveCommentary {
         "Fork with %s. It hits the %s and the %s at once.",
     )
 
-    // Args are (move, piece in front, piece behind).
+    // Args are (mover, piece in front, piece behind).
     private val PIN_WINS_PLAN_LINES = arrayOf(
         "%s pins the %s to the %s. Take it next move.",
         "Pin the %2\$s to the %3\$s with %1\$s. It can't move, so you win it.",
@@ -940,7 +1061,7 @@ object MoveCommentary {
         "Skewer with %s. The %s has to step aside and you take the %s.",
     )
 
-    // Args are (move, follow-up, target).
+    // Args are (mover, follow-up mover, target).
     private val IF_THEY_TAKE_PLAN_LINES = arrayOf(
         "Play %s. If they take, %s wins the %s.",
         "%s sets a trap. If they capture, %s picks up the %s.",
@@ -948,20 +1069,21 @@ object MoveCommentary {
 
     private val TRADE_THEN_WIN_PLAN_LINES = arrayOf(
         "Trade with %s first. Then %s wins the %s.",
-        "%s clears the way. Next comes %s, winning the %s.",
+        "%s clears the way. Next, %s wins the %s.",
     )
 
     private val SETS_UP_PLAN_LINES = arrayOf(
-        "%s sets up %s. They can't save the %s.",
-        "%s threatens %s, and the %s has no escape.",
-        "Play %s. Next is %s, winning the %s.",
+        "%s sets it up. Next, %s wins the %s.",
+        "%1\$s makes the threat. Their %3\$s has no escape.",
+        "Play %s. Next, %s wins the %s.",
     )
 
     private val KING_STEPS_OUT_PLAN_LINES = arrayOf(
-        "You're in check. %s steps out safely.",
-        "%s gets the king out of check.",
+        "You're in check. The king steps out safely.",
+        "Move the king. That gets you out of check.",
     )
 
+    // Arg is the mover.
     private val TAKE_CHECKER_PLAN_LINES = arrayOf(
         "You're in check. %s removes the attacker.",
         "%s takes the checking piece. Problem solved.",
@@ -972,13 +1094,14 @@ object MoveCommentary {
         "%s blocks the check and holds things together.",
     )
 
-    // Args are (move, piece).
+    // Arg is the piece that is moved away.
     private val RESCUE_PLAN_LINES = arrayOf(
-        "Your %2\$s is under attack. %1\$s moves it to safety.",
-        "%s gets the %s out of danger.",
-        "Don't hang the %2\$s. %1\$s saves it.",
+        "Your %s is under attack. Move it to safety.",
+        "Get the %s out of danger.",
+        "Don't hang the %s. Move it away.",
     )
 
+    // Args are (mover, target).
     private val HITS_PIECE_PLAN_LINES = arrayOf(
         "%s hits their %s. It has to move and you gain a tempo.",
         "%s attacks the %s. Make them react.",
@@ -994,54 +1117,55 @@ object MoveCommentary {
         "Your %2\$s needed cover. %1\$s protects it.",
     )
 
-    // Args are (move, piece).
+    // Arg is the piece the pawn move frees.
     private val CENTER_OPENS_PLAN_LINES = arrayOf(
-        "%s takes the center and opens a line for your %s.",
-        "%s claims the center and lets the %s out.",
+        "Push the pawn. It takes the center and opens a line for your %s.",
+        "The pawn claims the center and lets the %s out.",
     )
 
     private val CENTER_PLAN_LINES = arrayOf(
-        "%s takes the center. Develop behind it.",
-        "%s grabs central space. Good opening move.",
+        "Push the pawn. It takes the center.",
+        "The pawn grabs central space. Good opening move.",
     )
 
     private val PASSED_PAWN_PLAN_LINES = arrayOf(
-        "Push the passed pawn with %s. No pawn can stop it.",
-        "%s advances the passed pawn. It gets more dangerous every step.",
+        "Push the passed pawn. No pawn can stop it.",
+        "Advance the passed pawn. It gets more dangerous every step.",
     )
 
-    // Args are (move, "diagonal" | "file", piece).
+    // Args are ("diagonal" | "file", piece).
     private val OPENS_LINE_PLAN_LINES = arrayOf(
-        "%s opens the %s for your %s.",
-        "Play %s. It clears the %s and activates the %s.",
+        "Push the pawn. It opens the %s for your %s.",
+        "The pawn move clears the %s and activates the %s.",
     )
 
     private val DEVELOP_CENTER_PLAN_LINES = arrayOf(
-        "%s develops the knight toward the center.",
-        "%s brings a piece out and controls the center.",
+        "Develop the knight toward the center.",
+        "Bring the knight out. It controls the center.",
     )
 
-    // Args are (move, piece).
+    // Arg is the piece.
     private val DEVELOP_PLAN_LINES = arrayOf(
-        "%s develops the %s. Get your pieces out.",
-        "%s brings the %s into the game. Development first.",
+        "Develop the %s. Get your pieces out.",
+        "Bring the %s into the game. Development first.",
     )
 
     private val OPEN_FILE_PLAN_LINES = arrayOf(
-        "%s puts the rook on the open file. It's much more active there.",
-        "%s takes the open file. Rooks belong there.",
+        "Put the rook on the open file. It's much more active there.",
+        "The rook takes the open file. Rooks belong there.",
     )
 
     private val HALF_OPEN_FILE_PLAN_LINES = arrayOf(
-        "%s puts the rook on the half-open file. It presses on their pawn.",
-        "%s lines the rook up against their pawn.",
+        "Put the rook on the half-open file. It presses on their pawn.",
+        "Line the rook up against their pawn.",
     )
 
     private val SEVENTH_RANK_PLAN_LINES = arrayOf(
-        "%s puts the rook on the seventh. Their pawns become targets.",
-        "%s invades the seventh rank and attacks their pawns.",
+        "Put the rook on the seventh rank. Their pawns become targets.",
+        "The rook invades the seventh rank and attacks their pawns.",
     )
 
+    // Arg is the mover.
     private val DEFENSE_PLAN_LINES = arrayOf(
         "%s holds the position. Stay solid.",
         "%s is the toughest defense. Wait for your chance.",
