@@ -121,7 +121,7 @@ class StockfishEngine(private val binaryPath: String) {
             }
 
             send("setoption name Threads value 4")
-            send("setoption name Hash value 128")
+            send("setoption name Hash value 256")
 
             if (!send("isready") ||
                 waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null

@@ -83,7 +83,7 @@ class AnalysisCoordinator(
         private const val NUM_LINES = 3
 
         /** Time budget (ms) for the main multi-PV search; 0 means use depth only. */
-        private const val SEARCH_TIME_MS = 3000
+        private const val SEARCH_TIME_MS = 5000
 
         /** At or below this many seconds on the user's clock, the search uses [FAST_MOVETIME_MS]. */
         private const val TIME_PRESSURE_THRESHOLD_SECONDS = 20

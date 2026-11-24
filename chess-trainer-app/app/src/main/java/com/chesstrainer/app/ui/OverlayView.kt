@@ -145,7 +145,7 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "chess_overlay"
         private const val NOTIFICATION_ID = 2002
         private const val WAITING_TEXT = "Engine is waiting for a move..."
-        private const val THINKING_TEXT = "Calculating (~3s)..."
+        private const val THINKING_TEXT = "Calculating (~5s)..."
 
         /** How long the coach's reaction to the user's own move stays in the bubble. */
         private const val COACH_MESSAGE_MS = 8_000L
