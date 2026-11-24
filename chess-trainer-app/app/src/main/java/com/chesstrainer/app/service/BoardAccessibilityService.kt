@@ -144,6 +144,7 @@ class BoardAccessibilityService : AccessibilityService() {
         val result = parse(nodes)
         if (result.positions != null) {
             moveTrackingActive = false
+            AccessibilityData.trackedFen = null
             publish(result)
             // Side to move from the move list — only when the board parser produced the position.
             // When move tracking is active, game.white is authoritative (set in publishFromMoveList).
@@ -343,6 +344,7 @@ class BoardAccessibilityService : AccessibilityService() {
             val fen = game.toFen()
             AccessibilityData.lastRejectReason = null
             AccessibilityData.whiteToMove = game.white
+            AccessibilityData.trackedFen = fen
 
             if (positions == lastPositions && !applied) {
                 identicalReads++

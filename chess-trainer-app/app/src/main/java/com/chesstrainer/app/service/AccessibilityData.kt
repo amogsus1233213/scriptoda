@@ -48,6 +48,14 @@ object AccessibilityData {
     @Volatile var whiteToMove: Boolean? = null
 
     /**
+     * Full FEN produced by the game tracker ([ChessGame.toFen]) when move tracking is active;
+     * null when the position comes from the board parser instead. Unlike a FEN rebuilt from
+     * [detectedPositions], this carries the correct side-to-move, castling rights and en passant
+     * square, so [AnalysisCoordinator] should prefer it when available.
+     */
+    @Volatile var trackedFen: String? = null
+
+    /**
      * Last positions that were read identically on at least two consecutive reads. Unlike
      * [detectedPositions], this skips the in-between states seen while a piece animates or is
      * dragged.
@@ -95,6 +103,7 @@ object AccessibilityData {
         userPlaysWhite = null
         detectedWhiteAtBottom = null
         whiteToMove = null
+        trackedFen = null
         lastUpdateTime = 0L
     }
 
@@ -108,6 +117,7 @@ object AccessibilityData {
         detectedPositions = null
         detectedWhiteAtBottom = null
         whiteToMove = null
+        trackedFen = null
         lastStablePositions = null
         positionChangeCount = 0
         lastViewDump = ""

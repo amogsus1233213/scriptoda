@@ -698,16 +698,28 @@ class AnalysisCoordinator(
         if (!running.get()) return
         ensureTemplatesLoaded()
 
-        // Side to move: keep the tracked side if known, otherwise default to white. The actual
-        // mover is recovered by move inference in onPositionChanged once a move is diffed.
-        val whiteToMove = currentFen?.let { sideToMoveIsWhite(it) } ?: true
-        val fen = try {
-            FenConverter.positionsToFen(positions, whiteToMove)
-        } catch (e: RuntimeException) {
-            Log.w(TAG, "Could not convert accessibility positions", e)
-            return
+        // When the accessibility service has move tracking active, it produces a full FEN with
+        // correct side-to-move, castling rights, and en passant. Prefer it over rebuilding a
+        // lossy FEN from the position map.
+        val trackedFen = AccessibilityData.trackedFen
+        val fen: String
+        if (trackedFen != null && AccessibilityData.isRecent()) {
+            fen = trackedFen
+            Log.d(TAG, "Using tracked FEN from accessibility service: $fen")
+        } else {
+            // Side to move: keep the tracked side if known, otherwise default to white. The actual
+            // mover is recovered by move inference in onPositionChanged once a move is diffed.
+            val whiteToMove = AccessibilityData.whiteToMove
+                ?: currentFen?.let { sideToMoveIsWhite(it) }
+                ?: true
+            fen = try {
+                FenConverter.positionsToFen(positions, whiteToMove)
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "Could not convert accessibility positions", e)
+                return
+            }
+            Log.d(TAG, "Using accessibility data: ${positions.size} pieces, FEN: $fen")
         }
-        Log.d(TAG, "Using accessibility data: ${positions.size} pieces, FEN: $fen")
 
         val placement = fen.substringBefore(' ')
         if (parsePlacement(placement) == null) {
@@ -1117,7 +1129,7 @@ class AnalysisCoordinator(
                     if (diffs in 1..3) return
                 }
             }
-            resyncTo(placement, after, if (placement == START_PLACEMENT) true else userIsWhite)
+            resyncTo(placement, after, if (placement == START_PLACEMENT) true else (AccessibilityData.whiteToMove ?: userIsWhite))
             return
         }
 
@@ -1278,13 +1290,16 @@ class AnalysisCoordinator(
 
     /** Starts tracking from [placement] without a known previous move. */
     private fun resyncTo(placement: String, board: CharArray, whiteToMove: Boolean) {
+        // Prefer the accessibility service's side-to-move when available; the caller's guess
+        // (typically userIsWhite) is only a fallback.
+        val sideToMove = AccessibilityData.whiteToMove ?: whiteToMove
         castlingRights = castlingFromPlacement(board)
         halfMoveClock = 0
         fullMoveNumber = 1
-        val fen = composeFen(placement, whiteToMove, castlingRights, null, fullMoveNumber)
+        val fen = composeFen(placement, sideToMove, castlingRights, null, fullMoveNumber)
         currentFen = fen
         currentAnalyses = null
-        if (whiteToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
+        if (sideToMove != (whiteAtBottom ?: lastKnownOrientation ?: true)) {
             previousFen = null
             previousAnalysis = null
             currentAnalyses = null
