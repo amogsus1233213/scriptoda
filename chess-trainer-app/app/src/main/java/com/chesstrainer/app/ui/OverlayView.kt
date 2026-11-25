@@ -980,8 +980,11 @@ class ArrowView(
 
     private companion object {
         const val MAX_ARROWS = 5
-        /** Most premove arrows (step 2 and up) drawn besides the [MAX_ARROWS] suggestions. */
-        const val MAX_PREMOVES = 4
+        /**
+         * Most premove arrows (step 2 and up) drawn besides the [MAX_ARROWS] suggestions: as
+         * many as the coordinator sends for a forced mate (steps 2 to 8, one per step color).
+         */
+        const val MAX_PREMOVES = 7
 
         /** Opacity of the arrow of a later move (step 2 and up) of a forced mate. */
         const val MATE_PREMOVE_ALPHA = 200

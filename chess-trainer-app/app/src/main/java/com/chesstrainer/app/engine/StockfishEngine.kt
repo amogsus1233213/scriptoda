@@ -230,7 +230,7 @@ class StockfishEngine(private val binaryPath: String) {
                     val info = parseInfo(line) ?: continue
                     recordBestLine(bestLineHistory, info)
                     val existing = infos[info.multiPv]
-                    if (shouldReplace(existing, info)) infos[info.multiPv] = info
+                    if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
                 }
             }
 
@@ -246,7 +246,7 @@ class StockfishEngine(private val binaryPath: String) {
                             val info = parseInfo(stopLine) ?: continue
                             recordBestLine(bestLineHistory, info)
                             val existing = infos[info.multiPv]
-                            if (shouldReplace(existing, info)) infos[info.multiPv] = info
+                            if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
                         }
                     }
                 }
@@ -314,6 +314,20 @@ class StockfishEngine(private val binaryPath: String) {
         if (candidate.isBound && !existing.isBound) return false
         // Bound lines often carry a truncated PV; keep the old one if the new one is empty.
         return candidate.pv.isNotEmpty() || existing.pv.isEmpty()
+    }
+
+    /**
+     * [candidate] is about to replace [existing]. Fail-high / fail-low lines ("lowerbound" /
+     * "upperbound") and lines cut short by the hash table often carry only the first move or
+     * two of the line, and the search may end before the full line is printed again. If the new
+     * PV is just the start of the one already known (or is missing), the known continuation is
+     * kept: without it a forced mate arrives with a one-move PV and its later moves cannot be
+     * shown.
+     */
+    private fun keepLongerPv(existing: InfoLine?, candidate: InfoLine): InfoLine {
+        if (existing == null || existing.pv.size <= candidate.pv.size) return candidate
+        val isPrefix = existing.pv.subList(0, candidate.pv.size) == candidate.pv
+        return if (isPrefix) candidate.copy(pv = existing.pv) else candidate
     }
 
     /** Keeps the latest exact score of the best line (multipv 1) for each depth, in depth order. */

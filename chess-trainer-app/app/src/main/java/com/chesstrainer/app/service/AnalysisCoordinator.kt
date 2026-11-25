@@ -112,6 +112,12 @@ class AnalysisCoordinator(
          */
         private const val MAX_MATE_PREMOVES = 7
 
+        /** Time (ms) of one follow-up search that completes a mate PV; see [completeMatePv]. */
+        private const val MATE_PV_STEP_MS = 200
+
+        /** Most follow-up searches spent on completing one mate PV. */
+        private const val MATE_PV_MAX_ROUNDS = 3
+
         /**
          * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
          * above which a warning is logged. No ordinary move swings the eval this far, so it is
@@ -738,9 +744,58 @@ class AnalysisCoordinator(
             null
         }
         if (raw.isNullOrEmpty()) Log.w(TAG, "Engine returned no analysis (ready=${e.isReady()}) for $fen")
-        val analyses = validatedAnalyses(fen, raw)
-        checkEvalSanity(fen, analyses?.firstOrNull())
-        return analyses
+        val validated = validatedAnalyses(fen, raw)
+        checkEvalSanity(fen, validated?.firstOrNull())
+        if (validated.isNullOrEmpty()) return validated
+        // Only the best line gets numbered follow-up moves, so only its PV is completed.
+        return listOf(completeMatePv(fen, validated[0], searchMs)) + validated.drop(1)
+    }
+
+    /**
+     * Makes sure the PV of a forced mate by the side to move holds every move of the mate that
+     * [premoveLines] draws. Stockfish regularly reports "mate in 3" with a PV of one or two
+     * moves (lines cut short by the hash table, fail-high / fail-low output, a search stopped
+     * mid-iteration), and without the later moves no premove arrow can be drawn at all. The
+     * missing moves are asked for by searching the position at the end of the known PV, which
+     * is quick as the mate is already in the hash table. An extension is only taken while the
+     * engine still sees the same side mating; otherwise the PV is left as far as it got.
+     */
+    private fun completeMatePv(fen: String, best: AnalysisResult, searchMs: Int): AnalysisResult {
+        val mate = best.mate ?: return best
+        if (mate <= 1) return best
+        val e = engine ?: return best
+        // Plies up to and including the last user move that is drawn.
+        val needed = 2 * minOf(mate, MAX_MATE_PREMOVES + 1) - 1
+        var pv = best.pv.takeWhile { isUciMove(it) }
+        if (pv.isEmpty() || pv[0] != best.bestMove || pv.size >= needed) return best
+        val stepMs = if (searchMs <= FAST_MOVETIME_MS) MATE_PV_STEP_MS / 2 else MATE_PV_STEP_MS
+        val deadline = SystemClock.elapsedRealtime() + stepMs * MATE_PV_MAX_ROUNDS
+        var rounds = 0
+        while (pv.size < needed && rounds < MATE_PV_MAX_ROUNDS && running.get() && !positionStale &&
+            SystemClock.elapsedRealtime() < deadline
+        ) {
+            rounds++
+            val next = try {
+                e.analyzeMultiPv(fen, depth, 1, moves = pv, moveTimeMs = stepMs)?.firstOrNull()
+            } catch (ex: RuntimeException) {
+                Log.w(TAG, "Could not extend the mate PV for $fen", ex)
+                null
+            } ?: break
+            val nextMate = next.mate ?: break
+            // Even length: the mating side is to move again and must still mate; odd length:
+            // the defender is to move and must still be getting mated.
+            val matingSideToMove = pv.size % 2 == 0
+            if (nextMate == 0 || matingSideToMove != (nextMate > 0)) break
+            val tail = next.pv.takeWhile { isUciMove(it) }
+            if (tail.isEmpty()) break
+            pv = pv + tail
+        }
+        if (pv.size <= best.pv.size) {
+            Log.w(TAG, "Mate in $mate but the PV has only ${best.pv.size} moves and could not be extended: $fen")
+            return best
+        }
+        Log.d(TAG, "Mate in $mate: PV extended from ${best.pv.size} to ${pv.size} moves in $rounds searches")
+        return best.copy(pv = pv)
     }
 
     /**
@@ -2096,8 +2151,12 @@ class AnalysisCoordinator(
         val lines = ArrayList<SuggestedLineData>(count.coerceAtLeast(0))
         for (step in 2..count + 1) {
             val index = (step - 1) * 2
-            val move = pv.getOrNull(index) ?: break
-            if (!isUciMove(move) || !isUciMove(pv[index - 1])) break
+            val move = pv.getOrNull(index)
+            if (move == null || !isUciMove(move) || !isUciMove(pv[index - 1])) {
+                Log.w(TAG, "Mate in $userMate: PV ends before move $step (${pv.size} plies), " +
+                    "showing ${lines.size} of $count premoves")
+                break
+            }
             // Mate distance left once the earlier moves are played, so the last arrow is M1.
             val left = userMate - (step - 1)
             lines += SuggestedLineData(
