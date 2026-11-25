@@ -121,6 +121,13 @@ class AnalysisCoordinator(
         private const val MATE_PV_MAX_ROUNDS = 3
 
         /**
+         * Time limit (ms) of the search that confirms a mate line ends in checkmate; see
+         * [verifiedMatePv]. A checkmated position is answered at once, so this is only spent
+         * when the line turns out not to mate.
+         */
+        private const val MATE_VERIFY_MS = 100
+
+        /**
          * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
          * above which a warning is logged. No ordinary move swings the eval this far, so it is
          * either a mate appearing or disappearing, or the engine answering for another position.
@@ -770,8 +777,73 @@ class AnalysisCoordinator(
         val validated = validatedAnalyses(fen, raw)
         checkEvalSanity(fen, validated?.firstOrNull())
         if (validated.isNullOrEmpty()) return validated
+        val trusted = trustedMates(fen, validated)
         // Only the best line gets numbered follow-up moves, so only its PV is completed.
-        return listOf(completeMatePv(fen, validated[0], searchMs)) + validated.drop(1)
+        return listOf(verifiedMatePv(fen, completeMatePv(fen, trusted[0], searchMs))) + trusted.drop(1)
+    }
+
+    /**
+     * Last check before the moves of a forced mate are drawn: a PV that holds the whole mate
+     * (2N - 1 plies for a mate in N) is played out on the engine's board and must end with the
+     * opponent checkmated. The engine stops applying moves at the first illegal one, so a line
+     * with a move that cannot be played fails as well.
+     *
+     * A line that fails is not the mate: only its first move is kept, so no premove arrow and
+     * no mate ring is drawn from it. For a "mate in 1" the claim itself is then disproved (the
+     * move on the arrow does not mate) and the mate score is dropped too. A PV shorter than the
+     * whole mate is left alone: [premoveLines] draws it without a mating move.
+     */
+    private fun verifiedMatePv(fen: String, best: AnalysisResult): AnalysisResult {
+        val mate = best.mate?.takeIf { it > 0 } ?: return best
+        val e = engine ?: return best
+        val plies = 2 * mate - 1
+        val pv = best.pv.takeWhile { isUciMove(it) }
+        if (pv.size < plies || pv[0] != best.bestMove) return best
+        val line = pv.take(plies)
+        val end = try {
+            e.analyzeMultiPv(fen, depth, 1, moves = line, moveTimeMs = MATE_VERIFY_MS)?.firstOrNull()
+        } catch (ex: RuntimeException) {
+            Log.w(TAG, "Could not verify the mate line for $fen", ex)
+            null
+        }
+        // "mate 0" with no move to play: the side to move at the end of the line is checkmated.
+        if (end != null && end.mate == 0 && end.bestMove.isEmpty()) {
+            return if (line.size == best.pv.size) best else best.copy(pv = line)
+        }
+        // The search was cut short because the board moved on: this result is discarded anyway.
+        if (end == null || positionStale) return best.copy(pv = listOf(best.bestMove))
+        Log.w(TAG, "Mate in $mate: the line ${line.joinToString(" ")} does not end in checkmate " +
+            "(engine: mate ${end.mate}, bestmove '${end.bestMove}'), premoves dropped: $fen")
+        if (mate > 1) return best.copy(pv = listOf(best.bestMove))
+        val cap = StockfishEngine.UNPROVEN_MATE_CP
+        return best.copy(mate = null, eval = best.eval.coerceIn(-cap, cap), pv = listOf(best.bestMove))
+    }
+
+    /**
+     * Removes what cannot be trusted about the mate scores of [analyses] before they are shown.
+     *
+     * With the side not to move in check, [fen] is not a legal position (the side to move was
+     * tracked wrongly: it is really the other side's turn). The engine's "mates" there are the
+     * product of a free extra move and do not exist on the board, so they are dropped.
+     *
+     * A mate in N by the side to move is 2N - 1 plies long; anything in the PV after that is
+     * not part of the mate and is cut off.
+     */
+    private fun trustedMates(fen: String, analyses: List<AnalysisResult>): List<AnalysisResult> {
+        if (analyses.none { it.mate != null }) return analyses
+        if (PositionValidator.sideNotToMoveInCheck(fen)) {
+            Log.w(TAG, "Mate scores dropped, the side not to move is in check (wrong side to move): $fen")
+            val cap = StockfishEngine.UNPROVEN_MATE_CP
+            return analyses.map { if (it.mate == null) it else it.copy(mate = null, eval = it.eval.coerceIn(-cap, cap)) }
+        }
+        return analyses.map { result ->
+            val mate = result.mate
+            if (mate != null && mate > 0 && result.pv.size > 2 * mate - 1) {
+                result.copy(pv = result.pv.take(2 * mate - 1))
+            } else {
+                result
+            }
+        }
     }
 
     /**
@@ -780,8 +852,11 @@ class AnalysisCoordinator(
      * moves (lines cut short by the hash table, fail-high / fail-low output, a search stopped
      * mid-iteration), and without the later moves no premove arrow can be drawn at all. The
      * missing moves are asked for by searching the position at the end of the known PV, which
-     * is quick as the mate is already in the hash table. An extension is only taken while the
-     * engine still sees the same side mating; otherwise the PV is left as far as it got.
+     * is quick as the mate is already in the hash table. An extension is only taken when the
+     * engine reports exactly the mate distance that is left at that point of the line, and it
+     * is cut at the mating move. Anything else (no mate, the other side mating, a longer or a
+     * shorter mate) means the moves found are not the rest of this mate, and the PV is left as
+     * far as it got: fewer premoves, but never moves that do not lead to the mate.
      */
     private fun completeMatePv(fen: String, best: AnalysisResult, searchMs: Int): AnalysisResult {
         val mate = best.mate ?: return best
@@ -805,13 +880,19 @@ class AnalysisCoordinator(
                 null
             } ?: break
             val nextMate = next.mate ?: break
-            // Even length: the mating side is to move again and must still mate; odd length:
-            // the defender is to move and must still be getting mated.
-            val matingSideToMove = pv.size % 2 == 0
-            if (nextMate == 0 || matingSideToMove != (nextMate > 0)) break
+            // After k plies of a mate in N: with k even the mating side is to move and has a
+            // mate in N - k/2; with k odd the defender is to move and is mated in N - (k+1)/2.
+            val k = pv.size
+            val expectedMate = if (k % 2 == 0) mate - k / 2 else -(mate - (k + 1) / 2)
+            if (nextMate != expectedMate) {
+                Log.w(TAG, "Mate in $mate: after $k plies the engine reports mate $nextMate, " +
+                    "expected $expectedMate; not extending the PV: $fen")
+                break
+            }
             val tail = next.pv.takeWhile { isUciMove(it) }
             if (tail.isEmpty()) break
-            pv = pv + tail
+            // The whole mate is 2 * mate - 1 plies; nothing after the mating move belongs to it.
+            pv = (pv + tail).take(2 * mate - 1)
         }
         if (pv.size <= best.pv.size) {
             Log.w(TAG, "Mate in $mate but the PV has only ${best.pv.size} moves and could not be extended: $fen")
@@ -1651,6 +1732,8 @@ class AnalysisCoordinator(
         shownAnalyses = null
         lastSearchedPlacement = null
         lastSearchedEvalWhite = null
+        // A forced mate of the old tracking state must not be continued by a move of the new one.
+        mateLine = null
     }
 
     private fun updateBoardBounds(grid: Grid, px: Pixels, bitmap: Bitmap) {

@@ -49,6 +49,12 @@ class StockfishEngine(private val binaryPath: String) {
         /** Base value used to represent mate scores in centipawns. */
         const val MATE_SCORE = 100_000
 
+        /**
+         * Eval (cp) given to a line whose mate score could not be trusted: clearly winning, but
+         * well below the range that stands for a forced mate.
+         */
+        const val UNPROVEN_MATE_CP = 5_000
+
         private const val TAG = "StockfishEngine"
 
         private const val ANALYSIS_TIMEOUT_MS = 10_000L
@@ -308,6 +314,9 @@ class StockfishEngine(private val binaryPath: String) {
 
     private fun shouldReplace(existing: InfoLine?, candidate: InfoLine): Boolean {
         if (existing == null) return true
+        // A mate score that is only a bound ("score mate 3 upperbound") proves no mate, so it
+        // never takes the place of an exact score, whatever its depth.
+        if (candidate.isBound && candidate.mate != null && !existing.isBound) return false
         if (candidate.depth < existing.depth) return false
         if (candidate.depth > existing.depth) return true
         // Prefer exact scores over lower/upper bounds at the same depth.
@@ -323,9 +332,15 @@ class StockfishEngine(private val binaryPath: String) {
      * PV is just the start of the one already known (or is missing), the known continuation is
      * kept: without it a forced mate arrives with a one-move PV and its later moves cannot be
      * shown.
+     *
+     * The continuation is only kept when both lines carry the same mate score (or neither has
+     * one). The tail of a line that was not a mate, or was a mate of another length, is not the
+     * mating line: appended to a "mate in 3" it would be shown as moves 2 and 3 of a mate that
+     * they do not deliver.
      */
     private fun keepLongerPv(existing: InfoLine?, candidate: InfoLine): InfoLine {
         if (existing == null || existing.pv.size <= candidate.pv.size) return candidate
+        if (existing.mate != candidate.mate) return candidate
         val isPrefix = existing.pv.subList(0, candidate.pv.size) == candidate.pv
         return if (isPrefix) candidate.copy(pv = existing.pv) else candidate
     }
@@ -414,10 +429,6 @@ class StockfishEngine(private val binaryPath: String) {
         }
 
         return infos.toSortedMap().map { (index, info) ->
-            val eval = when {
-                info.mate != null -> mateToCp(info.mate)
-                else -> info.cp ?: 0
-            }
             val move = if (index == 1) {
                 bestMove.ifEmpty { info.pv.firstOrNull().orEmpty() }
             } else {
@@ -426,12 +437,21 @@ class StockfishEngine(private val binaryPath: String) {
             // After an interrupted search the bestmove token may not match the
             // PV's first move.  When they disagree, replace the PV so the
             // displayed arrow and eval stay consistent.
-            val pvAdjusted = if (index == 1 && bestMove.isNotEmpty() &&
+            val moveMismatch = index == 1 && bestMove.isNotEmpty() &&
                 info.pv.firstOrNull() != null && info.pv[0] != bestMove
-            ) {
-                listOf(bestMove)
-            } else {
-                info.pv
+            val pvAdjusted = if (moveMismatch) listOf(bestMove) else info.pv
+            // A mate is only reported when it is proven for the move that is returned: not when
+            // the score is a bound, and not when the score belongs to another move than the
+            // bestmove (the mate is then that other move's, and this one may not mate at all).
+            val mate = info.mate?.takeUnless { info.isBound || moveMismatch }
+            val eval = when {
+                mate != null -> mateToCp(mate)
+                info.mate != null -> {
+                    Log.w(TAG, "Unproven mate score dropped (mate ${info.mate}, bound=${info.isBound}, " +
+                        "pv move ${info.pv.firstOrNull()}, bestmove $bestMove)")
+                    if (info.mate > 0) UNPROVEN_MATE_CP else -UNPROVEN_MATE_CP
+                }
+                else -> info.cp ?: 0
             }
             val pv = when {
                 pvAdjusted.isNotEmpty() -> pvAdjusted
@@ -441,7 +461,7 @@ class StockfishEngine(private val binaryPath: String) {
             AnalysisResult(
                 bestMove = move,
                 eval = eval,
-                mate = info.mate,
+                mate = mate,
                 depth = info.depth,
                 pv = pv,
                 evalSwing = if (index == 1) evalSwing(bestLineHistory) else null,

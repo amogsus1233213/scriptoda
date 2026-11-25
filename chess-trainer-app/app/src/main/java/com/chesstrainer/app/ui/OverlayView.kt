@@ -131,8 +131,8 @@ data class SuggestedLine(
     /**
      * Place in a forced mate the user delivers: 1 = the move to play now, 2 and up = the user's
      * later moves of that mate, each drawn as a thin teal arrow with its number in a chip on the
-     * destination square ([to]). 0 or 1 without a mate = ordinary arrow, no number (the
-     * coordinator sends 0 for those).
+     * destination square ([to]). 0 or 1 = the move to play now: a bold arrow in [labelColor],
+     * no number (the coordinator sends 0 outside a mate).
      */
     val step: Int = 1,
     /**
@@ -964,11 +964,9 @@ data class ArrowData(
     /** Moves until the mover delivers mate (> 0), or null when the move is not a forced mate. */
     val mateIn: Int? = null,
     /**
-     * 0 or 1 = the move to play now (the normal arrow). 2, 3, ... = the user's later moves of
-     * the same line. With [mateIn] > 0 and step >= 1 the move belongs to a forced-mate
-     * sequence: step 1 is the bold teal main arrow, steps 2 and up are thin, faded teal arrows
-     * with their number in a small chip on the destination square. A step above 1 without a
-     * mate is an ordinary plan, drawn as a faded, dashed arrow.
+     * 0 or 1 = the move to play now: the bold main arrow in its own [color]. 2, 3, ... = the
+     * user's later moves of the same line (premoves): always thin, faded teal arrows, whatever
+     * their [color], with their place in the order in a small chip on the destination square.
      */
     val step: Int = 1,
     /**
@@ -1017,7 +1015,7 @@ class ArrowView(
         /** Most opponent replies drawn: one after each of the user's moves but the last. */
         const val MAX_OPPONENT_REPLIES = 8
 
-        /** The one color of every move the user makes in a forced mate. */
+        /** The one color of every premove (the user's later moves, step 2 and up). */
         val MATE_TEAL = Color.parseColor("#00BFA5")
         /** Color of the opponent's expected replies. */
         val OPPONENT_GREY = Color.parseColor("#9E9E9E")
@@ -1035,19 +1033,18 @@ class ArrowView(
         const val OPPONENT_DASH_OFF_DP = 6f
         /** Diameter of the numbered chip on a premove's destination square. */
         const val CHIP_DP = 14f
+        /** Dark rim that keeps the teal chip readable on light squares. */
+        const val CHIP_RIM_DP = 1f
+        const val CHIP_RIM_ALPHA = 140
         const val MATE_RING_STROKE_DP = 3f
         const val MATE_RING_ALPHA = 128
-        /** Premove arrows of an ordinary plan: about 30% opacity. */
-        const val PREMOVE_PLAN_ALPHA = 77
         const val PREMOVE_BADGE_DP = 16f
-        /** Geometry of a premove arrow: the look of an alternative move, a little slimmer. */
-        val STYLE_PREMOVE = ArrowStyle(255, 0.12f, 0.36f, 0.20f, PREMOVE_BADGE_DP)
         val STYLE_RANK_1 = ArrowStyle(255, 0.19f, 0.48f, 0.28f, 22f)  // Best: fully opaque, thicker
         val STYLE_RANK_2 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_3 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_4 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_5 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
-        /** Premove or opponent reply of a forced mate: the main arrow at [THIN_ARROW_SCALE]. */
+        /** Premove or opponent reply: the main arrow at [THIN_ARROW_SCALE]. */
         val STYLE_THIN = ArrowStyle(
             MATE_PREMOVE_ALPHA,
             STYLE_RANK_1.shaftFactor * THIN_ARROW_SCALE,
@@ -1078,7 +1075,10 @@ class ArrowView(
     private var landscapeBounds: RectF? = null
 
     private var arrows: List<ArrowData> = emptyList()
-    /** The user's later moves of the best line, in step order; drawn beneath [arrows]. */
+    /**
+     * The user's later moves of the best line, in step order; drawn beneath the main arrow.
+     * The chip of premoves[i] reads i + 2: the main arrow is move 1.
+     */
     private var premoves: List<ArrowData> = emptyList()
     /** The opponent's expected replies between those moves; drawn beneath [premoves]. */
     private var opponentReplies: List<ArrowData> = emptyList()
@@ -1109,15 +1109,7 @@ class ArrowView(
     }
     private val layerBounds = RectF()
 
-    // Dashed shaft (and its outline) of a premove arrow; the dash pattern is set per draw.
-    private val premoveShaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-    private val premoveBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        color = Color.BLACK
-    }
     private val premovePath = Path()
-    private var premoveDash: DashPathEffect? = null
-    private var premoveDashSquare = 0f
 
     // Thin dashed shaft of an opponent reply; butt caps keep the dashes at their nominal length.
     private val opponentShaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1137,6 +1129,11 @@ class ArrowView(
     private val chipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = MATE_TEAL
+    }
+    private val chipRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.BLACK
+        alpha = CHIP_RIM_ALPHA
     }
     private val chipTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
@@ -1170,9 +1167,16 @@ class ArrowView(
     }
 
     /**
-     * Replaces all arrows. Only the five best-ranked arrows are drawn, plus up to
-     * [MAX_PREMOVES] premove arrows ([ArrowData.step] > 1) and [MAX_OPPONENT_REPLIES]
-     * opponent replies ([ArrowData.isOpponentReply]).
+     * Replaces all arrows. Three separate groups come out of [arrows]:
+     * - suggestions (step 0 or 1, not a reply): the five best-ranked, the best one the main arrow;
+     * - premoves (step 2 and up, not a reply): up to [MAX_PREMOVES], in step order;
+     * - opponent replies ([ArrowData.isOpponentReply], whatever their step): up to
+     *   [MAX_OPPONENT_REPLIES].
+     *
+     * While premoves are shown there is exactly one suggestion arrow, so the move to play now
+     * cannot be mistaken: the alternatives are dropped, and when the move to play now is itself
+     * missing (the first moves of the line were already played and only its rest is on screen)
+     * the earliest premove takes its place as the main arrow.
      */
     fun setArrows(arrows: List<ArrowData>) {
         val all = arrows
@@ -1183,10 +1187,24 @@ class ArrowView(
                     mateKingSquare = it.mateKingSquare?.lowercase(Locale.ROOT),
                 )
             }
-        this.arrows = all.filter { it.step <= 1 && !it.isOpponentReply }
+        var suggestions = all.filter { it.step <= 1 && !it.isOpponentReply }
             .sortedBy { it.rank }.take(MAX_ARROWS)
-        premoves = all.filter { it.step > 1 && !it.isOpponentReply }
-            .sortedBy { it.step }.take(MAX_PREMOVES)
+        var plan = all.filter { it.step > 1 && !it.isOpponentReply }.sortedBy { it.step }
+        if (plan.isNotEmpty()) {
+            if (suggestions.isEmpty()) {
+                // The next move of the line is now the move to play: bold, in the color a
+                // best move with its label gets, not in the premove teal.
+                val next = plan.first()
+                val color =
+                    if (next.label.isBlank()) next.color else MoveColors.forLabel(next.label)
+                suggestions = listOf(next.copy(step = 1, rank = 1, color = color))
+                plan = plan.drop(1)
+            } else {
+                suggestions = suggestions.take(1)
+            }
+        }
+        this.arrows = suggestions
+        premoves = plan.take(MAX_PREMOVES)
         opponentReplies = all.filter { it.isOpponentReply }
             .sortedBy { it.step }.take(MAX_OPPONENT_REPLIES)
         invalidate()
@@ -1222,28 +1240,23 @@ class ArrowView(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        // The rest of a forced mate stays on screen after its first move is played, so there
-        // can be premoves and replies without any arrow for the move to play now.
         val hasArrows = arrows.isNotEmpty() || premoves.isNotEmpty() || opponentReplies.isNotEmpty()
         val hasBadge = opBadgeSquare != null
         if (!hasArrows && !hasBadge) return
         val board = boardRectInView() ?: return
         val square = board.width() / 8f
         if (hasArrows) {
-            // Back to front: plan premoves, alternative moves, the opponent's expected
-            // replies, the user's later moves of a forced mate (last step lowest, so the nearer
-            // steps lie on top), then the move to play now.
-            for (i in premoves.indices.reversed()) {
-                if (!isMateStep(premoves[i])) drawPremoveArrow(canvas, premoves[i], board, square)
-            }
+            // Back to front: alternative moves, the opponent's expected replies (grey, dashed),
+            // the user's premoves (teal; last step lowest, so the nearer steps lie on top), then
+            // the move to play now, above everything else.
             val drawOrder = arrows.sortedByDescending { it.rank }
             val main = drawOrder.lastOrNull()
             for (arrow in drawOrder) if (arrow !== main) drawArrow(canvas, arrow, board, square)
             for (i in opponentReplies.indices.reversed()) {
-                drawMatePremoveArrow(canvas, opponentReplies[i], board, square)
+                drawThinArrow(canvas, opponentReplies[i], board, square)
             }
             for (i in premoves.indices.reversed()) {
-                if (isMateStep(premoves[i])) drawMatePremoveArrow(canvas, premoves[i], board, square)
+                drawThinArrow(canvas, premoves[i], board, square)
             }
             if (main != null) drawArrow(canvas, main, board, square)
             for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
@@ -1257,22 +1270,17 @@ class ArrowView(
         }
     }
 
-    /** True for a move of a forced-mate sequence: it has a place in the order and a mate count. */
-    private fun isMateStep(arrow: ArrowData): Boolean =
-        arrow.step >= 1 && arrow.mateIn != null && arrow.mateIn > 0
-
     /**
-     * Draws the numbered chips of the user's later moves of a forced mate (step 2 and up), each
-     * on its move's destination square. Moves landing on the same square carry their chips side
-     * by side.
+     * Draws the numbered chips of the user's premoves, each on its move's destination square:
+     * "2" on the move after the main arrow, "3" on the one after that, in step order. Opponent
+     * replies never get a chip. Moves landing on the same square carry their chips side by side.
      */
     private fun drawDestinationChips(canvas: Canvas, board: RectF, square: Float) {
         val squares = ArrayList<String>(premoves.size)
-        for (arrow in premoves) {
-            if (!isMateStep(arrow)) continue
+        for ((index, arrow) in premoves.withIndex()) {
             val slot = squares.count { it == arrow.to }
             squares += arrow.to
-            drawDestinationChip(canvas, arrow, slot, board, square)
+            drawDestinationChip(canvas, arrow, index + 2, slot, board, square)
         }
     }
 
@@ -1285,11 +1293,9 @@ class ArrowView(
         if (length < 1f) return
 
         val style = styleFor(arrow.rank)
-        // A move of a forced mate is teal, like the premoves that follow it; any other arrow
-        // keeps its classification color.
-        val baseColor =
-            if (isMateStep(arrow)) MATE_TEAL else arrowColorForRank(arrow.rank, arrow.color)
-        val color = withAlpha(baseColor, style.alpha)
+        // Always the arrow's own (classification) color, also for the first move of a forced
+        // mate: teal is reserved for the premoves, so the move to play now never looks like one.
+        val color = withAlpha(arrowColorForRank(arrow.rank, arrow.color), style.alpha)
         shaftPaint.color = color
         headPaint.color = color
 
@@ -1333,13 +1339,13 @@ class ArrowView(
     }
 
     /**
-     * Draws a thin arrow of a forced-mate sequence, at half the width of the main arrow and
-     * without outline. One of the user's later moves (step 2 and up) is solid teal at 35%
-     * opacity; an opponent reply ([ArrowData.isOpponentReply]) is grey at 30% with a dashed
+     * Draws a thin arrow of the line behind the main arrow, at half the width of the main arrow
+     * and without outline. One of the user's later moves (step 2 and up) is solid teal at 35%
+     * opacity, whatever its own color; an opponent reply ([ArrowData.isOpponentReply]) is grey at 30% with a dashed
      * shaft. Shaft and head are composed opaque in a layer and faded once, so they do not show
      * through each other. The step number is drawn separately ([drawDestinationChip]).
      */
-    private fun drawMatePremoveArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
+    private fun drawThinArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
         val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
         val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
         val dx = end.x - start.x
@@ -1393,13 +1399,14 @@ class ArrowView(
     }
 
     /**
-     * Draws the step number of one of the user's later moves of a forced mate ("2", "3", ...):
-     * white and bold in a [CHIP_DP] teal disc, in the bottom-right quarter of the move's
-     * destination square, clear of the piece and of the classification badge (top-right).
+     * Draws the number of one of the user's premoves ("2", "3", ...): white and bold in a
+     * [CHIP_DP] teal disc, in the bottom-right quarter of the move's destination square, clear
+     * of the piece and of the classification badge (top-right).
+     * @param number place of the move in the order; the main arrow is 1
      * @param slot 0 for the first chip on the square; later ones step to the left
      */
     private fun drawDestinationChip(
-        canvas: Canvas, arrow: ArrowData, slot: Int, board: RectF, square: Float,
+        canvas: Canvas, arrow: ArrowData, number: Int, slot: Int, board: RectF, square: Float,
     ) {
         val center = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
         val size = CHIP_DP * density
@@ -1410,9 +1417,11 @@ class ArrowView(
         val cy = (center.y + offset).coerceIn(half, max(half, height - half))
 
         canvas.drawCircle(cx, cy, half, chipPaint)
+        chipRimPaint.strokeWidth = CHIP_RIM_DP * density
+        canvas.drawCircle(cx, cy, half, chipRimPaint)
         chipTextPaint.textSize = size * 0.75f
         val fm = chipTextPaint.fontMetrics
-        canvas.drawText(arrow.step.toString(), cx, cy - (fm.ascent + fm.descent) / 2f, chipTextPaint)
+        canvas.drawText(number.toString(), cx, cy - (fm.ascent + fm.descent) / 2f, chipTextPaint)
     }
 
     /**
@@ -1426,71 +1435,6 @@ class ArrowView(
         val stroke = MATE_RING_STROKE_DP * density
         mateRingPaint.strokeWidth = stroke
         canvas.drawCircle(center.x, center.y, (square - stroke) / 2f, mateRingPaint)
-    }
-
-    /**
-     * Draws a later move of an ordinary plan ([ArrowData.step] > 1): a dashed, faded arrow. The
-     * whole arrow (outline included) is composed opaque in one layer and faded once, so the
-     * dashes, the head and the outline do not show through each other.
-     */
-    private fun drawPremoveArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
-        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
-        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
-        val dx = end.x - start.x
-        val dy = end.y - start.y
-        val length = hypot(dx, dy)
-        if (length < 1f) return
-
-        val style = STYLE_PREMOVE
-        val alpha = PREMOVE_PLAN_ALPHA
-        val color = withAlpha(arrow.color, 255)
-
-        val angle = atan2(dy, dx)
-        val headLength = min(square * style.headLengthFactor, length * 0.6f)
-        val headHalfWidth = square * style.headHalfWidthFactor
-        val baseX = end.x - headLength * cos(angle)
-        val baseY = end.y - headLength * sin(angle)
-        val shaftWidth = square * style.shaftFactor
-        val borderExtra = BORDER_EXTRA_DP * density * 0.6f
-
-        if (premoveDash == null || premoveDashSquare != square) {
-            premoveDash = DashPathEffect(floatArrayOf(square * 0.22f, square * 0.12f), 0f)
-            premoveDashSquare = square
-        }
-        premoveShaftPaint.pathEffect = premoveDash
-        premoveShaftPaint.strokeWidth = shaftWidth
-        premoveShaftPaint.color = color
-        premoveBorderPaint.pathEffect = premoveDash
-        premoveBorderPaint.strokeWidth = shaftWidth + borderExtra
-        borderHeadPaint.strokeWidth = borderExtra
-        headPaint.color = color
-
-        // Dashes run from the head back to the start, so a full dash always meets the head.
-        premovePath.reset()
-        premovePath.moveTo(baseX, baseY)
-        premovePath.lineTo(start.x, start.y)
-
-        val perpX = -sin(angle) * headHalfWidth
-        val perpY = cos(angle) * headHalfWidth
-        headPath.reset()
-        headPath.moveTo(end.x, end.y)
-        headPath.lineTo(baseX + perpX, baseY + perpY)
-        headPath.lineTo(baseX - perpX, baseY - perpY)
-        headPath.close()
-
-        val pad = max(headHalfWidth, shaftWidth) + borderExtra * 2f
-        layerBounds.set(
-            min(start.x, end.x) - pad,
-            min(start.y, end.y) - pad,
-            max(start.x, end.x) + pad,
-            max(start.y, end.y) + pad,
-        )
-        val saveCount = canvas.saveLayerAlpha(layerBounds, alpha)
-        canvas.drawPath(premovePath, premoveBorderPaint)
-        canvas.drawPath(headPath, borderHeadPaint)
-        canvas.drawPath(premovePath, premoveShaftPaint)
-        canvas.drawPath(headPath, headPaint)
-        canvas.restoreToCount(saveCount)
     }
 
     private fun getCachedDrawable(resId: Int): Drawable? =
