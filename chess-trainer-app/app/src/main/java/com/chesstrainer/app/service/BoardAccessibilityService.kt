@@ -119,8 +119,10 @@ class BoardAccessibilityService : AccessibilityService() {
         // Needed for [getWindows], which finds the chess app when another window is the active
         // one. Also declared in the XML config; set here too in case that was cached without it.
         try {
-            serviceInfo?.let { info ->
-                info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            val info = serviceInfo
+            val flag = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+            if (info != null && info.flags and flag == 0) {
+                info.flags = info.flags or flag
                 serviceInfo = info
             }
         } catch (e: RuntimeException) {
@@ -176,6 +178,14 @@ class BoardAccessibilityService : AccessibilityService() {
         lastReadTime = SystemClock.uptimeMillis()
         try {
             readBoardNow()
+        } catch (e: RuntimeException) {
+            // This runs on the main thread, from an accessibility event or a handler callback.
+            // Anything thrown by the parsers or the move tracker would otherwise kill the whole
+            // process, and with a read every [HEARTBEAT_MS] it would do so again right after
+            // the restart, until the system stops rebinding the service (enabled in settings,
+            // but never connected).
+            Log.e(TAG, "Board read failed", e)
+            AccessibilityData.lastRejectReason = "Board read failed: ${e.javaClass.simpleName}: ${e.message}"
         } finally {
             // Heartbeat; a sooner read scheduled by the read above is kept (see scheduleRead).
             if (AccessibilityData.targetPackageVisible) scheduleRead(HEARTBEAT_MS)
