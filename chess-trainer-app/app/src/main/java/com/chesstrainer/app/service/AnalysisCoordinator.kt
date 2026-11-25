@@ -124,6 +124,14 @@ class AnalysisCoordinator(
          */
         private const val MAX_MATE_CATCH_UP_PLIES = 6
 
+        /**
+         * How long (ms) a followed forced mate is kept through accessibility reads that neither
+         * a move nor the line explains, and the most squares such a read may differ from the
+         * tracked position on; see [holdMateLine].
+         */
+        private const val LINE_HOLD_MS = 1500L
+        private const val LINE_HOLD_MAX_SQUARES = 6
+
         /** Time (ms) of one follow-up search that completes a mate PV; see [completeMatePv]. */
         private const val MATE_PV_STEP_MS = 200
 
@@ -422,11 +430,19 @@ class AnalysisCoordinator(
 
     /**
      * Set by [render] when it draws a forced mate with premoves (or a mate in one, which has
-     * none: [MateLine.lines] is then empty), dropped by every clearing of
-     * the overlay ([postOverlayClear]) and as soon as a move leaves the line. While it is set
+     * none: [MateLine.lines] is then empty), dropped as soon as a move leaves the line and by
+     * every clearing of the overlay ([postOverlayClear]) that voids the position. A clearing
+     * that only hides the arrows (board or chess app out of sight, the arrow-misread test)
+     * keeps it: the mate is as forced as before, and the arrows are drawn again when the same
+     * position or a later one of the line is read ([onPositionChanged]). While it is set
      * and the moves played are the expected ones, the remaining arrows stay on screen: the user
      * is queueing premoves from them and must not lose them when the first move is played and
-     * the position is searched again. See [advanceMateLine]. Worker thread only.
+     * the position is searched again. See [advanceMateLine].
+     *
+     * Worker thread only, like all tracking state: every read and write of it, including those
+     * in [postOverlayClear] and [isMateLineJump], runs inside a worker task ([submit]), and the
+     * worker is a single thread. The capture and poll threads never touch it, so no check of it
+     * can be overtaken between the check and the use.
      */
     private var mateLine: MateLine? = null
 
@@ -443,6 +459,13 @@ class AnalysisCoordinator(
      * yet. Worker thread only.
      */
     private var premovePreviewPlacement: String? = null
+
+    /**
+     * When ([SystemClock.elapsedRealtime]) the first of the unexplained board reads in a row
+     * was seen while a forced mate is being followed, 0 when none is pending; see
+     * [holdMateLine]. Worker thread only.
+     */
+    private var lineHoldSinceMs = 0L
 
     /** Placement and eval (white's POV) of the last main search, for [checkEvalSanity]. */
     private var lastSearchedPlacement: String? = null
@@ -1220,7 +1243,10 @@ class AnalysisCoordinator(
                 lastHintStatus = STATUS_LOOKING
                 postStatus(STATUS_LOOKING)
             }
-            postOverlayClear()
+            // The position is still the tracked one; only the arrows are hidden. A forced mate
+            // being followed is drawn again when the board is back (stablePlacement is null,
+            // so the position is handled again), or dropped there if the board has moved on.
+            postOverlayClear(dropMateLine = false)
         }
     }
 
@@ -1756,7 +1782,12 @@ class AnalysisCoordinator(
         missedFrames++
         if (boardVisible && missedFrames >= MISSED_FRAMES_BEFORE_CLEAR) {
             boardVisible = false
-            postOverlayClear(dropMateLine = mateLine == null)
+            // The placement is forgotten with the arrows, as on the accessibility path
+            // (noteAccessibilityBoard). Otherwise the same position, back on screen, equals
+            // stablePlacement and is never handled again: no arrows until the board changes,
+            // and a forced mate that was kept here is never drawn again either.
+            stablePlacement = null
+            postOverlayClear(dropMateLine = false)
             lastHintStatus = STATUS_LOOKING
             postStatus(STATUS_LOOKING)
         }
@@ -1982,7 +2013,10 @@ class AnalysisCoordinator(
                 // user's. Drop them and force a re-analysis of the current placement.
                 currentAnalyses = null
                 stablePlacement = null
-                postOverlayClear(dropMateLine = mateLine == null)
+                // A forced mate being followed goes too: it is the mate of the side that was
+                // taken for the user's, and its arrows (MateLine.flipped) are laid out for the
+                // other orientation. Kept, it would be drawn again rotated by 180 degrees.
+                postOverlayClear()
             } else {
                 resetTracking()
                 postOverlayClear()
@@ -2026,6 +2060,7 @@ class AnalysisCoordinator(
         mateLine = null
         mateDelivered = false
         premovePreviewPlacement = null
+        lineHoldSinceMs = 0L
         // Retries belong to the placement that was just forgotten.
         failedPlacement = null
         failedRetries = 0
@@ -2103,6 +2138,7 @@ class AnalysisCoordinator(
                 if (real != null) {
                     val realPlacement = placementOf(real)
                     premovePreviewPlacement = placement
+                    lineHoldSinceMs = 0L
                     guardedPlacement = null
                     guardedCount = 0
                     if (realPlacement == prevPlacement) {
@@ -2138,15 +2174,34 @@ class AnalysisCoordinator(
         // The same position read again while a forced mate is being followed (a forced re-read,
         // a flickering event): nothing was played, so the line and its arrows stay as they are.
         // Without this the "no move found" path below would drop the line and search again.
+        // The arrows are drawn again, as a clearing that kept the line may have hidden them (see
+        // postOverlayClear). Before the first move of the line is played they are the whole
+        // picture of the last search, which render() draws (setting the line up again).
         val followed = mateLine
-        if (move == null && prevFen != null && followed != null && followed.played > 0 &&
+        if (move == null && prevFen != null && followed != null &&
             placement == prevFen.substringBefore(' ')
         ) {
-            val remaining = remainingMateLines(followed)
-            if (remaining.isNotEmpty()) {
+            val remaining = if (followed.played > 0) remainingMateLines(followed) else emptyList()
+            val redrawn = when {
+                remaining.isNotEmpty() -> {
+                    postMultiSuggestion(remaining, followed.flipped)
+                    true
+                }
+                followed.played == 0 && !currentAnalyses.isNullOrEmpty() -> {
+                    render()
+                    true
+                }
+                else -> false
+            }
+            if (redrawn) {
                 Log.d(TAG, "MateLine re-read of the same position: played=${followed.played}, " +
                     "pv.size=${followed.pv.size}, next=${followed.pv.getOrNull(followed.played)}")
-                postMultiSuggestion(remaining, followed.flipped)
+                // A good read ends a run of the arrow-misread guard: its count is "in a row".
+                // Left standing, the run went on after the arrows were back and ended with the
+                // misread accepted as the position, which dropped the line.
+                guardedPlacement = null
+                guardedCount = 0
+                lineHoldSinceMs = 0L
                 return
             }
         }
@@ -2159,6 +2214,15 @@ class AnalysisCoordinator(
                 prevFen = currentFen
             }
         }
+
+        // Still unexplained, with a forced mate being followed: the line is not given up on at
+        // once. Accessibility path only; vision reads have the arrow-misread guard below.
+        if (move == null && fromAccessibility && allowPreview &&
+            holdMateLine(placement, after, prevFen, userIsWhite)
+        ) {
+            return
+        }
+        lineHoldSinceMs = 0L
 
         if (move == null) {
             if (placement != START_PLACEMENT && !orientationKnown) {
@@ -2295,11 +2359,17 @@ class AnalysisCoordinator(
             val delivered = mateDelivered
             if (remaining.isNotEmpty()) {
                 postMultiSuggestion(remaining, mateLine?.flipped ?: !userIsWhite)
-            } else {
-                postOverlayClear()
-                // The last move of the mate was played: nothing left to show but the result.
-                if (delivered) postCoachMessage(MATE_DELIVERED_COMMENTARY)
+                // The move was the arrow of the forced mate and the next arrows are on screen.
+                // It is not classified: the overlay shows no reaction while arrows are up, and
+                // the engine searches for it kept the worker from seeing the opponent's reply
+                // (and the premove played with it) for as long as they ran.
+                EngineStats.lastFen = newFen
+                EngineStats.whiteAtBottom = whiteAtBottom
+                return
             }
+            postOverlayClear()
+            // The last move of the mate was played: nothing left to show but the result.
+            if (delivered) postCoachMessage(MATE_DELIVERED_COMMENTARY)
             val (analysedBefore, classified) = classifyInterruptibly(
                 screenPlacement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier,
             )
@@ -2314,13 +2384,7 @@ class AnalysisCoordinator(
                 // The celebration stays; a "best move" nod would only replace it.
             } else if (classified != null) {
                 val suggested = beforeAnalysis?.bestMove?.trim()
-                // A premove of the mate played without a fresh search has no beforeAnalysis,
-                // but it was the arrow on screen all the same.
-                postCoachReaction(
-                    classified,
-                    beforeFen,
-                    remaining.isNotEmpty() || suggested.equals(move.uci, ignoreCase = true),
-                )
+                postCoachReaction(classified, beforeFen, suggested.equals(move.uci, ignoreCase = true))
             } else {
                 Log.w(TAG, "User move ${move.uci} could not be classified: no coach reaction")
             }
@@ -2871,6 +2935,11 @@ class AnalysisCoordinator(
         }
     }
 
+    /**
+     * Takes the arrows and the opponent's badge off the screen. Worker thread only.
+     * @param dropMateLine false when the arrows are only hidden and the tracked position stays
+     *   valid: a forced mate being followed is then kept, see [mateLine].
+     */
     private fun postOverlayClear(dropMateLine: Boolean = true) {
         if (dropMateLine) {
             mateLine = null
@@ -2879,6 +2948,75 @@ class AnalysisCoordinator(
             OverlayService.instance?.clearSuggestion()
             OverlayService.instance?.clearOpponentBadge()
         }
+    }
+
+    /**
+     * Called for a board change ([prevFen] to [placement]) reported by the accessibility service
+     * that is neither one move nor the next plies of the forced mate being followed, with or
+     * without queued premoves. Returns true when the change is to be ignored for now: the
+     * tracked position ([currentFen]), the line and its arrows all stay as they are, and the
+     * next read is diffed against the tracked position again.
+     *
+     * Such a read used to drop the line at once and start over from the board, and the line
+     * was then gone for good: the position that followed could no longer be matched against it,
+     * so the sequence stopped advancing. But many of these reads are not positions of the game
+     * at all. The view tree also shows in-between pictures, and one that is read twice in a row
+     * is passed on as stable: a piece that is picked up or dragged is missing or stands on the
+     * square it hovers over, a piece in flight is missing, a queued premove is drawn in a way
+     * [premovePreviewBase] does not expect.
+     *
+     * - While the opponent is to move in the line and no piece of the opponent has arrived on
+     *   any square, the change cannot be a played move (every move of the opponent puts one of
+     *   its pieces on a new square). It is the user's premoves or a piece in flight, and is
+     *   ignored for as long as it stays ([premovePreviewPlacement]).
+     * - Anything else small ([LINE_HOLD_MAX_SQUARES]) is held back for [LINE_HOLD_MS], counted
+     *   from the first such read in a row: [stablePlacement] is forgotten so every frame looks
+     *   at the board again. A read that is still there after that time is a real position (e.g.
+     *   the opponent left the line and a queued premove was played with it): false is returned
+     *   and the caller starts over from the board. A change that is the next plies of the line
+     *   plus one other move is such a position for certain and is not held back at all.
+     */
+    private fun holdMateLine(placement: String, after: CharArray, prevFen: String?, userIsWhite: Boolean): Boolean {
+        val line = mateLine ?: return false
+        if (placement == START_PLACEMENT) return false
+        val before = prevFen?.let { parsePlacement(it.substringBefore(' ')) } ?: return false
+        val changed = (0 until 64).filter { before[it] != after[it] }
+        if (changed.isEmpty() || changed.size > LINE_HOLD_MAX_SQUARES) return false
+
+        // The PV starts with a move of the user, so after an odd number of plies the opponent
+        // is to move.
+        if (line.played % 2 == 1 &&
+            changed.none { after[it] != EMPTY && after[it].isUpperCase() != userIsWhite }
+        ) {
+            Log.d(TAG, "MateLine: only the user's pieces changed on the opponent's turn " +
+                "(premove or piece in flight), line kept: played=${line.played}, to=$placement")
+            premovePreviewPlacement = placement
+            lineHoldSinceMs = 0L
+            return true
+        }
+
+        // The next plies of the line followed by one move that is not on it: the line was
+        // left (typically the user's arrow and another reply than the expected one, read as one
+        // change). That is a real position and must be searched without delay.
+        var board = before
+        for (k in 0 until MAX_MATE_CATCH_UP_PLIES) {
+            val uci = line.pv.getOrNull(line.played + k) ?: break
+            board = applyUci(board, uci)?.second ?: break
+            if (MoveInference.infer(board, after, -1) != null) return false
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (lineHoldSinceMs == 0L) lineHoldSinceMs = now
+        val heldFor = now - lineHoldSinceMs
+        if (heldFor >= LINE_HOLD_MS) {
+            Log.d(TAG, "MateLine: unexplained board still there after $heldFor ms, giving the line up: $placement")
+            return false
+        }
+        Log.d(TAG, "MateLine: unexplained board change held back ($heldFor ms, ${changed.size} squares), " +
+            "line kept: played=${line.played}, next=${line.pv.getOrNull(line.played)}, to=$placement")
+        // Not accepted, so it must be read again: by then it is gone or has lasted long enough.
+        stablePlacement = null
+        return true
     }
 
     /**
