@@ -122,7 +122,7 @@ class AnalysisCoordinator(
          * played together with the opponent's reply (2 plies); 3 covers a read that also missed
          * the user's own move before them.
          */
-        private const val MAX_MATE_CATCH_UP_PLIES = 3
+        private const val MAX_MATE_CATCH_UP_PLIES = 6
 
         /** Time (ms) of one follow-up search that completes a mate PV; see [completeMatePv]. */
         private const val MATE_PV_STEP_MS = 200
@@ -1537,7 +1537,22 @@ class AnalysisCoordinator(
         ) {
             return false
         }
-        return moveFromCurrent(placement) != null
+        return moveFromCurrent(placement) != null || isMateLineJump(placement)
+    }
+
+    /**
+     * True if [placement] is the tracked position with the next few plies of the forced mate on
+     * screen played (the opponent's reply plus a queued premove arrive as one change). Such a
+     * jump is as unambiguous as a single move, so it need not wait for a screen frame.
+     */
+    private fun isMateLineJump(placement: String): Boolean {
+        val line = mateLine ?: return false
+        val cur = currentFen ?: return false
+        val curPlacement = cur.substringBefore(' ')
+        if (placement == curPlacement || curPlacement != stablePlacement) return false
+        val before = parsePlacement(curPlacement) ?: return false
+        val after = parsePlacement(placement) ?: return false
+        return matchMateLine(line, before, after) != null
     }
 
     /**
@@ -1804,6 +1819,22 @@ class AnalysisCoordinator(
         // with the opponent's reply, so the board skips a position. If the change is the next
         // plies of the mate, the skipped ones are recorded here and the last one is handled
         // below like any single move.
+        // The same position read again while a forced mate is being followed (a forced re-read,
+        // a flickering event): nothing was played, so the line and its arrows stay as they are.
+        // Without this the "no move found" path below would drop the line and search again.
+        val followed = mateLine
+        if (move == null && prevFen != null && followed != null && followed.played > 0 &&
+            placement == prevFen.substringBefore(' ')
+        ) {
+            val remaining = remainingMateLines(followed)
+            if (remaining.isNotEmpty()) {
+                Log.d(TAG, "MateLine re-read of the same position: played=${followed.played}, " +
+                    "pv.size=${followed.pv.size}, next=${followed.pv.getOrNull(followed.played)}")
+                postMultiSuggestion(remaining, followed.flipped)
+                return
+            }
+        }
+
         if (move == null && prevFen != null && placement != START_PLACEMENT && mateLine != null) {
             val before = parsePlacement(prevFen.substringBefore(' '))
             val last = if (before != null) catchUpMateLine(before, after) else null
@@ -1836,6 +1867,11 @@ class AnalysisCoordinator(
                 }
             }
             // Whatever happened, it was not the forced mate on screen: fresh analysis decides.
+            mateLine?.let {
+                Log.d(TAG, "MateLine dropped, board change is not on the line: played=${it.played}, " +
+                    "pv.size=${it.pv.size}, next=${it.pv.getOrNull(it.played)}, " +
+                    "from=${prevFen?.substringBefore(' ')}, to=$placement")
+            }
             mateLine = null
             resyncTo(
                 placement,
@@ -1933,7 +1969,13 @@ class AnalysisCoordinator(
                 // The celebration stays; a "best move" nod would only replace it.
             } else if (classified != null) {
                 val suggested = beforeAnalysis?.bestMove?.trim()
-                postCoachReaction(classified, beforeFen, suggested.equals(move.uci, ignoreCase = true))
+                // A premove of the mate played without a fresh search has no beforeAnalysis,
+                // but it was the arrow on screen all the same.
+                postCoachReaction(
+                    classified,
+                    beforeFen,
+                    remaining.isNotEmpty() || suggested.equals(move.uci, ignoreCase = true),
+                )
             } else {
                 Log.w(TAG, "User move ${move.uci} could not be classified: no coach reaction")
             }
@@ -1945,11 +1987,26 @@ class AnalysisCoordinator(
         // The opponent played the reply the forced mate on screen expected: the user's remaining
         // premoves stay visible through the search, until the new analysis replaces them.
         val remainingMate = advanceMateLine(move)
-        val keepPremoves = remainingMate.isNotEmpty()
-        if (keepPremoves) postMultiSuggestion(remainingMate, mateLine?.flipped ?: !userIsWhite)
+        if (remainingMate.isNotEmpty()) {
+            // The mate is forced and its line already known: searching this position again
+            // would only replace the line (often by a different or shallower one, with `played`
+            // back at 0) while the user's premove is already on its way, which is what made the
+            // arrows stop advancing. Show the next step at once and wait for the next move.
+            postMultiSuggestion(remainingMate, mateLine?.flipped ?: !userIsWhite)
+            previousFen = beforeFen
+            previousAnalysis = beforeAnalysis
+            currentAnalyses = null
+            lastKnownGoodFen = newFen
+            lastMove = move
+            lastClassified = null
+            postClearOpponentBadge()
+            EngineStats.lastFen = newFen
+            EngineStats.whiteAtBottom = whiteAtBottom
+            return
+        }
         val newAnalyses = recentlyShown(newFen) ?: run {
             val searchMs = searchTimeMs()
-            postOverlayThinking(searchMs, keepArrows = keepPremoves)
+            postOverlayThinking(searchMs)
             analyzeInterruptibly(newFen, placement, searchMs)
         }
         if (!running.get()) return
@@ -1979,10 +2036,7 @@ class AnalysisCoordinator(
             // An interrupted search is too shallow to keep for classifying the next move.
             if (positionStale) currentAnalyses = null
             stablePlacement = null
-            // A queued premove may already have been played. The mate's arrows stay until the
-            // board is read again (forced by the line above): that read either continues the
-            // line or clears the overlay.
-            if (!keepPremoves) postOverlayClear()
+            postOverlayClear()
             return
         }
         render()
@@ -2461,11 +2515,14 @@ class AnalysisCoordinator(
         // Compared by squares only: a promotion piece may be written differently or be missing.
         val uci = move.uci
         if (expected == null || expected.length < 4 || !expected.regionMatches(0, uci, 0, 4, ignoreCase = true)) {
+            Log.d(TAG, "MateLine left: move=$uci, expected=$expected, played=${line.played}, pv.size=${line.pv.size}")
             mateLine = null
             return emptyList()
         }
         line.played++
         val remaining = remainingMateLines(line)
+        Log.d(TAG, "MateLine advance: played=${line.played}, pv.size=${line.pv.size}, " +
+            "next=${line.pv.getOrNull(line.played)}, move=$uci, arrows left=${remaining.size}")
         if (remaining.isEmpty()) {
             // Only a line drawn to its end has the mating move as its last arrow; one cut short
             // (MAX_MATE_PREMOVES, incomplete PV) just runs out and is searched again.
@@ -2524,23 +2581,16 @@ class AnalysisCoordinator(
      */
     private fun catchUpMateLine(before: CharArray, after: CharArray): InferredMove? {
         val line = mateLine ?: return null
-        val moves = ArrayList<InferredMove>(MAX_MATE_CATCH_UP_PLIES)
-        val boards = ArrayList<CharArray>(MAX_MATE_CATCH_UP_PLIES + 1)
-        boards += before
-        var matched = false
-        for (k in 0 until MAX_MATE_CATCH_UP_PLIES) {
-            val uci = line.pv.getOrNull(line.played + k) ?: break
-            val (move, next) = applyUci(boards.last(), uci) ?: break
-            moves += move
-            boards += next
-            if (next.contentEquals(after)) {
-                matched = true
-                break
-            }
+        val match = matchMateLine(line, before, after)
+        if (match == null) {
+            Log.d(TAG, "MateLine catch-up: no match within $MAX_MATE_CATCH_UP_PLIES plies, " +
+                "played=${line.played}, pv.size=${line.pv.size}, next=${line.pv.getOrNull(line.played)}, " +
+                "from=${placementOf(before)}, to=${placementOf(after)}")
+            return null
         }
-        if (!matched) return null
-        Log.d(TAG, "Forced mate: ${moves.size} plies played at once " +
-            "(${moves.joinToString(" ") { it.uci }}), advancing the line")
+        val (moves, boards) = match
+        Log.d(TAG, "MateLine catch-up: ${moves.size} plies played at once " +
+            "(${moves.joinToString(" ") { it.uci }}) from played=${line.played}, pv.size=${line.pv.size}")
         for (i in 0 until moves.size - 1) {
             val move = moves[i]
             val from = boards[i]
@@ -2561,6 +2611,30 @@ class AnalysisCoordinator(
             previousAnalysis = null
         }
         return moves.last()
+    }
+
+    /**
+     * The next plies of [line] (from [MateLine.played] on, at most [MAX_MATE_CATCH_UP_PLIES])
+     * that turn [before] into [after], with the boards along the way (`boards[0]` is [before],
+     * `boards[i + 1]` the board after `moves[i]`). Null when [after] is not on the line.
+     * Changes nothing.
+     */
+    private fun matchMateLine(
+        line: MateLine,
+        before: CharArray,
+        after: CharArray,
+    ): Pair<List<InferredMove>, List<CharArray>>? {
+        val moves = ArrayList<InferredMove>(MAX_MATE_CATCH_UP_PLIES)
+        val boards = ArrayList<CharArray>(MAX_MATE_CATCH_UP_PLIES + 1)
+        boards += before
+        for (k in 0 until MAX_MATE_CATCH_UP_PLIES) {
+            val uci = line.pv.getOrNull(line.played + k) ?: break
+            val (move, next) = applyUci(boards.last(), uci) ?: break
+            moves += move
+            boards += next
+            if (next.contentEquals(after)) return moves to boards
+        }
+        return null
     }
 
     /**
