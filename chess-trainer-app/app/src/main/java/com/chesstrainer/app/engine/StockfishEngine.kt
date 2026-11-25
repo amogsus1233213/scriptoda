@@ -89,7 +89,7 @@ class StockfishEngine(private val binaryPath: String) {
         private const val POLL_INTERVAL_MS = 100L
         private const val ENGINE_THREADS = 6
         /** First hash size tried. See the class comment for the fallback. */
-        private const val ENGINE_HASH_MB = 1800
+        private const val ENGINE_HASH_MB = 512
         /** The hash size is never reduced below this. */
         private const val MIN_HASH_MB = 64
         /**
