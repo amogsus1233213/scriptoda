@@ -3,6 +3,7 @@ package com.chesstrainer.app.engine
 import android.util.Log
 import java.io.BufferedReader
 import java.io.BufferedWriter
+import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
@@ -42,6 +43,12 @@ data class AnalysisResult(
  * shared between threads. Every call except [stop] blocks, so call them off the main thread.
  *
  * If the process dies, the next [analyze] call restarts it transparently.
+ *
+ * The hash table is the engine's one large allocation. [ENGINE_HASH_MB] is only the first size
+ * tried: when the engine dies or stops answering while allocating it, or is killed later during a
+ * search (Android's low memory killer), the size is halved, down to [MIN_HASH_MB], and the
+ * engine is started again. The reduced size is kept for the lifetime of this instance, so a size
+ * that got the engine killed is not tried again. [hashMb] tells the size in use.
  */
 class StockfishEngine(private val binaryPath: String) {
 
@@ -66,7 +73,16 @@ class StockfishEngine(private val binaryPath: String) {
         private const val DESTROY_WAIT_MS = 500L
         private const val POLL_INTERVAL_MS = 100L
         private const val ENGINE_THREADS = 6
+        /** First hash size tried. See the class comment for the fallback. */
         private const val ENGINE_HASH_MB = 1800
+        /** The hash size is never reduced below this. */
+        private const val MIN_HASH_MB = 64
+        /**
+         * Time given to the engine to allocate and clear the hash table ("setoption name Hash",
+         * "ucinewgame"). Clearing a large table on a phone short of memory takes far longer than
+         * a plain "isready".
+         */
+        private const val HASH_READY_TIMEOUT_MS = 10_000L
         /** Number of final search depths compared by [AnalysisResult.evalSwing]. */
         private const val SWING_DEPTHS = 4
 
@@ -87,16 +103,70 @@ class StockfishEngine(private val binaryPath: String) {
     @Volatile private var initialized = false
     @Volatile private var currentMultiPv = 1
 
+    /** Hash size (MB) the next launch asks for. Only ever reduced. */
+    @Volatile private var targetHashMb = ENGINE_HASH_MB
+    /** Incremented by every [quit], so a search can tell a requested shutdown from a death. */
+    @Volatile private var quitCount = 0
+    /** Set when the process died on its own during the current search. Guarded by [analysisLock]. */
+    private var searchDied = false
+
     /**
-     * Launches the engine process and performs the UCI handshake.
+     * Hash size (MB) the running engine was configured with, 0 while it is not running. Lower
+     * than the default when larger sizes could not be allocated or got the engine killed.
+     */
+    @Volatile var hashMb = 0
+        private set
+
+    private enum class Launch { READY, HASH_FAILED, FAILED }
+
+    /**
+     * Launches the engine process and performs the UCI handshake. If the engine cannot take the
+     * hash size asked for, it is launched again with half of it until one works.
      *
      * @return true if the engine answered "uciok" and "readyok", false otherwise.
      */
-    fun start(): Boolean = synchronized(stateLock) {
-        if (isReady()) return true
-        shutdownProcess()
+    fun start(): Boolean = synchronized(stateLock) { startLocked() }
 
-        try {
+    private fun startLocked(): Boolean {
+        if (isReady()) return true
+        while (true) {
+            val hash = targetHashMb.coerceAtLeast(MIN_HASH_MB)
+            when (launch(hash)) {
+                Launch.READY -> {
+                    hashMb = hash
+                    Log.i(TAG, "Engine ready: Hash=$hash MB, Threads=$ENGINE_THREADS" +
+                        if (hash < ENGINE_HASH_MB) " (reduced from $ENGINE_HASH_MB MB)" else "")
+                    return true
+                }
+                Launch.FAILED -> return false
+                Launch.HASH_FAILED -> if (!reduceHash("could not be allocated")) {
+                    Log.e(TAG, "Engine does not start even with Hash=$hash MB; giving up for now")
+                    return false
+                }
+            }
+        }
+    }
+
+    /**
+     * Halves the hash size used by the next launch.
+     *
+     * @return false if it already was at [MIN_HASH_MB].
+     */
+    private fun reduceHash(why: String): Boolean {
+        val current = targetHashMb
+        if (current <= MIN_HASH_MB) return false
+        val next = (current / 2).coerceAtLeast(MIN_HASH_MB)
+        targetHashMb = next
+        Log.w(TAG, "Hash=$current MB $why; next attempt uses $next MB")
+        return true
+    }
+
+    /** One launch attempt with a hash table of [hash] MB. Leaves no process behind on failure. */
+    private fun launch(hash: Int): Launch {
+        shutdownProcess()
+        Log.i(TAG, "Starting engine with Hash=$hash MB (device MemAvailable: ${memAvailableMb() ?: "?"} MB)")
+
+        return try {
             val p = ProcessBuilder(binaryPath)
                 .redirectErrorStream(true)
                 .start()
@@ -132,31 +202,72 @@ class StockfishEngine(private val binaryPath: String) {
             if (!send("uci") ||
                 waitForLine(queue, deadlineAfter(HANDSHAKE_TIMEOUT_MS)) { it == "uciok" } == null
             ) {
+                Log.e(TAG, "No uciok from the engine (${describeExit(p)})")
                 shutdownProcess()
-                return false
+                return Launch.FAILED
             }
 
-            // Sized for a mid-range phone (2 big + 6 little cores): more threads or a larger
-            // hash table make Android more likely to kill the process.
-            send("setoption name Threads value $ENGINE_THREADS")
-            send("setoption name Hash value $ENGINE_HASH_MB")
-
-            if (!send("isready") ||
+            // Threads first and on its own: a failure here has nothing to do with the hash size.
+            if (!send("setoption name Threads value $ENGINE_THREADS") || !send("isready") ||
                 waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
             ) {
+                Log.e(TAG, "Engine did not accept Threads=$ENGINE_THREADS (${describeExit(p)})")
                 shutdownProcess()
-                return false
+                return Launch.FAILED
+            }
+
+            // The engine allocates and clears the table while handling this option. When it
+            // cannot, it prints an error and exits, or Android kills it; "isready" is answered
+            // only once the table is in place.
+            var lastOutput = ""
+            val hashSet = send("setoption name Hash value $hash") && send("isready") &&
+                waitForLine(queue, deadlineAfter(HASH_READY_TIMEOUT_MS)) {
+                    if (it != "readyok") lastOutput = it
+                    it == "readyok"
+                } != null
+            // Second check: a full "uci" round trip proves the engine survived the allocation
+            // and still answers commands.
+            val alive = hashSet && p.isAlive && send("uci") &&
+                waitForLine(queue, deadlineAfter(HANDSHAKE_TIMEOUT_MS)) { it == "uciok" } != null &&
+                p.isAlive
+            if (!alive) {
+                Log.w(TAG, "Engine lost while setting Hash=$hash MB (${describeExit(p)})" +
+                    if (lastOutput.isNotEmpty()) ", last output: $lastOutput" else "")
+                shutdownProcess()
+                return Launch.HASH_FAILED
             }
 
             initialized = true
-            true
+            Launch.READY
         } catch (e: IOException) {
+            Log.e(TAG, "Could not launch the engine", e)
             shutdownProcess()
-            false
-        } catch (e: SecurityException) {
+            Launch.FAILED
+        } catch (e: RuntimeException) {
+            // SecurityException and anything else the process launch can throw.
+            Log.e(TAG, "Could not launch the engine", e)
             shutdownProcess()
-            false
+            Launch.FAILED
         }
+    }
+
+    /** "still running" or the exit code of [p], for the log. */
+    private fun describeExit(p: Process): String = try {
+        "exit code ${p.exitValue()}"
+    } catch (_: IllegalThreadStateException) {
+        "still running, not answering"
+    }
+
+    /** The kernel's estimate of the memory available without swapping, or null if unknown. */
+    private fun memAvailableMb(): Long? = try {
+        File("/proc/meminfo").useLines { all ->
+            all.firstOrNull { it.startsWith("MemAvailable:") }
+                ?.split(WHITESPACE)?.getOrNull(1)?.toLongOrNull()?.div(1024)
+        }
+    } catch (_: IOException) {
+        null
+    } catch (_: RuntimeException) {
+        null
     }
 
     /** True when the process is alive and the UCI handshake has completed. */
@@ -201,100 +312,130 @@ class StockfishEngine(private val binaryPath: String) {
         }
 
         analysisLock.withLock {
-            if (!isReady() && !start()) return null
-            val queue = lines
-
-            queue.clear()
-            if (!send("isready") ||
-                waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
-            ) {
-                markDeadIfNeeded()
-                return null
-            }
-
-            if (lineCount != currentMultiPv) {
-                if (!send("setoption name MultiPV value $lineCount")) {
-                    markDeadIfNeeded()
+            // A second attempt only after the engine died on its own: it is restarted (with a
+            // smaller hash table) and the same position searched again, so that a killed engine
+            // costs a delay and not the answer.
+            repeat(2) { attempt ->
+                val quitsBefore = quitCount
+                searchDied = false
+                val results = searchOnce(fen, depth, lineCount, moves, moveTimeMs)
+                if (results != null) return results
+                // Nothing to retry if the engine is alive, was shut down on purpose, or the
+                // calling thread is being stopped.
+                if (!searchDied || quitCount != quitsBefore || Thread.currentThread().isInterrupted) {
                     return null
                 }
-                currentMultiPv = lineCount
+                reduceHash("in use when the engine died during a search")
+                Log.w(TAG, "Engine died during a search" + if (attempt == 0) "; restarting and retrying" else " again")
             }
-
-            val position = buildString {
-                append("position fen ").append(fen.trim())
-                if (moves.isNotEmpty()) append(" moves ").append(moves.joinToString(" "))
-            }
-            // Both limits are sent: the engine stops at whichever comes first.
-            val goCommand = if (moveTimeMs > 0) "go depth $depth movetime $moveTimeMs" else "go depth $depth"
-            if (!send(position) || !send(goCommand)) {
-                markDeadIfNeeded()
-                return null
-            }
-
-            val deadline = deadlineAfter(if (moveTimeMs > 0) moveTimeMs.toLong() + ANALYSIS_TIMEOUT_MS else ANALYSIS_TIMEOUT_MS)
-            val infos = HashMap<Int, InfoLine>()
-            // Exact scores of the best line, one per depth, to tell how settled the eval is.
-            val bestLineHistory = ArrayList<InfoLine>()
-            // Latest line seen for each first move, whatever its multipv slot or depth; see
-            // [buildResults] for why the slots alone are not enough.
-            val byFirstMove = HashMap<String, InfoLine>()
-            var order = 0
-            fun record(parsed: InfoLine) {
-                val info = parsed.copy(order = ++order)
-                recordBestLine(bestLineHistory, info)
-                val existing = infos[info.multiPv]
-                if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
-                val first = info.pv.firstOrNull() ?: return
-                val known = byFirstMove[first]
-                // Newest wins, except that a bound never takes the place of an exact score.
-                if (known == null || !info.isBound || known.isBound) {
-                    byFirstMove[first] = keepLongerPv(known, info)
-                }
-            }
-            var bestMove: String? = null
-
-            while (bestMove == null) {
-                val line = waitForLine(queue, deadline) { true } ?: break
-                if (line.startsWith("bestmove")) {
-                    bestMove = line.split(WHITESPACE).getOrNull(1) ?: "(none)"
-                } else if (line.startsWith("info ")) {
-                    record(parseInfo(line) ?: continue)
-                }
-            }
-
-            if (bestMove == null) {
-                // The process died mid-search: whatever was collected comes from a half-finished
-                // search, so nothing is returned and the next call restarts the engine.
-                if (process?.isAlive != true) {
-                    markDeadIfNeeded()
-                    return null
-                }
-                send("stop")
-                val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
-                while (bestMove == null) {
-                    val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
-                    if (stopLine.startsWith("bestmove")) {
-                        bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
-                    } else if (stopLine.startsWith("info ")) {
-                        record(parseInfo(stopLine) ?: continue)
-                    }
-                }
-                if (bestMove == null) {
-                    // Still no bestmove: the engine is either dead or still searching. Left
-                    // alive, its late bestmove would be read as the answer of the next search
-                    // and every later result would be one search behind, so it is torn down and
-                    // the next call starts a fresh process.
-                    val diedMeanwhile = process?.isAlive != true
-                    Log.w(TAG, "No bestmove before the timeout (process dead=$diedMeanwhile); restarting the engine")
-                    synchronized(stateLock) { shutdownProcess() }
-                    if (diedMeanwhile) return null
-                    bestMove = infos[1]?.pv?.firstOrNull() ?: infos.values.firstOrNull()?.pv?.firstOrNull()
-                    if (bestMove == null) return null
-                }
-            }
-
-            return buildResults(bestMove, infos, bestLineHistory, byFirstMove)
+            return null
         }
+    }
+
+    /** One search on the running engine (started if needed). Call with [analysisLock] held. */
+    private fun searchOnce(
+        fen: String,
+        depth: Int,
+        lineCount: Int,
+        moves: List<String>,
+        moveTimeMs: Int
+    ): List<AnalysisResult>? {
+        if (!isReady() && !start()) return null
+        val queue = lines
+
+        queue.clear()
+        if (!send("isready") ||
+            waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
+        ) {
+            markDeadIfNeeded()
+            return null
+        }
+
+        if (lineCount != currentMultiPv) {
+            if (!send("setoption name MultiPV value $lineCount")) {
+                markDeadIfNeeded()
+                return null
+            }
+            currentMultiPv = lineCount
+        }
+
+        val position = buildString {
+            append("position fen ").append(fen.trim())
+            if (moves.isNotEmpty()) append(" moves ").append(moves.joinToString(" "))
+        }
+        // Both limits are sent: the engine stops at whichever comes first.
+        val goCommand = if (moveTimeMs > 0) "go depth $depth movetime $moveTimeMs" else "go depth $depth"
+        if (!send(position) || !send(goCommand)) {
+            markDeadIfNeeded()
+            return null
+        }
+
+        val deadline = deadlineAfter(if (moveTimeMs > 0) moveTimeMs.toLong() + ANALYSIS_TIMEOUT_MS else ANALYSIS_TIMEOUT_MS)
+        val infos = HashMap<Int, InfoLine>()
+        // Exact scores of the best line, one per depth, to tell how settled the eval is.
+        val bestLineHistory = ArrayList<InfoLine>()
+        // Latest line seen for each first move, whatever its multipv slot or depth; see
+        // [buildResults] for why the slots alone are not enough.
+        val byFirstMove = HashMap<String, InfoLine>()
+        var order = 0
+        fun record(parsed: InfoLine) {
+            val info = parsed.copy(order = ++order)
+            recordBestLine(bestLineHistory, info)
+            val existing = infos[info.multiPv]
+            if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
+            val first = info.pv.firstOrNull() ?: return
+            val known = byFirstMove[first]
+            // Newest wins, except that a bound never takes the place of an exact score.
+            if (known == null || !info.isBound || known.isBound) {
+                byFirstMove[first] = keepLongerPv(known, info)
+            }
+        }
+        var bestMove: String? = null
+
+        while (bestMove == null) {
+            val line = waitForLine(queue, deadline) { true } ?: break
+            if (line.startsWith("bestmove")) {
+                bestMove = line.split(WHITESPACE).getOrNull(1) ?: "(none)"
+            } else if (line.startsWith("info ")) {
+                record(parseInfo(line) ?: continue)
+            }
+        }
+
+        if (bestMove == null) {
+            // The process died mid-search: whatever was collected comes from a half-finished
+            // search, so nothing is returned and the next call restarts the engine.
+            if (process?.isAlive != true) {
+                markDeadIfNeeded()
+                return null
+            }
+            send("stop")
+            val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
+            while (bestMove == null) {
+                val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
+                if (stopLine.startsWith("bestmove")) {
+                    bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
+                } else if (stopLine.startsWith("info ")) {
+                    record(parseInfo(stopLine) ?: continue)
+                }
+            }
+            if (bestMove == null) {
+                // Still no bestmove: the engine is either dead or still searching. Left
+                // alive, its late bestmove would be read as the answer of the next search
+                // and every later result would be one search behind, so it is torn down and
+                // the next call starts a fresh process.
+                val diedMeanwhile = process?.isAlive != true
+                Log.w(TAG, "No bestmove before the timeout (process dead=$diedMeanwhile); restarting the engine")
+                synchronized(stateLock) { shutdownProcess() }
+                if (diedMeanwhile) {
+                    searchDied = true
+                    return null
+                }
+                bestMove = infos[1]?.pv?.firstOrNull() ?: infos.values.firstOrNull()?.pv?.firstOrNull()
+                if (bestMove == null) return null
+            }
+        }
+
+        return buildResults(bestMove, infos, bestLineHistory, byFirstMove)
     }
 
     /**
@@ -313,8 +454,9 @@ class StockfishEngine(private val binaryPath: String) {
         if (!isReady()) return false
         val queue = lines
         queue.clear()
+        // "ucinewgame" clears the whole hash table, hence the long timeout.
         if (!send("ucinewgame") || !send("isready") ||
-            waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
+            waitForLine(queue, deadlineAfter(HASH_READY_TIMEOUT_MS)) { it == "readyok" } == null
         ) {
             markDeadIfNeeded()
             return false
@@ -338,6 +480,7 @@ class StockfishEngine(private val binaryPath: String) {
 
     /** Asks the engine to exit and releases the process. */
     fun quit() {
+        quitCount++
         synchronized(stateLock) {
             val p = process ?: return
             if (p.isAlive) {
@@ -651,12 +794,14 @@ class StockfishEngine(private val binaryPath: String) {
     /** Tears the process down if it died so the next call restarts it. */
     private fun markDeadIfNeeded() {
         if (process?.isAlive != true) {
+            searchDied = true
             synchronized(stateLock) { shutdownProcess() }
         }
     }
 
     private fun shutdownProcess() {
         initialized = false
+        hashMb = 0
         synchronized(writeLock) {
             try {
                 writer?.close()
