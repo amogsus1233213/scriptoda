@@ -2330,7 +2330,9 @@ class AnalysisCoordinator(
                 evalCp = best.evalCp,
                 mateIn = left * sign,
                 label = mateLabel(left),
-                labelColor = MoveColors.MATE,
+                // Same colors as render() gives the best arrow, so the move looks the same
+                // when it becomes the move to play: gold only for the mating move itself.
+                labelColor = if (left == 1) MoveColors.MATE else MoveColors.BEST,
                 rank = 1,
                 step = step,
                 isMateTarget = left == 1,
@@ -2410,9 +2412,13 @@ class AnalysisCoordinator(
 
     /**
      * Records [move] as played against the forced mate on screen ([mateLine]) and returns the
-     * arrows of that mate still to be played: the opponent's replies and the user's numbered
-     * moves, with their original numbers. Empty, and the line forgotten, when no mate is on
-     * screen, [move] is not its next move, or nothing is left of it (the mate was delivered).
+     * arrows of that mate still to be played: the opponent's replies and the user's later
+     * moves, exactly as [premoveLines] returned them (steps and mate distances unchanged).
+     * None of them has step 1 any more, so the overlay (ArrowView.setArrows) makes the earliest
+     * remaining user move the bold main arrow, with its own "M<n>" pill, and numbers the ones
+     * after it 2, 3, ... by position: the same picture [render] draws once the position has
+     * been searched again. Empty, and the line forgotten, when no mate is on screen, [move] is
+     * not its next move, or nothing is left of it (the mate was delivered).
      */
     private fun advanceMateLine(move: InferredMove): List<SuggestedLineData> {
         val line = mateLine ?: return emptyList()

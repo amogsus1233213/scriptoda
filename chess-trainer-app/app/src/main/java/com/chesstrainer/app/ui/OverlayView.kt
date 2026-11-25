@@ -134,7 +134,7 @@ data class SuggestedLine(
      * destination square ([to]). 0 or 1 = the move to play now: a bold arrow in [labelColor],
      * no number (the coordinator sends 0 outside a mate).
      */
-    val step: Int = 1,
+    val step: Int = 0,
     /**
      * An opponent reply inside the mate sequence (grey dashed arrow, no number). Its [step] is
      * the step of the user move it replies to, so it must be told apart by this flag, not by step.
@@ -311,22 +311,6 @@ class OverlayService : Service() {
     // ---------------------------------------------------------------------------------------
     // Public API (thread-safe: all calls are marshalled onto the main thread)
     // ---------------------------------------------------------------------------------------
-
-    /** Single-move API kept for backwards compatibility; wraps into a one-line multi suggestion. */
-    fun showSuggestion(
-        from: String,
-        to: String,
-        evalCp: Int?,
-        mateIn: Int?,
-        label: String,
-        labelColor: Int,
-        isFlipped: Boolean,
-    ) {
-        showMultiSuggestion(
-            listOf(SuggestedLine(from, to, evalCp, mateIn, label, labelColor, rank = 1)),
-            isFlipped,
-        )
-    }
 
     /** Shows up to five suggested lines (ordered by [SuggestedLine.rank]) as arrows + commentary. */
     fun showMultiSuggestion(lines: List<SuggestedLine>, isFlipped: Boolean) {
@@ -968,7 +952,7 @@ data class ArrowData(
      * user's later moves of the same line (premoves): always thin, faded teal arrows, whatever
      * their [color], with their place in the order in a small chip on the destination square.
      */
-    val step: Int = 1,
+    val step: Int = 0,
     /**
      * The opponent's expected reply between two of the user's moves: a thin, grey, dashed arrow
      * without a number. Never counted as a suggestion, whatever its [step].
@@ -1207,15 +1191,6 @@ class ArrowView(
         premoves = plan.take(MAX_PREMOVES)
         opponentReplies = all.filter { it.isOpponentReply }
             .sortedBy { it.step }.take(MAX_OPPONENT_REPLIES)
-        invalidate()
-    }
-
-    fun clearArrows() {
-        arrows = emptyList()
-        premoves = emptyList()
-        opponentReplies = emptyList()
-        opBadgeSquare = null
-        opBadgeLabel = null
         invalidate()
     }
 
