@@ -149,6 +149,8 @@ class AnalysisCoordinator(
 
         /** How often the search of one placement is repeated after it gave no analysis. */
         private const val MAX_ANALYSIS_RETRIES = 2
+        /** How often in a row a position is read again after its worker task threw. */
+        private const val MAX_WORKER_FAILURE_RETRIES = 3
 
         /**
          * The engine binary, shipped as `jniLibs/arm64-v8a/libstockfish.so`. Android 10+ refuses
@@ -432,6 +434,9 @@ class AnalysisCoordinator(
     /** Placement whose search last gave no analysis, and how often it was retried. Worker only. */
     private var failedPlacement: String? = null
     private var failedRetries = 0
+
+    /** Worker tasks that threw in a row; see [recoverFromWorkerFailure]. Worker only. */
+    private var workerFailures = 0
 
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
@@ -790,6 +795,18 @@ class AnalysisCoordinator(
             null
         }
         if (raw.isNullOrEmpty()) Log.w(TAG, "Engine returned no analysis (ready=${e.isReady()}) for $fen")
+        // Null (as opposed to a result cut short by an interrupt) means the engine did not answer
+        // at all. A process that died is restarted by the next call on its own, but one that is
+        // alive and no longer answering would fail every search from here on, leaving every
+        // position without arrows. It is torn down so the retry starts a fresh process.
+        if (raw == null && running.get() && e.isReady()) {
+            Log.w(TAG, "Engine is alive but gave no answer; restarting it")
+            try {
+                e.quit()
+            } catch (ex: RuntimeException) {
+                Log.w(TAG, "Could not shut the unresponsive engine down", ex)
+            }
+        }
         val validated = validatedAnalyses(fen, raw)
         checkEvalSanity(fen, validated?.firstOrNull())
         if (validated.isNullOrEmpty()) return validated
@@ -1137,13 +1154,32 @@ class AnalysisCoordinator(
         worker.execute {
             try {
                 task()
+                workerFailures = 0
             } catch (t: Exception) {
                 Log.e(TAG, "Worker task failed", t)
+                recoverFromWorkerFailure()
             }
         }
         true
     } catch (e: RejectedExecutionException) {
         false
+    }
+
+    /**
+     * Worker thread, after a task threw. The placement it was handling is already recorded as
+     * [stablePlacement], so without this it would never be looked at again and the position
+     * would stay without arrows until the board changes. It is forgotten so the next frame
+     * starts over from the board, and a forced mate being followed is dropped with it (its
+     * bookkeeping may be half done), which sends that position through a normal search. Not
+     * repeated endlessly: after [MAX_WORKER_FAILURE_RETRIES] failures in a row the position is
+     * left alone until the board changes.
+     */
+    private fun recoverFromWorkerFailure() {
+        mateLine = null
+        mateDelivered = false
+        if (workerFailures >= MAX_WORKER_FAILURE_RETRIES) return
+        workerFailures++
+        stablePlacement = null
     }
 
     // -------------------------------------------------------------------------------------
@@ -1765,6 +1801,10 @@ class AnalysisCoordinator(
         lastSearchedEvalWhite = null
         // A forced mate of the old tracking state must not be continued by a move of the new one.
         mateLine = null
+        mateDelivered = false
+        // Retries belong to the placement that was just forgotten.
+        failedPlacement = null
+        failedRetries = 0
     }
 
     private fun updateBoardBounds(grid: Grid, px: Pixels, bitmap: Bitmap) {
