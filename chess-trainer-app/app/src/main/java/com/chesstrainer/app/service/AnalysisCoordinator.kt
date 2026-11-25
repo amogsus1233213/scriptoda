@@ -975,10 +975,12 @@ class AnalysisCoordinator(
         val previous = analysis.previousMate ?: return false
         if ((previous > 0) != (mate > 0)) return false
         if (abs(mate - previous) > MATE_STABLE_MAX_DELTA) return false
-        // The engine must have searched deep enough to actually prove the mate. A mate in N
-        // is 2N-1 plies; require the search depth to reach at least that far. Without this,
-        // a shallow depth can "settle" on a mate distance that deeper search will revise.
-        val requiredDepth = 2 * abs(mate) - 1
+        // The engine must have searched deep enough for the mate distance to be meaningful.
+        // Requiring the full 2N-1 plies is too strict: a mate in 8 would need depth 15, which
+        // a 5-second search often does not reach, so the arrows never appear. Requiring depth
+        // >= |mate| is enough: the engine has seen at least that many plies of forced play, and
+        // lastCommittedMate prevents the distance from jumping once arrows are drawn.
+        val requiredDepth = abs(mate)
         if (analysis.depth < requiredDepth) {
             Log.d(TAG, "Mate in $mate not settled: depth ${analysis.depth} < required $requiredDepth")
             return false
@@ -2188,6 +2190,38 @@ class AnalysisCoordinator(
             if (before != null) MoveInference.infer(before, after, epSquareOf(prevFen)) else null
         } else {
             null
+        }
+
+        // A user-colored piece moved while currentFen says it is the opponent's turn: this is a
+        // queued premove, not a real move. premovePreviewBase may have missed it (the board picture
+        // differs from the model, or there is no mateLine). Do not process it as a move — it would
+        // flip the tracked side to move, corrupt the FEN and drop the mate line.
+        if (move != null && prevFen != null) {
+            val opponentToMove = sideToMoveIsWhite(prevFen) != userIsWhite
+            if (opponentToMove && move.white == userIsWhite) {
+                Log.d(TAG, "Premove fallback: user piece moved on opponent's turn (${move.uci}), " +
+                    "keeping state (mateLine=${mateLine != null})")
+                premovePreviewPlacement = placement
+                val line = mateLine
+                if (line != null) {
+                    // Find the next user-move index in the PV (even indices are user moves).
+                    val nextUserIdx = if (line.played % 2 == 0) line.played else line.played + 1
+                    val expected = line.pv.getOrNull(nextUserIdx)
+                    if (expected != null && expected.length >= 4 &&
+                        expected.regionMatches(0, move.uci, 0, 4, ignoreCase = true)
+                    ) {
+                        val remaining = remainingMateLines(line, premoveOffset = 1)
+                        if (remaining.isNotEmpty()) {
+                            Log.d(TAG, "Premove fallback: matches PV[$nextUserIdx]=$expected, " +
+                                "showing next arrow")
+                            postMultiSuggestion(remaining, line.flipped)
+                        }
+                    } else {
+                        Log.d(TAG, "Premove fallback: ${move.uci} != expected $expected at PV[$nextUserIdx]")
+                    }
+                }
+                return
+            }
         }
 
         // Not one move, but a forced mate is being followed: a queued premove is played together
