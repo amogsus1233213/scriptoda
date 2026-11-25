@@ -85,7 +85,7 @@ class AnalysisCoordinator(
         const val DEFAULT_DEPTH = 18
 
         /** Number of engine lines (Multi-PV) shown as suggestions. */
-        private const val NUM_LINES = 3
+        private const val NUM_LINES = 4
 
         /** Time budget (ms) for the main multi-PV search; 0 means use depth only. */
         private const val SEARCH_TIME_MS = 5000
@@ -228,6 +228,15 @@ class AnalysisCoordinator(
         /** Frames without a visible board after which the overlay suggestion is cleared. */
         private const val MISSED_FRAMES_BEFORE_CLEAR = 6
 
+        /**
+         * Vision path: how often in a row the same small unexplained board change (see the
+         * arrow-misread guard in [onPositionChanged]) is read before the arrows are taken off
+         * the screen to find out whether they cause it, and how often before it is accepted as
+         * real. The reads between the two are made with the arrows gone.
+         */
+        private const val ARROW_GUARD_CLEAR_HITS = 3
+        private const val ARROW_GUARD_ACCEPT_HITS = 6
+
         /** Minimum change (screen fraction) before new board bounds are pushed to the overlay. */
         private const val BOUNDS_EPSILON = 0.004f
 
@@ -339,6 +348,17 @@ class AnalysisCoordinator(
     private var missedFrames = 0
     private var boardVisible = false
 
+    /**
+     * Accessibility path: consecutive frames in which the board could not be located on screen.
+     * The accessibility positions outlive the board (another screen of the chess app), so this
+     * is what takes the arrows down there; see [noteAccessibilityBoard]. Worker thread only.
+     */
+    private var accessibilityMissedBoards = 0
+
+    /** Placement last held back by the arrow-misread guard and how often in a row. Worker only. */
+    private var guardedPlacement: String? = null
+    private var guardedCount = 0
+
     /** Position before [currentFen] and its analysis (mover = side to move in [previousFen]). */
     private var previousFen: String? = null
     private var previousAnalysis: AnalysisResult? = null
@@ -381,7 +401,8 @@ class AnalysisCoordinator(
     )
 
     /**
-     * Set by [render] when it draws a forced mate with premoves, dropped by every clearing of
+     * Set by [render] when it draws a forced mate with premoves (or a mate in one, which has
+     * none: [MateLine.lines] is then empty), dropped by every clearing of
      * the overlay ([postOverlayClear]) and as soon as a move leaves the line. While it is set
      * and the moves played are the expected ones, the remaining arrows stay on screen: the user
      * is queueing premoves from them and must not lose them when the first move is played and
@@ -427,6 +448,10 @@ class AnalysisCoordinator(
     @Volatile
     private var accessibilityFrameSeen = false
 
+    /** [AccessibilityData.targetPackageVisible] as last seen by [checkTargetLeft]. Poll thread. */
+    @Volatile
+    private var targetWasVisible = false
+
     /** Placement [pollAccessibility] last handed to the worker. */
     @Volatile
     private var polledPlacement: String? = null
@@ -451,6 +476,9 @@ class AnalysisCoordinator(
     /** Prepares the engine, loads saved templates and starts consuming screen frames. */
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        // A flag left set by an earlier run must not keep every frame of this one out.
+        processing.set(false)
+        targetWasVisible = AccessibilityData.targetPackageVisible
         // Non-blocking: fetches/loads the piece templates on its own background thread.
         templateManager.ensureLoaded()
         submit {
@@ -488,6 +516,7 @@ class AnalysisCoordinator(
         }
         mainHandler.post {
             OverlayService.instance?.clearSuggestion()
+            OverlayService.instance?.clearOpponentBadge()
             boundsDeliveredTo = null
         }
     }
@@ -1022,31 +1051,73 @@ class AnalysisCoordinator(
      */
     private fun pollAccessibility() {
         try {
-            if (!running.get() || !accessibilityFrameSeen) return
+            if (!running.get()) return
+            checkTargetLeft()
+            if (!accessibilityFrameSeen) return
             val live = liveAccessibilityPlacement() ?: return
             if (live == polledPlacement) return
             if (!processing.compareAndSet(false, true)) {
                 interruptStaleSearch()
                 return
             }
-            val positions = freshAccessibilityPositions()
-            if (positions == null) {
-                processing.set(false)
-                return
-            }
-            polledPlacement = live
-            val reportedOrientation = AccessibilityData.userPlaysWhite
-            val accepted = submit {
-                try {
-                    processAccessibilityPositions(positions, reportedOrientation, null, clearMoveOnly = true)
-                } finally {
-                    processing.set(false)
+            // Whatever happens below, the flag must not stay set without a task to reset it.
+            var handedOff = false
+            try {
+                val positions = freshAccessibilityPositions() ?: return
+                polledPlacement = live
+                val reportedOrientation = AccessibilityData.userPlaysWhite
+                handedOff = submit {
+                    try {
+                        processAccessibilityPositions(positions, reportedOrientation, null, clearMoveOnly = true)
+                    } finally {
+                        processing.set(false)
+                    }
                 }
+            } finally {
+                if (!handedOff) processing.set(false)
             }
-            if (!accepted) processing.set(false)
         } catch (e: RuntimeException) {
             // An exception escaping a scheduled task would silently end the polling.
             Log.w(TAG, "Accessibility poll failed", e)
+        }
+    }
+
+    /**
+     * Poll thread: takes the overlay down the moment the chess app stops being in front
+     * ([AccessibilityData.targetPackageVisible] going false). Without this the arrows stayed
+     * over the next app until the vision path had missed the board on
+     * [MISSED_FRAMES_BEFORE_CLEAR] frames. The overlay is cleared from here, as the worker may
+     * be inside a search; that search is stopped and its result dropped, and the worker then
+     * forgets the placement so the position is drawn again when the board is back.
+     */
+    private fun checkTargetLeft() {
+        val visible = AccessibilityData.targetPackageVisible
+        if (visible == targetWasVisible) return
+        targetWasVisible = visible
+        if (visible || !running.get()) return
+        Log.d(TAG, "Chess app left the screen; clearing the overlay")
+        if (searchingPlacement != null) {
+            positionStale = true
+            engine?.interruptSearch()
+        }
+        mainHandler.post {
+            OverlayService.instance?.clearSuggestion()
+            OverlayService.instance?.clearOpponentBadge()
+        }
+        submit {
+            if (!running.get()) return@submit
+            candidatePlacement = null
+            candidateCount = 0
+            candidateHistory.clear()
+            candidateFramesSinceStable = 0
+            stablePlacement = null
+            missedFrames = 0
+            if (boardVisible) {
+                boardVisible = false
+                lastHintStatus = STATUS_LOOKING
+                postStatus(STATUS_LOOKING)
+            }
+            postOverlayClear()
         }
     }
 
@@ -1095,50 +1166,50 @@ class AnalysisCoordinator(
             return
         }
 
-        // Check if accessibility data is available (higher accuracy than vision). When it is
-        // fresh and complete enough, piece recognition is skipped for this frame; the frame is
-        // still used to locate the board so the overlay has bounds to draw arrows in.
-        val accessibilityPositions = freshAccessibilityPositions()
-        if (accessibilityPositions != null) {
-            accessibilityFrameSeen = true
-            // The accessibility squares are absolute, so the screen orientation (needed to draw
-            // the arrows) must come from elsewhere: the accessibility service when it can tell,
-            // otherwise a cross-check against this frame (see processAccessibilityPositions).
-            val reportedOrientation = AccessibilityData.userPlaysWhite
-            // A failed copy only costs the bounds refresh; previously known bounds are reused.
-            val frame = copyBitmap(bitmap)
-            val accepted = submit {
+        // From here on the flag is set. It is reset by the worker task once one was accepted;
+        // on every other way out (nothing to do, rejected task, anything thrown) it is reset
+        // here, or no frame would ever be processed again.
+        var handedOff = false
+        try {
+            // Check if accessibility data is available (higher accuracy than vision). When it is
+            // fresh and complete enough, piece recognition is skipped for this frame; the frame is
+            // still used to locate the board so the overlay has bounds to draw arrows in.
+            val accessibilityPositions = freshAccessibilityPositions()
+            if (accessibilityPositions != null) {
+                accessibilityFrameSeen = true
+                // The accessibility squares are absolute, so the screen orientation (needed to draw
+                // the arrows) must come from elsewhere: the accessibility service when it can tell,
+                // otherwise a cross-check against this frame (see processAccessibilityPositions).
+                val reportedOrientation = AccessibilityData.userPlaysWhite
+                // A failed copy only costs the bounds refresh; previously known bounds are reused.
+                val frame = copyBitmap(bitmap)
+                handedOff = submit {
+                    try {
+                        val board = if (frame != null) updateBoundsFromFrame(frame) else null
+                        // Only a frame that was actually looked at says whether the board is there.
+                        if (frame != null) noteAccessibilityBoard(board != null)
+                        processAccessibilityPositions(accessibilityPositions, reportedOrientation, board)
+                    } finally {
+                        frame?.recycle()
+                        processing.set(false)
+                    }
+                }
+                if (!handedOff) frame?.recycle()
+                return
+            }
+
+            val copy = copyBitmap(bitmap) ?: return
+            handedOff = submit {
                 try {
-                    val board = if (frame != null) updateBoundsFromFrame(frame) else null
-                    processAccessibilityPositions(accessibilityPositions, reportedOrientation, board)
+                    processFrame(copy)
                 } finally {
-                    frame?.recycle()
+                    copy.recycle()
                     processing.set(false)
                 }
             }
-            if (!accepted) {
-                frame?.recycle()
-                processing.set(false)
-            }
-            return
-        }
-
-        val copy = copyBitmap(bitmap)
-        if (copy == null) {
-            processing.set(false)
-            return
-        }
-        val accepted = submit {
-            try {
-                processFrame(copy)
-            } finally {
-                copy.recycle()
-                processing.set(false)
-            }
-        }
-        if (!accepted) {
-            copy.recycle()
-            processing.set(false)
+            if (!handedOff) copy.recycle()
+        } finally {
+            if (!handedOff) processing.set(false)
         }
     }
 
@@ -1146,6 +1217,10 @@ class AnalysisCoordinator(
         if (bitmap.isRecycled) null else bitmap.copy(Bitmap.Config.ARGB_8888, false)
     } catch (e: OutOfMemoryError) {
         Log.w(TAG, "Out of memory copying frame")
+        null
+    } catch (e: RuntimeException) {
+        // E.g. IllegalStateException when the capture thread recycles the bitmap meanwhile.
+        Log.w(TAG, "Could not copy frame", e)
         null
     }
 
@@ -1201,6 +1276,7 @@ class AnalysisCoordinator(
         // The board is on screen: keep the overlay aligned even if this frame's pieces are
         // unreadable (e.g. mid-animation).
         missedFrames = 0
+        accessibilityMissedBoards = 0
         updateBoardBounds(grid, px, bitmap)
 
         val cells = CellReader.read(px, grid)
@@ -1308,6 +1384,33 @@ class AnalysisCoordinator(
     }
 
     /**
+     * Accessibility path, once per frame that was looked at: counts the frames in a row without
+     * a board on screen. The accessibility positions stay "fresh" for
+     * [ACCESSIBILITY_MAX_AGE_VISIBLE_MS] after the board is gone (another screen of the chess
+     * app), and an unchanged placement is never drawn or cleared again, so the arrows used to
+     * stay on screen for that long. After [MISSED_FRAMES_BEFORE_CLEAR] such frames the overlay
+     * is cleared and the placement forgotten; until the board is located again
+     * [processAccessibilityPositions] draws nothing, then the position is analysed afresh.
+     */
+    private fun noteAccessibilityBoard(found: Boolean) {
+        if (found) {
+            accessibilityMissedBoards = 0
+            return
+        }
+        if (!running.get()) return
+        accessibilityMissedBoards++
+        if (accessibilityMissedBoards != MISSED_FRAMES_BEFORE_CLEAR) return
+        Log.d(TAG, "No board on screen for $accessibilityMissedBoards accessibility frames; clearing the overlay")
+        stablePlacement = null
+        postOverlayClear()
+        if (boardVisible) {
+            boardVisible = false
+            lastHintStatus = STATUS_LOOKING
+            postStatus(STATUS_LOOKING)
+        }
+    }
+
+    /**
      * Accessibility counterpart of [processFrame]: converts the reported positions to a FEN and
      * feeds its placement into the same move-tracking path ([onPositionChanged]) that sets
      * [currentFen] for vision reads. Accessibility data is exact, so no multi-frame stability
@@ -1327,6 +1430,8 @@ class AnalysisCoordinator(
         clearMoveOnly: Boolean = false,
     ) {
         if (!running.get()) return
+        // The board is not on screen (see noteAccessibilityBoard): nothing to draw arrows on.
+        if (board == null && accessibilityMissedBoards >= MISSED_FRAMES_BEFORE_CLEAR) return
         ensureTemplatesLoaded()
 
         // When the accessibility service has move tracking active, it produces a full FEN with
@@ -1556,7 +1661,10 @@ class AnalysisCoordinator(
         if (placement == stablePlacement || placement == START_PLACEMENT) return null
         val cur = currentFen ?: return null
         val curPlacement = cur.substringBefore(' ')
-        if (curPlacement != stablePlacement) return null
+        // A null stablePlacement only means the placement must be confirmed again (e.g. after a
+        // search that was cut short); the tracked position is still the one to diff against.
+        val stable = stablePlacement
+        if (stable != null && curPlacement != stable) return null
         val before = parsePlacement(curPlacement) ?: return null
         val after = parsePlacement(placement) ?: return null
         return MoveInference.infer(before, after, epSquareOf(cur))
@@ -1585,7 +1693,8 @@ class AnalysisCoordinator(
         val line = mateLine ?: return false
         val cur = currentFen ?: return false
         val curPlacement = cur.substringBefore(' ')
-        if (placement == curPlacement || curPlacement != stablePlacement) return false
+        val stable = stablePlacement
+        if (placement == curPlacement || (stable != null && curPlacement != stable)) return false
         val before = parsePlacement(curPlacement) ?: return false
         val after = parsePlacement(placement) ?: return false
         return matchMateLine(line, before, after) != null
@@ -1805,6 +1914,8 @@ class AnalysisCoordinator(
         // Retries belong to the placement that was just forgotten.
         failedPlacement = null
         failedRetries = 0
+        guardedPlacement = null
+        guardedCount = 0
     }
 
     private fun updateBoardBounds(grid: Grid, px: Pixels, bitmap: Bitmap) {
@@ -1903,9 +2014,34 @@ class AnalysisCoordinator(
                     for (i in after.indices) {
                         if (after[i] != goodBoard[i]) diffs++
                     }
-                    if (diffs in 1..3) return
+                    if (diffs in 1..3) {
+                        if (placement == guardedPlacement) {
+                            guardedCount++
+                        } else {
+                            guardedPlacement = placement
+                            guardedCount = 1
+                        }
+                        // Not accepted, so it must not count as the stable placement either: it
+                        // would never be looked at again, and a real change of this size (a
+                        // capture and the recapture on the same square is 3 squares) would be
+                        // lost for good. It has to be read again.
+                        stablePlacement = null
+                        if (guardedCount < ARROW_GUARD_ACCEPT_HITS) {
+                            if (guardedCount == ARROW_GUARD_CLEAR_HITS) {
+                                // It persists. Take the arrows away: a misread caused by them
+                                // disappears with them, a real position is still there after.
+                                Log.d(TAG, "Unexplained small change read $guardedCount times; " +
+                                    "clearing the arrows to tell a misread from a real change: $placement")
+                                postOverlayClear()
+                            }
+                            return
+                        }
+                        Log.i(TAG, "Small change still read with the arrows gone, accepting it: $placement")
+                    }
                 }
             }
+            guardedPlacement = null
+            guardedCount = 0
             // Whatever happened, it was not the forced mate on screen: fresh analysis decides.
             mateLine?.let {
                 Log.d(TAG, "MateLine dropped, board change is not on the line: played=${it.played}, " +
@@ -1920,6 +2056,9 @@ class AnalysisCoordinator(
             )
             return
         }
+
+        guardedPlacement = null
+        guardedCount = 0
 
         // --- Cross-validate with move inference: same-side-moves sanity check ---
         if (lastInferredMoverWasWhite == move.white) {
@@ -2135,7 +2274,9 @@ class AnalysisCoordinator(
                 evalBeforeOpponentMove = olderAnalysis?.let { -it.eval },
                 multiPvBefore = multiPvBefore,
             )
-        } catch (ex: IllegalStateException) {
+        } catch (ex: RuntimeException) {
+            // Any failure here only costs the classification; it must not reach the worker's
+            // failure handling, which would blank the arrows and search the position again.
             Log.w(TAG, "Could not classify ${move.uci}", ex)
             null
         }
@@ -2146,7 +2287,10 @@ class AnalysisCoordinator(
     private fun resyncTo(placement: String, board: CharArray, whiteToMove: Boolean) {
         // Prefer the accessibility service's side-to-move when available; the caller's guess
         // (typically userIsWhite) is only a fallback.
-        var sideToMove = AccessibilityData.whiteToMove ?: whiteToMove
+        // The starting position is always white's move. The service only updates its
+        // side-to-move while the move list has moves, so at a rematch it still holds the value
+        // of the game before.
+        var sideToMove = if (placement == START_PLACEMENT) true else AccessibilityData.whiteToMove ?: whiteToMove
         castlingRights = castlingFromPlacement(board)
         halfMoveClock = 0
         fullMoveNumber = 1
@@ -2230,6 +2374,7 @@ class AnalysisCoordinator(
         consecutiveSameSideMoves = 0
         lastInferredMoverWasWhite = null
         missedFrames = 0
+        accessibilityMissedBoards = 0
         boardVisible = false
         resetTracking()
         EngineStats.clear()
@@ -2368,10 +2513,13 @@ class AnalysisCoordinator(
         // the opponent's reply before each of them. The line that delivers mate is the target.
         val premoves = premoveLines(bestAnalysis, best, sign, fen)
         suggestions += premoves
-        mateLine = if (premoves.isNotEmpty() && bestAnalysis != null) {
-            MateLine(bestAnalysis.pv, premoves, flipped)
-        } else {
-            null
+        mateLine = when {
+            bestAnalysis == null -> null
+            premoves.isNotEmpty() -> MateLine(bestAnalysis.pv, premoves, flipped)
+            // Mate in one: no premoves, but the line is kept (with no arrows after the first)
+            // so that playing the arrow is recognised as delivering the mate.
+            moverMate == 1 -> MateLine(listOf(bestAnalysis.bestMove), emptyList(), flipped)
+            else -> null
         }
 
         postMultiSuggestion(suggestions, flipped)
@@ -2538,7 +2686,11 @@ class AnalysisCoordinator(
     private fun postOverlayClear() {
         // Nothing of a forced mate is on screen any more, so there is nothing to keep.
         mateLine = null
-        mainHandler.post { OverlayService.instance?.clearSuggestion() }
+        mainHandler.post {
+            // The opponent's badge belongs to the position whose arrows are removed here.
+            OverlayService.instance?.clearSuggestion()
+            OverlayService.instance?.clearOpponentBadge()
+        }
     }
 
     /**
@@ -2567,7 +2719,9 @@ class AnalysisCoordinator(
             // Only a line drawn to its end has the mating move as its last arrow; one cut short
             // (MAX_MATE_PREMOVES, incomplete PV) just runs out and is searched again.
             val wasLastUserMove = line.played % 2 == 1 && line.played - 1 >= line.lines.size
-            mateDelivered = wasLastUserMove && line.lines.lastOrNull()?.isMateTarget == true
+            // A mate in one has no arrows after the first: its only move is the mating move.
+            mateDelivered = wasLastUserMove &&
+                (line.lines.lastOrNull()?.isMateTarget == true || (line.lines.isEmpty() && line.played == 1))
             mateLine = null
         }
         return remaining
