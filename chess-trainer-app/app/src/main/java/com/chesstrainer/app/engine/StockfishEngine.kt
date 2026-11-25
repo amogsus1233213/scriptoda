@@ -477,7 +477,13 @@ class StockfishEngine(private val binaryPath: String) {
             return listOf(AnalysisResult(bestMove, 0, null, 0, listOfNotNull(bestMove.ifEmpty { null })))
         }
 
-        return infos.toSortedMap().map { (index, slot) ->
+        // Set when the bestmove is returned in place of the first move of the multipv 1 line:
+        // that line then takes the place of the bestmove's own slot further down, so no move is
+        // listed twice and the displaced one is not lost.
+        var displaced: InfoLine? = null
+
+        return infos.toSortedMap().map { (index, stored) ->
+            val slot = displaced?.takeIf { index > 1 && stored.pv.firstOrNull() == bestMove } ?: stored
             var info = slot
             var move = if (index == 1) {
                 bestMove.ifEmpty { slot.pv.firstOrNull().orEmpty() }
@@ -510,12 +516,20 @@ class StockfishEngine(private val binaryPath: String) {
                     }
                     slotMate != null -> pvAdjusted = listOf(bestMove)
                     else -> {
-                        // No mate involved (or none proven): the arrow follows the bestmove and
-                        // the PV is cut so that arrow and line stay consistent.
-                        pvAdjusted = listOf(bestMove)
-                        mateIsForMove = false
+                        // No mate involved (or none proven): the arrow follows the bestmove. Its
+                        // own line, when one was seen, gives it its own score and continuation;
+                        // otherwise the PV is cut so that arrow and line stay consistent.
+                        val ownLine = byFirstMove[bestMove]?.takeIf { it.mate == null }
+                        if (ownLine != null) {
+                            info = ownLine
+                            pvAdjusted = ownLine.pv
+                        } else {
+                            pvAdjusted = listOf(bestMove)
+                            mateIsForMove = false
+                        }
                     }
                 }
+                if (move == bestMove) displaced = slot
             }
             val mate = info.mate?.takeIf { info.provesMate && mateIsForMove }
             val eval = when {
