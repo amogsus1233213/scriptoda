@@ -250,6 +250,20 @@ class AnalysisCoordinator(
         /** Minimum number of accessibility-reported pieces for the data to be trusted. */
         private const val ACCESSIBILITY_MIN_PIECES = 3
 
+        /**
+         * A read of the chess app's view tree that found the board less than this long ago
+         * proves the board is on screen, whatever package detection or the vision locator say.
+         * The accessibility service re-reads the tree at least once a second while the chess
+         * app is in front, so this allows for two late reads.
+         */
+        private const val ACCESSIBILITY_CONFIRMED_MS = 2500L
+
+        /**
+         * Consecutive polls ([ACCESSIBILITY_POLL_MS] apart) that must find the chess app gone
+         * before the overlay is taken down for it; see [checkTargetLeft].
+         */
+        private const val TARGET_GONE_POLLS = 5
+
         // User-facing status messages. Users should never need to know about "calibration".
         private const val STATUS_LOOKING = "Looking for chess board..."
         private const val STATUS_READING = "Board found — reading pieces..."
@@ -448,9 +462,13 @@ class AnalysisCoordinator(
     @Volatile
     private var accessibilityFrameSeen = false
 
-    /** [AccessibilityData.targetPackageVisible] as last seen by [checkTargetLeft]. Poll thread. */
+    /** Whether [checkTargetLeft] last found the chess app on screen. Poll thread. */
     @Volatile
     private var targetWasVisible = false
+
+    /** Polls in a row in which [checkTargetLeft] found the chess app gone. Poll thread. */
+    @Volatile
+    private var targetGonePolls = 0
 
     /** Placement [pollAccessibility] last handed to the worker. */
     @Volatile
@@ -478,7 +496,8 @@ class AnalysisCoordinator(
         if (!running.compareAndSet(false, true)) return
         // A flag left set by an earlier run must not keep every frame of this one out.
         processing.set(false)
-        targetWasVisible = AccessibilityData.targetPackageVisible
+        targetWasVisible = chessAppOnScreen()
+        targetGonePolls = 0
         // Non-blocking: fetches/loads the piece templates on its own background thread.
         templateManager.ensureLoaded()
         submit {
@@ -1083,18 +1102,35 @@ class AnalysisCoordinator(
     }
 
     /**
-     * Poll thread: takes the overlay down the moment the chess app stops being in front
-     * ([AccessibilityData.targetPackageVisible] going false). Without this the arrows stayed
-     * over the next app until the vision path had missed the board on
-     * [MISSED_FRAMES_BEFORE_CLEAR] frames. The overlay is cleared from here, as the worker may
-     * be inside a search; that search is stopped and its result dropped, and the worker then
-     * forgets the placement so the position is drawn again when the board is back.
+     * Whether the chess app is on screen as far as the accessibility service can tell. Package
+     * detection ([AccessibilityData.targetPackageVisible]) alone is not reliable: on some
+     * devices another package (launcher, system UI) reports itself as the active window while
+     * the chess app is in front. A view tree read that found the board moments ago is proof
+     * that it is there, so it counts as well. Any thread.
+     */
+    private fun chessAppOnScreen(): Boolean =
+        AccessibilityData.targetPackageVisible || AccessibilityData.isRecent(ACCESSIBILITY_CONFIRMED_MS)
+
+    /**
+     * Poll thread: takes the overlay down soon after the chess app stops being in front.
+     * Without this the arrows stayed over the next app until the vision path had missed the
+     * board on [MISSED_FRAMES_BEFORE_CLEAR] frames. The app must be gone ([chessAppOnScreen])
+     * on [TARGET_GONE_POLLS] polls in a row, so a flicker of the package detection does not
+     * wipe a position that is still on the board. The overlay is cleared from here, as the
+     * worker may be inside a search; that search is stopped and its result dropped, and the
+     * worker then forgets the placement so the position is drawn again when the board is back.
      */
     private fun checkTargetLeft() {
-        val visible = AccessibilityData.targetPackageVisible
-        if (visible == targetWasVisible) return
-        targetWasVisible = visible
-        if (visible || !running.get()) return
+        if (chessAppOnScreen()) {
+            targetGonePolls = 0
+            targetWasVisible = true
+            return
+        }
+        if (!targetWasVisible) return
+        if (++targetGonePolls < TARGET_GONE_POLLS) return
+        targetWasVisible = false
+        targetGonePolls = 0
+        if (!running.get()) return
         Log.d(TAG, "Chess app left the screen; clearing the overlay")
         if (searchingPlacement != null) {
             positionStale = true
@@ -1391,9 +1427,15 @@ class AnalysisCoordinator(
      * stay on screen for that long. After [MISSED_FRAMES_BEFORE_CLEAR] such frames the overlay
      * is cleared and the placement forgotten; until the board is located again
      * [processAccessibilityPositions] draws nothing, then the position is analysed afresh.
+     *
+     * A frame without a located board is only counted while the view tree does not show the
+     * board either. Not locating it is no proof that it is gone (the locator also fails on
+     * frames with arrows or a highlight across the grid lines, or mid-animation), while a tree
+     * read that found the pieces moments ago is proof that it is there. Without this, a board
+     * the locator had trouble with lost its arrows every few seconds, or for good.
      */
     private fun noteAccessibilityBoard(found: Boolean) {
-        if (found) {
+        if (found || AccessibilityData.isRecent(ACCESSIBILITY_CONFIRMED_MS)) {
             accessibilityMissedBoards = 0
             return
         }

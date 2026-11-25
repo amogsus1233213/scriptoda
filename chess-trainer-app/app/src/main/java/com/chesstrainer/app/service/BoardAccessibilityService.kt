@@ -1,11 +1,15 @@
 package com.chesstrainer.app.service
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 
 /**
  * Reads the chess.com board from the accessibility tree and publishes it in [AccessibilityData].
@@ -27,6 +31,13 @@ class BoardAccessibilityService : AccessibilityService() {
 
         /** Shortest time between two view tree reads. */
         private const val MIN_INTERVAL_MS = 200L
+
+        /**
+         * While the chess app is in front the tree is read again at least this often, events or
+         * not. A board that just stands there sends no events, and [AnalysisCoordinator] takes
+         * a recent read as the proof that the board is still on screen.
+         */
+        private const val HEARTBEAT_MS = 1000L
 
         /** Identical consecutive reads after which a position or orientation counts as stable. */
         private const val STABLE_READS = 2
@@ -60,6 +71,9 @@ class BoardAccessibilityService : AccessibilityService() {
     }
     private var readScheduled = false
 
+    /** [SystemClock.uptimeMillis] the scheduled read is due at; only valid while [readScheduled]. */
+    private var scheduledReadAt = 0L
+
     /** [SystemClock.uptimeMillis] of the last read. */
     private var lastReadTime = 0L
 
@@ -85,13 +99,33 @@ class BoardAccessibilityService : AccessibilityService() {
     private val targetLeftRunnable = Runnable {
         if (targetLeftPending) {
             targetLeftPending = false
-            doTargetLeft()
+            // Another package's window event followed by two quiet seconds does not prove the
+            // chess app is gone: launchers and system UI send such events while it stays in
+            // front (gesture bar, taskbar, edge panels), and a board nobody touches is quiet.
+            // Only reset when its window really is off the screen.
+            if (AccessibilityData.targetPackageVisible && isTargetOnScreen()) {
+                Log.d(TAG, "Chess app still on screen; not resetting")
+                readBoard()
+            } else {
+                doTargetLeft()
+            }
         }
     }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         AccessibilityData.serviceConnected = true
+        // Needed for [getWindows], which finds the chess app when another window is the active
+        // one. Also declared in the XML config; set here too in case that was cached without it.
+        try {
+            serviceInfo?.let { info ->
+                info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                serviceInfo = info
+            }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Could not enable window retrieval", e)
+        }
         Log.i(TAG, "Accessibility service connected")
     }
 
@@ -140,6 +174,15 @@ class BoardAccessibilityService : AccessibilityService() {
     private fun readBoard() {
         cancelScheduledRead()
         lastReadTime = SystemClock.uptimeMillis()
+        try {
+            readBoardNow()
+        } finally {
+            // Heartbeat; a sooner read scheduled by the read above is kept (see scheduleRead).
+            if (AccessibilityData.targetPackageVisible) scheduleRead(HEARTBEAT_MS)
+        }
+    }
+
+    private fun readBoardNow() {
         val nodes = readTree() ?: return
         // The user's clock, for time pressure detection in AnalysisCoordinator. Null when the
         // tree shows no clock (untimed game, or not on a game screen).
@@ -161,26 +204,80 @@ class BoardAccessibilityService : AccessibilityService() {
         }
     }
 
-    /** The chess app's view tree, or null if it is not the active window or cannot be read. */
-    private fun readTree(): List<ViewTreeReader.NodeData>? {
-        val root = rootInActiveWindow
-        if (root == null) {
-            AccessibilityData.lastRejectReason = "No active window"
-            return null
-        }
-        return try {
-            if (root.packageName?.toString() != TARGET_PACKAGE) {
-                AccessibilityData.lastRejectReason =
-                    "Active package: ${root.packageName} (need $TARGET_PACKAGE)"
-                null
-            } else {
-                val nodes = ViewTreeReader.traverse(root)
-                if (nodes.isEmpty()) {
-                    AccessibilityData.lastNodeCount = 0
-                    AccessibilityData.lastRejectReason = "Empty view tree"
-                    null
-                } else nodes
+    /**
+     * Root node of the chess app's window, or null if it has none on screen. The active window
+     * is tried first. It is not always the chess app's while that is in front: on some devices
+     * the launcher (gesture bar, taskbar) or another system window is reported instead, which
+     * used to reject every read. The other windows on screen are therefore searched as well,
+     * taking the largest one of the chess app (the board's, not a popup's). The caller recycles
+     * the returned node. Sets [AccessibilityData.lastRejectReason] when returning null.
+     */
+    private fun findTargetRoot(): AccessibilityNodeInfo? {
+        var activePackage: String? = null
+        try {
+            val active = rootInActiveWindow
+            if (active != null) {
+                activePackage = active.packageName?.toString()
+                if (activePackage == TARGET_PACKAGE) return active
+                active.recycle()
             }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Could not read the active window", e)
+        }
+
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = -1L
+        var windowCount = 0
+        try {
+            val bounds = Rect()
+            for (window in windows.orEmpty()) {
+                windowCount++
+                if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val root = window.root ?: continue
+                if (root.packageName?.toString() != TARGET_PACKAGE) {
+                    root.recycle()
+                    continue
+                }
+                window.getBoundsInScreen(bounds)
+                val area = bounds.width().toLong() * bounds.height()
+                if (area > bestArea) {
+                    best?.recycle()
+                    best = root
+                    bestArea = area
+                } else {
+                    root.recycle()
+                }
+            }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Could not read the window list", e)
+        }
+        if (best == null) {
+            AccessibilityData.lastRejectReason = if (activePackage == null && windowCount == 0) {
+                "No active window"
+            } else {
+                "Active package: $activePackage, no $TARGET_PACKAGE window among $windowCount windows"
+            }
+        }
+        return best
+    }
+
+    /** Whether the chess app has a window on screen right now. */
+    private fun isTargetOnScreen(): Boolean {
+        val root = findTargetRoot() ?: return false
+        root.recycle()
+        return true
+    }
+
+    /** The chess app's view tree, or null if it is not on screen or cannot be read. */
+    private fun readTree(): List<ViewTreeReader.NodeData>? {
+        val root = findTargetRoot() ?: return null
+        return try {
+            val nodes = ViewTreeReader.traverse(root)
+            if (nodes.isEmpty()) {
+                AccessibilityData.lastNodeCount = 0
+                AccessibilityData.lastRejectReason = "Empty view tree"
+                null
+            } else nodes
         } catch (e: RuntimeException) {
             Log.w(TAG, "Error reading view tree", e)
             AccessibilityData.lastRejectReason = "Error reading view tree: ${e.javaClass.simpleName}"
@@ -420,10 +517,18 @@ class BoardAccessibilityService : AccessibilityService() {
         AccessibilityData.onTargetLeft()
     }
 
+    /**
+     * Schedules a read in [delayMs]. A read already scheduled for sooner is kept; a later one
+     * (the heartbeat, the slow move-list poll) is brought forward, so an event's read never
+     * waits behind it.
+     */
     private fun scheduleRead(delayMs: Long) {
-        if (readScheduled) return
+        val at = SystemClock.uptimeMillis() + delayMs
+        if (readScheduled && scheduledReadAt <= at) return
+        handler.removeCallbacks(scheduledRead)
         readScheduled = true
-        handler.postDelayed(scheduledRead, delayMs)
+        scheduledReadAt = at
+        handler.postAtTime(scheduledRead, at)
     }
 
     private fun cancelScheduledRead() {
