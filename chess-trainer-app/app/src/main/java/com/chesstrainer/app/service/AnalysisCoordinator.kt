@@ -138,6 +138,12 @@ class AnalysisCoordinator(
         private const val MATE_VERIFY_MS = 100
 
         /**
+         * Most the mate distance may differ between the last two search depths for the mate to
+         * count as settled; see [mateIsSettled].
+         */
+        private const val MATE_STABLE_MAX_DELTA = 2
+
+        /**
          * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
          * above which a warning is logged. No ordinary move swings the eval this far, so it is
          * either a mate appearing or disappearing, or the engine answering for another position.
@@ -429,6 +435,14 @@ class AnalysisCoordinator(
      * whole mate has been played), cleared by its next call. Worker thread only.
      */
     private var mateDelivered = false
+
+    /**
+     * The placement last recognised as the tracked position plus queued premoves of the forced
+     * mate drawn on the board ([premovePreviewBase]), null otherwise. While [stablePlacement]
+     * equals it, [currentFen] deliberately lags behind the screen: the premoves are not played
+     * yet. Worker thread only.
+     */
+    private var premovePreviewPlacement: String? = null
 
     /** Placement and eval (white's POV) of the last main search, for [checkEvalSanity]. */
     private var lastSearchedPlacement: String? = null
@@ -869,10 +883,11 @@ class AnalysisCoordinator(
      * opponent checkmated. The engine stops applying moves at the first illegal one, so a line
      * with a move that cannot be played fails as well.
      *
-     * A line that fails is not the mate: only its first move is kept, so no premove arrow and
-     * no mate ring is drawn from it. For a "mate in 1" the claim itself is then disproved (the
-     * move on the arrow does not mate) and the mate score is dropped too. A PV shorter than the
-     * whole mate is left alone: [premoveLines] draws it without a mating move.
+     * A line that fails is not the mate, and the score that came with it ("mate in 12" from an
+     * intermediate search result) has nothing left to stand on: the mate score is dropped
+     * entirely and only the first move is kept, as an ordinary winning move. A PV shorter than
+     * the whole mate cannot be played out and is left alone: [premoveLines] draws no premove
+     * from it.
      */
     private fun verifiedMatePv(fen: String, best: AnalysisResult): AnalysisResult {
         val mate = best.mate?.takeIf { it > 0 } ?: return best
@@ -895,9 +910,33 @@ class AnalysisCoordinator(
         if (end == null || positionStale) return best.copy(pv = listOf(best.bestMove))
         Log.w(TAG, "Mate in $mate: the line ${line.joinToString(" ")} does not end in checkmate " +
             "(engine: mate ${end.mate}, bestmove '${end.bestMove}'), premoves dropped: $fen")
-        if (mate > 1) return best.copy(pv = listOf(best.bestMove))
+        return withoutMate(best)
+    }
+
+    /** [best] with its mate score dropped: a clearly winning move with no line behind it. */
+    private fun withoutMate(best: AnalysisResult): AnalysisResult {
         val cap = StockfishEngine.UNPROVEN_MATE_CP
-        return best.copy(mate = null, eval = best.eval.coerceIn(-cap, cap), pv = listOf(best.bestMove))
+        return best.copy(
+            mate = null,
+            eval = best.eval.coerceIn(-cap, cap),
+            pv = listOfNotNull(best.bestMove.takeIf { it.isNotEmpty() }),
+            previousMate = null,
+        )
+    }
+
+    /**
+     * Whether the forced mate of [analysis] may be shown as a sequence of moves. The score must
+     * be final (not a bound, not failed low on: [AnalysisResult.mateConfirmed]) and the mate
+     * distance must have settled: the previous search depth reported a mate for the same move
+     * ([AnalysisResult.previousMate]) at most [MATE_STABLE_MAX_DELTA] moves away. A mate seen at
+     * one depth only, or one that jumped ("mate 12", then "mate 2"), is still being worked out
+     * by the engine; latching onto it draws arrows for a line that is about to be replaced.
+     */
+    private fun mateIsSettled(analysis: AnalysisResult): Boolean {
+        val mate = analysis.mate ?: return false
+        if (!analysis.mateConfirmed) return false
+        val previous = analysis.previousMate ?: return false
+        return (previous > 0) == (mate > 0) && abs(mate - previous) <= MATE_STABLE_MAX_DELTA
     }
 
     /**
@@ -935,16 +974,24 @@ class AnalysisCoordinator(
      * missing moves are asked for by searching the position at the end of the known PV, which
      * is quick as the mate is already in the hash table. An extension is only taken when the
      * engine reports exactly the mate distance that is left at that point of the line, and it
-     * is cut at the mating move. Anything else (no mate, the other side mating, a longer or a
-     * shorter mate) means the moves found are not the rest of this mate, and the PV is left as
-     * far as it got: fewer premoves, but never moves that do not lead to the mate.
+     * is cut at the mating move.
+     *
+     * A follow-up search that reports another mate distance contradicts the original score
+     * ("mate in 12" at the root, "mate in 1" after the first move: the 12 was an intermediate
+     * result). The original score is then rejected: the distance the follow-up search implies is
+     * used instead, and the PV is cut to the first move, as neither the old line nor a line
+     * grafted from two disagreeing searches is the mate. The result is also marked as not
+     * settled ([mateIsSettled]). If the follow-up search has the other side mating, there is no
+     * mate at all and the score is dropped ([withoutMate]). A follow-up search that finds no
+     * mate score in its short time proves nothing either way: the PV stays as far as it got,
+     * which is incomplete and so draws no premoves.
      */
     private fun completeMatePv(fen: String, best: AnalysisResult, searchMs: Int): AnalysisResult {
         val mate = best.mate ?: return best
         if (mate <= 1) return best
         val e = engine ?: return best
-        // Plies up to and including the last user move that is drawn.
-        val needed = 2 * minOf(mate, MAX_MATE_PREMOVES + 1) - 1
+        // The whole mate: premoves are only drawn from a PV that holds every move of it.
+        val needed = 2 * mate - 1
         var pv = best.pv.takeWhile { isUciMove(it) }
         if (pv.isEmpty() || pv[0] != best.bestMove || pv.size >= needed) return best
         val stepMs = if (searchMs <= FAST_MOVETIME_MS) MATE_PV_STEP_MS / 2 else MATE_PV_STEP_MS
@@ -960,15 +1007,35 @@ class AnalysisCoordinator(
                 Log.w(TAG, "Could not extend the mate PV for $fen", ex)
                 null
             } ?: break
+            // Cut short because the board moved on: says nothing about the line.
+            if (positionStale || !running.get()) break
             val nextMate = next.mate ?: break
             // After k plies of a mate in N: with k even the mating side is to move and has a
             // mate in N - k/2; with k odd the defender is to move and is mated in N - (k+1)/2.
             val k = pv.size
             val expectedMate = if (k % 2 == 0) mate - k / 2 else -(mate - (k + 1) / 2)
             if (nextMate != expectedMate) {
+                // Distance from the root that the follow-up search stands for, if the same
+                // side still mates.
+                val implied = when {
+                    k % 2 == 0 && nextMate > 0 -> nextMate + k / 2
+                    k % 2 == 1 && nextMate <= 0 -> -nextMate + (k + 1) / 2
+                    else -> null
+                }
+                if (implied == null) {
+                    Log.w(TAG, "Mate in $mate: after $k plies the engine reports mate $nextMate " +
+                        "(the other side mates); mate score dropped: $fen")
+                    return withoutMate(best)
+                }
                 Log.w(TAG, "Mate in $mate: after $k plies the engine reports mate $nextMate, " +
-                    "expected $expectedMate; not extending the PV: $fen")
-                break
+                    "expected $expectedMate; score replaced by mate in $implied, premoves dropped: $fen")
+                return best.copy(
+                    mate = implied,
+                    eval = StockfishEngine.MATE_SCORE - implied,
+                    pv = listOf(best.bestMove),
+                    mateConfirmed = next.mateConfirmed,
+                    previousMate = null,
+                )
             }
             val tail = next.pv.takeWhile { isUciMove(it) }
             if (tail.isEmpty()) break
@@ -1705,8 +1772,10 @@ class AnalysisCoordinator(
         val curPlacement = cur.substringBefore(' ')
         // A null stablePlacement only means the placement must be confirmed again (e.g. after a
         // search that was cut short); the tracked position is still the one to diff against.
+        // A stable placement that only shows queued premoves on top of the tracked position
+        // (premovePreviewPlacement) is in step as well.
         val stable = stablePlacement
-        if (stable != null && curPlacement != stable) return null
+        if (stable != null && curPlacement != stable && stable != premovePreviewPlacement) return null
         val before = parsePlacement(curPlacement) ?: return null
         val after = parsePlacement(placement) ?: return null
         return MoveInference.infer(before, after, epSquareOf(cur))
@@ -1736,10 +1805,14 @@ class AnalysisCoordinator(
         val cur = currentFen ?: return false
         val curPlacement = cur.substringBefore(' ')
         val stable = stablePlacement
-        if (placement == curPlacement || (stable != null && curPlacement != stable)) return false
+        if (placement == curPlacement) return false
+        if (stable != null && curPlacement != stable && stable != premovePreviewPlacement) return false
         val before = parsePlacement(curPlacement) ?: return false
         val after = parsePlacement(placement) ?: return false
-        return matchMateLine(line, before, after) != null
+        if (matchMateLine(line, before, after) != null) return true
+        // The same, with further queued premoves of the line already drawn on the board.
+        val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
+        return premovePreviewBase(line, before, after, userIsWhite) != null
     }
 
     /**
@@ -1953,6 +2026,7 @@ class AnalysisCoordinator(
         // A forced mate of the old tracking state must not be continued by a move of the new one.
         mateLine = null
         mateDelivered = false
+        premovePreviewPlacement = null
         // Retries belong to the placement that was just forgotten.
         failedPlacement = null
         failedRetries = 0
@@ -1991,8 +2065,10 @@ class AnalysisCoordinator(
     /**
      * @param fromAccessibility true when [placement] comes from accessibility data (exact), false
      *   when it was read from the screen by vision (may contain misreads).
+     * @param allowPreview false for the inner call that handles the position under a premove
+     *   preview (see below), which must not be looked at as a preview again.
      */
-    private fun onPositionChanged(placement: String, fromAccessibility: Boolean) {
+    private fun onPositionChanged(placement: String, fromAccessibility: Boolean, allowPreview: Boolean = true) {
         EngineStats.positionsSeen++
         positionStale = false
         checkTurnTrackingSources()
@@ -2000,6 +2076,37 @@ class AnalysisCoordinator(
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
         var prevFen = currentFen
         val after = parsePlacement(placement) ?: return
+
+        // A forced mate is being followed and the user has queued its next move(s) as premoves.
+        // Chess apps draw a queued premove on the board at once, so the board shows the user's
+        // piece moved while the opponent has not replied yet. Read as a move, that is the user
+        // moving twice in a row: it is not the line's next ply (the opponent's reply), so the
+        // line was dropped and the arrows cleared the moment the second step was queued, and the
+        // sequence never advanced past it. Such a board is recognised here instead: the moves
+        // really played (none, or the next plies of the line) are handled as usual, the
+        // premoves on top of them are left alone until they are played.
+        if (allowPreview) {
+            premovePreviewPlacement = null
+            val line = mateLine
+            val prevPlacement = prevFen?.substringBefore(' ')
+            if (line != null && prevPlacement != null && placement != START_PLACEMENT) {
+                val before = parsePlacement(prevPlacement)
+                val real = if (before != null) premovePreviewBase(line, before, after, userIsWhite) else null
+                if (real != null) {
+                    val realPlacement = placementOf(real)
+                    premovePreviewPlacement = placement
+                    if (realPlacement == prevPlacement) {
+                        Log.d(TAG, "MateLine premove preview: nothing played yet, line kept " +
+                            "(played=${line.played}, pv.size=${line.pv.size})")
+                        return
+                    }
+                    Log.d(TAG, "MateLine premove preview on top of played moves: handling $realPlacement " +
+                        "(played=${line.played}, pv.size=${line.pv.size})")
+                    onPositionChanged(realPlacement, fromAccessibility, allowPreview = false)
+                    return
+                }
+            }
+        }
 
         var move = if (prevFen != null && placement != START_PLACEMENT) {
             val before = parsePlacement(prevFen.substringBefore(' '))
@@ -2614,6 +2721,22 @@ class AnalysisCoordinator(
 
         // Only a mate the user delivers has premoves: not an ordinary line, not getting mated.
         val userMate = analysis.mate?.takeIf { it > 0 } ?: return emptyList()
+        if (userMate == 1) return emptyList()
+        // A sequence is only committed to once the mate has settled over the last search depths
+        // and its score is final; until then the first move is all that is shown.
+        if (!mateIsSettled(analysis)) {
+            Log.d(TAG, "Mate in $userMate not settled (previous depth: ${analysis.previousMate}, " +
+                "confirmed=${analysis.mateConfirmed}); showing the first move only")
+            return emptyList()
+        }
+        // And only from a PV that holds the whole mate: 2N - 1 plies for a mate in N. A shorter
+        // one is not a line that can be followed to the end (nor was it played out by
+        // [verifiedMatePv]), so none of its later moves is drawn.
+        if (pv.size < 2 * userMate - 1 || pv.take(2 * userMate - 1).any { !isUciMove(it) }) {
+            Log.d(TAG, "Mate in $userMate with an incomplete PV (${pv.size} of ${2 * userMate - 1} " +
+                "plies); showing the first move only")
+            return emptyList()
+        }
         val count = minOf(userMate - 1, MAX_MATE_PREMOVES)
 
         val lines = ArrayList<SuggestedLineData>(2 * count.coerceAtLeast(0))
@@ -2871,6 +2994,70 @@ class AnalysisCoordinator(
             if (next.contentEquals(after)) return moves to boards
         }
         return null
+    }
+
+    /**
+     * Explains [after] as [before] with the next r plies of [line] played (r may be 0, at most
+     * [MAX_MATE_CATCH_UP_PLIES]) and, on top of that, one or more of the user's following moves
+     * of the line shown as queued premoves: moved on the board without the opponent's replies
+     * between them. Returns the board with only the r played plies, i.e. the position really
+     * reached ([before] itself when r is 0), or null when [after] is no such picture.
+     * Premoves exist only while the opponent is to move, which in the line is after an odd
+     * number of plies (the PV starts with a move of the user). Changes nothing.
+     */
+    private fun premovePreviewBase(
+        line: MateLine,
+        before: CharArray,
+        after: CharArray,
+        userIsWhite: Boolean,
+    ): CharArray? {
+        var board = before
+        for (r in 0..MAX_MATE_CATCH_UP_PLIES) {
+            if (r > 0) {
+                val uci = line.pv.getOrNull(line.played + r - 1) ?: return null
+                board = applyUci(board, uci)?.second ?: return null
+            }
+            if ((line.played + r) % 2 == 0) continue
+            var shown = board
+            var index = line.played + r + 1
+            while (true) {
+                val uci = line.pv.getOrNull(index) ?: break
+                shown = applyPremove(shown, uci, userIsWhite) ?: break
+                if (shown.contentEquals(after)) return board
+                index += 2
+            }
+        }
+        return null
+    }
+
+    /**
+     * [board] with the user's queued premove [uci] drawn on it: the piece simply stands on its
+     * target square (a promoting pawn as the new piece, a castling king with its rook moved).
+     * Null when [uci] is malformed or no piece of the user stands on its start square.
+     */
+    private fun applyPremove(board: CharArray, uci: String, userIsWhite: Boolean): CharArray? {
+        if (!isUciMove(uci)) return null
+        val from = squareIndex(uci.substring(0, 2)) ?: return null
+        val to = squareIndex(uci.substring(2, 4)) ?: return null
+        val piece = board[from]
+        if (piece == EMPTY || from == to || piece.isUpperCase() != userIsWhite) return null
+        val next = board.copyOf()
+        next[from] = EMPTY
+        var landed = piece
+        val kind = piece.lowercaseChar()
+        if (kind == 'p' && to / 8 == (if (userIsWhite) 7 else 0)) {
+            val p = (uci.getOrNull(4) ?: 'q').lowercaseChar()
+            if (p !in "nbrq") return null
+            landed = if (userIsWhite) p.uppercaseChar() else p
+        } else if (kind == 'k' && abs(to % 8 - from % 8) == 2) {
+            val base = (from / 8) * 8
+            val rookFrom = if (to % 8 == 6) base + 7 else base
+            val rookTo = if (to % 8 == 6) base + 5 else base + 3
+            next[rookTo] = next[rookFrom]
+            next[rookFrom] = EMPTY
+        }
+        next[to] = landed
+        return next
     }
 
     /**
