@@ -226,6 +226,22 @@ class StockfishEngine(private val binaryPath: String) {
             val infos = HashMap<Int, InfoLine>()
             // Exact scores of the best line, one per depth, to tell how settled the eval is.
             val bestLineHistory = ArrayList<InfoLine>()
+            // Latest line seen for each first move, whatever its multipv slot or depth; see
+            // [buildResults] for why the slots alone are not enough.
+            val byFirstMove = HashMap<String, InfoLine>()
+            var order = 0
+            fun record(parsed: InfoLine) {
+                val info = parsed.copy(order = ++order)
+                recordBestLine(bestLineHistory, info)
+                val existing = infos[info.multiPv]
+                if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
+                val first = info.pv.firstOrNull() ?: return
+                val known = byFirstMove[first]
+                // Newest wins, except that a bound never takes the place of an exact score.
+                if (known == null || !info.isBound || known.isBound) {
+                    byFirstMove[first] = keepLongerPv(known, info)
+                }
+            }
             var bestMove: String? = null
 
             while (bestMove == null) {
@@ -233,10 +249,7 @@ class StockfishEngine(private val binaryPath: String) {
                 if (line.startsWith("bestmove")) {
                     bestMove = line.split(WHITESPACE).getOrNull(1) ?: "(none)"
                 } else if (line.startsWith("info ")) {
-                    val info = parseInfo(line) ?: continue
-                    recordBestLine(bestLineHistory, info)
-                    val existing = infos[info.multiPv]
-                    if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
+                    record(parseInfo(line) ?: continue)
                 }
             }
 
@@ -249,10 +262,7 @@ class StockfishEngine(private val binaryPath: String) {
                         if (stopLine.startsWith("bestmove")) {
                             bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
                         } else if (stopLine.startsWith("info ")) {
-                            val info = parseInfo(stopLine) ?: continue
-                            recordBestLine(bestLineHistory, info)
-                            val existing = infos[info.multiPv]
-                            if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
+                            record(parseInfo(stopLine) ?: continue)
                         }
                     }
                 }
@@ -265,7 +275,7 @@ class StockfishEngine(private val binaryPath: String) {
                 }
             }
 
-            return buildResults(bestMove, infos, bestLineHistory)
+            return buildResults(bestMove, infos, bestLineHistory, byFirstMove)
         }
     }
 
@@ -309,14 +319,35 @@ class StockfishEngine(private val binaryPath: String) {
         val cp: Int?,
         val mate: Int?,
         val isBound: Boolean,
-        val pv: List<String>
-    )
+        val pv: List<String>,
+        /** Only meaningful with [isBound]: true for "lowerbound", false for "upperbound". */
+        val isLowerBound: Boolean = false,
+        /** Position of the line in the engine's output of one search (1, 2, ...). */
+        val order: Int = 0,
+    ) {
+        /**
+         * True if the line's mate score stands for a forced mate. An exact score does. A bound
+         * does only in one direction: "mate 3 lowerbound" says the score is at least a mate in
+         * 3, so the side to move mates (in 3 or sooner), and "mate -3 upperbound" says it is
+         * mated. The other direction ("mate 3 upperbound": at most a mate in 3) proves nothing.
+         */
+        val provesMate: Boolean
+            get() = mate != null && (!isBound || (mate > 0) == isLowerBound)
+
+        /** True for an exact (not a bound) mate score. */
+        val isExactMate: Boolean get() = mate != null && !isBound
+    }
 
     private fun shouldReplace(existing: InfoLine?, candidate: InfoLine): Boolean {
         if (existing == null) return true
-        // A mate score that is only a bound ("score mate 3 upperbound") proves no mate, so it
-        // never takes the place of an exact score, whatever its depth.
-        if (candidate.isBound && candidate.mate != null && !existing.isBound) return false
+        if (candidate.isBound && candidate.mate != null) {
+            // A mate bound that proves no mate ("score mate 3 upperbound") never takes the place
+            // of an exact score, whatever its depth.
+            if (!candidate.provesMate && !existing.isBound) return false
+            // One that does prove a mate ("score mate 3 lowerbound") is taken like any other
+            // line, except over an exact mate: that one has the true distance and the full PV.
+            if (existing.isExactMate) return false
+        }
         if (candidate.depth < existing.depth) return false
         if (candidate.depth > existing.depth) return true
         // Prefer exact scores over lower/upper bounds at the same depth.
@@ -373,6 +404,7 @@ class StockfishEngine(private val binaryPath: String) {
         var cp: Int? = null
         var mate: Int? = null
         var bound = false
+        var lowerBound = false
         var pv: List<String> = emptyList()
 
         var i = 1
@@ -397,6 +429,7 @@ class StockfishEngine(private val binaryPath: String) {
                     val next = tokens.getOrNull(i)
                     if (next == "lowerbound" || next == "upperbound") {
                         bound = true
+                        lowerBound = next == "lowerbound"
                         i++
                     }
                 }
@@ -414,13 +447,29 @@ class StockfishEngine(private val binaryPath: String) {
 
         val d = depth ?: return null
         if (cp == null && mate == null) return null
-        return InfoLine(d, multiPv, cp, mate, bound, pv)
+        return InfoLine(d, multiPv, cp, mate, bound, pv, lowerBound)
     }
 
+    /**
+     * Turns the stored lines into results, best line first.
+     *
+     * The bestmove is not always the first move of the multipv 1 line in [infos]: with several
+     * search threads Stockfish may take its answer from a helper thread, whose line it prints
+     * last and often at a lower depth than the one already stored (so it is not stored), and a
+     * stopped search can fall back to an earlier move. A forced mate must survive that, but the
+     * mate score must not be put on a move it was not found for. [byFirstMove] holds the latest
+     * line of every first move, so in that case:
+     *  - the bestmove's own line, if it is the newer one and proves a mate, is used whole;
+     *  - otherwise, if the stored line proves a mate for the side to move, its mating move is
+     *    returned instead of the bestmove: that mate is proven, the bestmove's is not;
+     *  - a proven "getting mated" score is kept on the bestmove: the best line loses by force,
+     *    so every move does.
+     */
     private fun buildResults(
         bestMoveToken: String,
         infos: Map<Int, InfoLine>,
         bestLineHistory: List<InfoLine> = emptyList(),
+        byFirstMove: Map<String, InfoLine> = emptyMap(),
     ): List<AnalysisResult> {
         val bestMove = if (bestMoveToken == "(none)" || bestMoveToken == "0000") "" else bestMoveToken
 
@@ -428,28 +477,53 @@ class StockfishEngine(private val binaryPath: String) {
             return listOf(AnalysisResult(bestMove, 0, null, 0, listOfNotNull(bestMove.ifEmpty { null })))
         }
 
-        return infos.toSortedMap().map { (index, info) ->
-            val move = if (index == 1) {
-                bestMove.ifEmpty { info.pv.firstOrNull().orEmpty() }
+        return infos.toSortedMap().map { (index, slot) ->
+            var info = slot
+            var move = if (index == 1) {
+                bestMove.ifEmpty { slot.pv.firstOrNull().orEmpty() }
             } else {
-                info.pv.firstOrNull().orEmpty()
+                slot.pv.firstOrNull().orEmpty()
             }
-            // After an interrupted search the bestmove token may not match the
-            // PV's first move.  When they disagree, replace the PV so the
-            // displayed arrow and eval stay consistent.
-            val moveMismatch = index == 1 && bestMove.isNotEmpty() &&
-                info.pv.firstOrNull() != null && info.pv[0] != bestMove
-            val pvAdjusted = if (moveMismatch) listOf(bestMove) else info.pv
-            // A mate is only reported when it is proven for the move that is returned: not when
-            // the score is a bound, and not when the score belongs to another move than the
-            // bestmove (the mate is then that other move's, and this one may not mate at all).
-            val mate = info.mate?.takeUnless { info.isBound || moveMismatch }
+            var pvAdjusted = slot.pv
+            val slotMove = slot.pv.firstOrNull()
+            val moveMismatch = index == 1 && bestMove.isNotEmpty() && slotMove != null && slotMove != bestMove
+            // False when the mate score of [info] belongs to another move than the one returned.
+            var mateIsForMove = true
+            if (moveMismatch) {
+                val own = byFirstMove[bestMove]?.takeIf { it.order > slot.order && it.provesMate }
+                val slotMate = slot.mate?.takeIf { slot.provesMate }
+                when {
+                    own != null && (own.mate ?: 0) > 0 -> {
+                        Log.d(TAG, "bestmove $bestMove is not the stored PV move $slotMove; using its own " +
+                            "line (mate ${own.mate}, depth ${own.depth})")
+                        info = own
+                        pvAdjusted = own.pv
+                    }
+                    slotMate != null && slotMate > 0 && slotMove != null -> {
+                        Log.w(TAG, "bestmove $bestMove has no mate line of its own; returning the proven " +
+                            "mating move $slotMove (mate $slotMate) instead")
+                        move = slotMove
+                    }
+                    own != null -> {
+                        info = own
+                        pvAdjusted = own.pv
+                    }
+                    slotMate != null -> pvAdjusted = listOf(bestMove)
+                    else -> {
+                        // No mate involved (or none proven): the arrow follows the bestmove and
+                        // the PV is cut so that arrow and line stay consistent.
+                        pvAdjusted = listOf(bestMove)
+                        mateIsForMove = false
+                    }
+                }
+            }
+            val mate = info.mate?.takeIf { info.provesMate && mateIsForMove }
             val eval = when {
                 mate != null -> mateToCp(mate)
                 info.mate != null -> {
                     Log.w(TAG, "Unproven mate score dropped (mate ${info.mate}, bound=${info.isBound}, " +
                         "pv move ${info.pv.firstOrNull()}, bestmove $bestMove)")
-                    if (info.mate > 0) UNPROVEN_MATE_CP else -UNPROVEN_MATE_CP
+                    if ((info.mate ?: 0) > 0) UNPROVEN_MATE_CP else -UNPROVEN_MATE_CP
                 }
                 else -> info.cp ?: 0
             }
