@@ -65,8 +65,8 @@ class StockfishEngine(private val binaryPath: String) {
         private const val QUIT_WAIT_MS = 1_000L
         private const val DESTROY_WAIT_MS = 500L
         private const val POLL_INTERVAL_MS = 100L
-        private const val ENGINE_THREADS = 3
-        private const val ENGINE_HASH_MB = 128
+        private const val ENGINE_THREADS = 4
+        private const val ENGINE_HASH_MB = 256
         /** Number of final search depths compared by [AnalysisResult.evalSwing]. */
         private const val SWING_DEPTHS = 4
 
