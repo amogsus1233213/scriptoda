@@ -476,6 +476,15 @@ class AnalysisCoordinator(
     private var lastSearchedPlacement: String? = null
     private var lastSearchedEvalWhite: Int? = null
 
+    /**
+     * Mate distance last committed as a premove sequence for the current position, null when
+     * no sequence has been shown yet. When a new search of the same position finds a mate
+     * distance that differs by more than [MATE_STABLE_MAX_DELTA] from this, the new mate is
+     * not trusted (the engine changed its mind between searches) and no premove sequence is
+     * drawn for it. Cleared on position change. Worker thread only.
+     */
+    private var lastCommittedMate: Int? = null
+
     /** Whether the last position change found no side-to-move source in [AccessibilityData]. */
     private var turnSourcesUnavailable = false
 
@@ -2066,6 +2075,7 @@ class AnalysisCoordinator(
         mateDelivered = false
         premovePreviewPlacement = null
         lineHoldSinceMs = 0L
+        lastCommittedMate = null
         // Retries belong to the placement that was just forgotten.
         failedPlacement = null
         failedRetries = 0
@@ -2139,24 +2149,22 @@ class AnalysisCoordinator(
             val prevPlacement = prevFen?.substringBefore(' ')
             if (line != null && prevPlacement != null && placement != START_PLACEMENT) {
                 val before = parsePlacement(prevPlacement)
-                val real = if (before != null) premovePreviewBase(line, before, after) else null
-                if (real != null) {
-                    val realPlacement = placementOf(real)
+                val preview = if (before != null) premovePreviewBase(line, before, after) else null
+                if (preview != null) {
+                    val realPlacement = placementOf(preview.base)
                     premovePreviewPlacement = placement
                     lineHoldSinceMs = 0L
                     guardedPlacement = null
                     guardedCount = 0
                     if (realPlacement == prevPlacement) {
-                        Log.d(TAG, "MateLine premove preview: nothing played yet, line kept " +
-                            "(played=${line.played}, pv.size=${line.pv.size})")
-                        // Drawn again (the same picture, so nothing moves on screen): the arrows
-                        // must be there for as long as the line is, whatever took them down.
-                        val remaining = remainingMateLines(line)
+                        Log.d(TAG, "MateLine premove preview: ${preview.premoveCount} premove(s) queued, " +
+                            "showing next arrow (played=${line.played}, pv.size=${line.pv.size})")
+                        val remaining = remainingMateLines(line, premoveOffset = preview.premoveCount)
                         if (remaining.isNotEmpty()) postMultiSuggestion(remaining, line.flipped)
                         return
                     }
                     Log.d(TAG, "MateLine premove preview on top of played moves: handling $realPlacement " +
-                        "(played=${line.played}, pv.size=${line.pv.size})")
+                        "(premoves=${preview.premoveCount}, played=${line.played}, pv.size=${line.pv.size})")
                     onPositionChanged(
                         realPlacement, fromAccessibility, allowPreview = false, screenPlacement = placement,
                     )
@@ -2770,6 +2778,9 @@ class AnalysisCoordinator(
             existing != null && existing.played == 0 -> existing
             else -> null
         }
+        if (mateLine === newLine && newLine != null) {
+            lastCommittedMate = bestAnalysis?.mate
+        }
 
         postMultiSuggestion(suggestions, flipped)
         // Remember what is on screen so the same position is not re-analysed right away. The
@@ -2827,6 +2838,12 @@ class AnalysisCoordinator(
         if (!mateIsSettled(analysis)) {
             Log.d(TAG, "Mate in $userMate not settled (previous depth: ${analysis.previousMate}, " +
                 "confirmed=${analysis.mateConfirmed}); showing the first move only")
+            return emptyList()
+        }
+        val prev = lastCommittedMate
+        if (prev != null && abs(userMate - prev) > MATE_STABLE_MAX_DELTA) {
+            Log.w(TAG, "Mate in $userMate rejected: last committed was M$prev, " +
+                "delta ${abs(userMate - prev)} > $MATE_STABLE_MAX_DELTA")
             return emptyList()
         }
         // And only from a PV that holds the whole mate: 2N - 1 plies for a mate in N. A shorter
