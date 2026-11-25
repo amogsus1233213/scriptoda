@@ -1023,6 +1023,12 @@ class ArrowView(
         const val MATE_RING_STROKE_DP = 3f
         const val MATE_RING_ALPHA = 128
         const val PREMOVE_BADGE_DP = 16f
+        /** Length of the pulse on a premove that has just become the move to play. */
+        const val ADVANCE_PULSE_MS = 600L
+        /** Opacity of that pulse's halo at its start; it fades to nothing. */
+        const val ADVANCE_PULSE_ALPHA = 170
+        /** Width the halo grows to beyond the arrow, as a fraction of the square size. */
+        const val ADVANCE_PULSE_GROW = 0.30f
         val STYLE_RANK_1 = ArrowStyle(255, 0.19f, 0.48f, 0.28f, 22f)  // Best: fully opaque, thicker
         val STYLE_RANK_2 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         val STYLE_RANK_3 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
@@ -1095,6 +1101,17 @@ class ArrowView(
 
     private val premovePath = Path()
 
+    /**
+     * Progress (0..1) of the pulse that marks the main arrow as newly promoted from a premove;
+     * 1 = no pulse. See [setArrows].
+     */
+    private var advancePulse = 1f
+    private var advanceAnimator: ValueAnimator? = null
+    private val pulsePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+
     // Thin dashed shaft of an opponent reply; butt caps keep the dashes at their nominal length.
     private val opponentShaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -1161,8 +1178,14 @@ class ArrowView(
      * cannot be mistaken: the alternatives are dropped, and when the move to play now is itself
      * missing (the first moves of the line were already played and only its rest is on screen)
      * the earliest premove takes its place as the main arrow.
+     *
+     * Stepping through a forced mate: when the new main arrow is a move that was one of the
+     * premoves a moment ago (the moves before it were played), it pulses once, so the eye
+     * lands on the move to play next. The remaining premoves are numbered from 2 again.
      */
     fun setArrows(arrows: List<ArrowData>) {
+        val previousMain = this.arrows.firstOrNull()
+        val previousPremoves = premoves
         val all = arrows
             .map {
                 it.copy(
@@ -1191,7 +1214,60 @@ class ArrowView(
         premoves = plan.take(MAX_PREMOVES)
         opponentReplies = all.filter { it.isOpponentReply }
             .sortedBy { it.step }.take(MAX_OPPONENT_REPLIES)
+        val main = suggestions.firstOrNull()
+        val sameMain = main != null && previousMain != null &&
+            main.from == previousMain.from && main.to == previousMain.to
+        val promoted = main != null && !sameMain && main.step == 1 &&
+            previousPremoves.any { it.from == main.from && it.to == main.to }
+        if (promoted) {
+            startAdvancePulse()
+        } else if (!sameMain) {
+            // Another arrow altogether: a pulse still running belongs to the old one.
+            stopAdvancePulse()
+        }
         invalidate()
+    }
+
+    private fun startAdvancePulse() {
+        stopAdvancePulse()
+        advancePulse = 0f
+        advanceAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = ADVANCE_PULSE_MS
+            addUpdateListener {
+                advancePulse = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    private fun stopAdvancePulse() {
+        advanceAnimator?.let {
+            it.removeAllUpdateListeners()
+            it.cancel()
+        }
+        advanceAnimator = null
+        advancePulse = 1f
+    }
+
+    override fun onDetachedFromWindow() {
+        stopAdvancePulse()
+        super.onDetachedFromWindow()
+    }
+
+    /**
+     * Halo of the advance pulse under the main arrow: a stroke in the arrow's color that widens
+     * and fades out over [ADVANCE_PULSE_MS].
+     */
+    private fun drawAdvancePulse(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
+        val t = advancePulse
+        if (t >= 1f) return
+        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
+        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val style = styleFor(arrow.rank)
+        pulsePaint.color = withAlpha(arrow.color, (ADVANCE_PULSE_ALPHA * (1f - t)).roundToInt())
+        pulsePaint.strokeWidth = square * (style.shaftFactor + ADVANCE_PULSE_GROW * t)
+        canvas.drawLine(start.x, start.y, end.x, end.y, pulsePaint)
     }
 
     fun clearOpponentBadge() {
@@ -1233,7 +1309,10 @@ class ArrowView(
             for (i in premoves.indices.reversed()) {
                 drawThinArrow(canvas, premoves[i], board, square)
             }
-            if (main != null) drawArrow(canvas, main, board, square)
+            if (main != null) {
+                drawAdvancePulse(canvas, main, board, square)
+                drawArrow(canvas, main, board, square)
+            }
             for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
         }
         drawOpponentBadge(canvas, board, square)

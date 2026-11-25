@@ -113,6 +113,16 @@ class AnalysisCoordinator(
         private const val MAX_MATE_PREMOVES = 7
         /** Coach text while the rest of a forced mate stays on screen after a move of it. */
         private const val MATE_FOLLOW_COMMENTARY = "Mate is forced. Keep following the numbered arrows."
+        /** Coach text once only the mating move of a followed forced mate is left. */
+        private const val MATE_LAST_MOVE_COMMENTARY = "Checkmate in one. Play the arrow."
+        /** Coach text when the user has played the last move of a followed forced mate. */
+        private const val MATE_DELIVERED_COMMENTARY = "Checkmate! You played the whole mate."
+        /**
+         * Most plies of a followed forced mate accepted as one board change. A queued premove is
+         * played together with the opponent's reply (2 plies); 3 covers a read that also missed
+         * the user's own move before them.
+         */
+        private const val MAX_MATE_CATCH_UP_PLIES = 3
 
         /** Time (ms) of one follow-up search that completes a mate PV; see [completeMatePv]. */
         private const val MATE_PV_STEP_MS = 200
@@ -376,6 +386,12 @@ class AnalysisCoordinator(
      * the position is searched again. See [advanceMateLine]. Worker thread only.
      */
     private var mateLine: MateLine? = null
+
+    /**
+     * Set by [advanceMateLine] when the move it recorded was the mating move of the line (the
+     * whole mate has been played), cleared by its next call. Worker thread only.
+     */
+    private var mateDelivered = false
 
     /** Placement and eval (white's POV) of the last main search, for [checkEvalSanity]. */
     private var lastSearchedPlacement: String? = null
@@ -1774,14 +1790,27 @@ class AnalysisCoordinator(
         checkTurnTrackingSources()
         val orientationKnown = whiteAtBottom != null || lastKnownOrientation != null
         val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
-        val prevFen = currentFen
+        var prevFen = currentFen
         val after = parsePlacement(placement) ?: return
 
-        val move = if (prevFen != null && placement != START_PLACEMENT) {
+        var move = if (prevFen != null && placement != START_PLACEMENT) {
             val before = parsePlacement(prevFen.substringBefore(' '))
             if (before != null) MoveInference.infer(before, after, epSquareOf(prevFen)) else null
         } else {
             null
+        }
+
+        // Not one move, but a forced mate is being followed: a queued premove is played together
+        // with the opponent's reply, so the board skips a position. If the change is the next
+        // plies of the mate, the skipped ones are recorded here and the last one is handled
+        // below like any single move.
+        if (move == null && prevFen != null && placement != START_PLACEMENT && mateLine != null) {
+            val before = parsePlacement(prevFen.substringBefore(' '))
+            val last = if (before != null) catchUpMateLine(before, after) else null
+            if (last != null) {
+                move = last
+                prevFen = currentFen
+            }
         }
 
         if (move == null) {
@@ -1806,6 +1835,8 @@ class AnalysisCoordinator(
                     if (diffs in 1..3) return
                 }
             }
+            // Whatever happened, it was not the forced mate on screen: fresh analysis decides.
+            mateLine = null
             resyncTo(
                 placement,
                 after,
@@ -1880,10 +1911,14 @@ class AnalysisCoordinator(
             // Following the forced mate on screen: its remaining arrows stay, the user is
             // about to premove them. Any other move clears the overlay as usual.
             val remaining = advanceMateLine(move)
+            // Read now: classifying below can take a while and must not see a later value.
+            val delivered = mateDelivered
             if (remaining.isNotEmpty()) {
                 postMultiSuggestion(remaining, mateLine?.flipped ?: !userIsWhite)
             } else {
                 postOverlayClear()
+                // The last move of the mate was played: nothing left to show but the result.
+                if (delivered) postCoachMessage(MATE_DELIVERED_COMMENTARY)
             }
             val (analysedBefore, classified) =
                 classifyInterruptibly(placement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
@@ -1894,7 +1929,9 @@ class AnalysisCoordinator(
             // Tell the user right away how their move was, and what was better if it was not.
             // beforeAnalysis is the top line that was on screen (null if nothing was shown), so a
             // match means the user simply followed the arrow: no surprise, just a brief nod.
-            if (classified != null) {
+            if (delivered) {
+                // The celebration stays; a "best move" nod would only replace it.
+            } else if (classified != null) {
                 val suggested = beforeAnalysis?.bestMove?.trim()
                 postCoachReaction(classified, beforeFen, suggested.equals(move.uci, ignoreCase = true))
             } else {
@@ -2412,15 +2449,13 @@ class AnalysisCoordinator(
 
     /**
      * Records [move] as played against the forced mate on screen ([mateLine]) and returns the
-     * arrows of that mate still to be played: the opponent's replies and the user's later
-     * moves, exactly as [premoveLines] returned them (steps and mate distances unchanged).
-     * None of them has step 1 any more, so the overlay (ArrowView.setArrows) makes the earliest
-     * remaining user move the bold main arrow, with its own "M<n>" pill, and numbers the ones
-     * after it 2, 3, ... by position: the same picture [render] draws once the position has
-     * been searched again. Empty, and the line forgotten, when no mate is on screen, [move] is
-     * not its next move, or nothing is left of it (the mate was delivered).
+     * arrows of that mate still to be played, one step further on ([remainingMateLines]).
+     * Empty, and the line forgotten, when no mate is on screen, [move] is not its next move
+     * (the user left the line, or the opponent found another reply: fresh analysis decides), or
+     * nothing is left of it. [mateDelivered] tells the last case apart: the mate was played out.
      */
     private fun advanceMateLine(move: InferredMove): List<SuggestedLineData> {
+        mateDelivered = false
         val line = mateLine ?: return emptyList()
         val expected = line.pv.getOrNull(line.played)
         // Compared by squares only: a promotion piece may be written differently or be missing.
@@ -2430,14 +2465,165 @@ class AnalysisCoordinator(
             return emptyList()
         }
         line.played++
-        // lines[i] is pv[i + 1], so with `played` plies done the first one left is lines[played - 1].
-        val remaining = line.lines.drop(line.played - 1)
+        val remaining = remainingMateLines(line)
         if (remaining.isEmpty()) {
+            // Only a line drawn to its end has the mating move as its last arrow; one cut short
+            // (MAX_MATE_PREMOVES, incomplete PV) just runs out and is searched again.
+            val wasLastUserMove = line.played % 2 == 1 && line.played - 1 >= line.lines.size
+            mateDelivered = wasLastUserMove && line.lines.lastOrNull()?.isMateTarget == true
             mateLine = null
-            return emptyList()
         }
-        // The overlay takes its coach text from the first line; arrows carry no notation.
-        return listOf(remaining[0].copy(commentary = MATE_FOLLOW_COMMENTARY)) + remaining.drop(1)
+        return remaining
+    }
+
+    /**
+     * What is left of [line] after its first [MateLine.played] plies, renumbered so that the
+     * picture is the one [render] draws for the position reached:
+     * - the user's next move is step 1, the bold main arrow with its own "M<n>" pill (and the
+     *   king's ring when it is the mating move); the moves after it are steps 2, 3, ...;
+     * - moves already played are gone, and so is the reply to a move the user has just played:
+     *   the opponent is about to answer it, and the user is looking at the move to premove;
+     * - the later replies keep the step of the user move they answer.
+     * Empty when no user move is left.
+     */
+    private fun remainingMateLines(line: MateLine): List<SuggestedLineData> {
+        // lines[i] is pv[i + 1], so with `played` plies done the first one left is lines[played - 1].
+        var rest = line.lines.drop((line.played - 1).coerceAtLeast(0))
+        // An odd number of plies played: the user moved last and rest starts with the reply to it.
+        if (line.played % 2 == 1 && rest.firstOrNull()?.isOpponentReply == true) rest = rest.drop(1)
+        val next = rest.firstOrNull { !it.isOpponentReply } ?: return emptyList()
+        val shift = next.step - 1
+        var first = true
+        return rest.map { data ->
+            when {
+                data.isOpponentReply -> data.copy(step = (data.step - shift).coerceAtLeast(1))
+                first -> {
+                    first = false
+                    // The overlay takes its coach text from the main arrow; no notation in it.
+                    data.copy(
+                        step = 1,
+                        commentary = if (data.isMateTarget) MATE_LAST_MOVE_COMMENTARY else MATE_FOLLOW_COMMENTARY,
+                    )
+                }
+                else -> data.copy(step = data.step - shift)
+            }
+        }
+    }
+
+    /**
+     * Explains a board change that is not one move ([before] to [after]) as the next two or
+     * three plies of the forced mate on screen: the opponent's reply and the premove that was
+     * played right after it arrive as a single change, and a slow read can add the user's own
+     * move before them.
+     *
+     * On a match every ply but the last is recorded here: [MateLine.played], castling rights,
+     * move counters and [currentFen] move on as if each position had been seen, and the analyses
+     * of the old position are dropped. The last ply is returned for the caller to handle like
+     * any single move, with [currentFen] the position right before it. Null, and nothing
+     * changed, when [after] is not on the line: the caller then starts over from the board.
+     */
+    private fun catchUpMateLine(before: CharArray, after: CharArray): InferredMove? {
+        val line = mateLine ?: return null
+        val moves = ArrayList<InferredMove>(MAX_MATE_CATCH_UP_PLIES)
+        val boards = ArrayList<CharArray>(MAX_MATE_CATCH_UP_PLIES + 1)
+        boards += before
+        var matched = false
+        for (k in 0 until MAX_MATE_CATCH_UP_PLIES) {
+            val uci = line.pv.getOrNull(line.played + k) ?: break
+            val (move, next) = applyUci(boards.last(), uci) ?: break
+            moves += move
+            boards += next
+            if (next.contentEquals(after)) {
+                matched = true
+                break
+            }
+        }
+        if (!matched) return null
+        Log.d(TAG, "Forced mate: ${moves.size} plies played at once " +
+            "(${moves.joinToString(" ") { it.uci }}), advancing the line")
+        for (i in 0 until moves.size - 1) {
+            val move = moves[i]
+            val from = boards[i]
+            val to = boards[i + 1]
+            castlingRights = updatedCastlingRights(castlingRights, move, to)
+            val capture = from[move.to] != EMPTY || move.enPassant
+            halfMoveClock = if (from[move.from].lowercaseChar() == 'p' || capture) 0 else halfMoveClock + 1
+            if (!move.white) fullMoveNumber++
+            currentFen = composeFen(
+                placementOf(to), !move.white, castlingRights, enPassantTarget(move, to), fullMoveNumber,
+            )
+            lastInferredMoverWasWhite = move.white
+            line.played++
+        }
+        if (moves.size > 1) {
+            // They describe a position that is no longer the one before the move.
+            currentAnalyses = null
+            previousAnalysis = null
+        }
+        return moves.last()
+    }
+
+    /**
+     * Plays the UCI move [uci] on [board] without checking legality (it comes from an engine
+     * PV): returns the move and the board after it, with castling, en passant and promotion
+     * carried out. Null when [uci] is malformed or its start square is empty.
+     */
+    private fun applyUci(board: CharArray, uci: String): Pair<InferredMove, CharArray>? {
+        if (!isUciMove(uci)) return null
+        val from = squareIndex(uci.substring(0, 2)) ?: return null
+        val to = squareIndex(uci.substring(2, 4)) ?: return null
+        val piece = board[from]
+        if (piece == EMPTY || from == to) return null
+        val white = piece.isUpperCase()
+        val kind = piece.lowercaseChar()
+        val next = board.copyOf()
+        next[from] = EMPTY
+        var landed = piece
+        var promotion: Char? = null
+        var enPassant = false
+        if (kind == 'p') {
+            if (from % 8 != to % 8 && board[to] == EMPTY) {
+                enPassant = true
+                next[(from / 8) * 8 + to % 8] = EMPTY
+            }
+            if (to / 8 == (if (white) 7 else 0)) {
+                val p = (uci.getOrNull(4) ?: 'q').lowercaseChar()
+                if (p !in "nbrq") return null
+                landed = if (white) p.uppercaseChar() else p
+                promotion = landed
+            }
+        } else if (kind == 'k' && abs(to % 8 - from % 8) == 2) {
+            val base = (from / 8) * 8
+            val rookFrom = if (to % 8 == 6) base + 7 else base
+            val rookTo = if (to % 8 == 6) base + 5 else base + 3
+            next[rookTo] = next[rookFrom]
+            next[rookFrom] = EMPTY
+        }
+        next[to] = landed
+        return InferredMove(from, to, promotion, white, enPassant) to next
+    }
+
+    /** FEN placement field of [board] (64 squares, a1 = 0): the inverse of [parsePlacement]. */
+    private fun placementOf(board: CharArray): String = buildString {
+        for (rank in 7 downTo 0) {
+            var empty = 0
+            for (file in 0..7) {
+                val c = board[rank * 8 + file]
+                if (c == EMPTY) {
+                    empty++
+                } else {
+                    if (empty > 0) append(empty)
+                    empty = 0
+                    append(c)
+                }
+            }
+            if (empty > 0) append(empty)
+            if (rank > 0) append('/')
+        }
+    }
+
+    private fun postCoachMessage(text: String) {
+        mainHandler.post { if (running.get()) OverlayService.instance?.showCoachMessage(text) }
     }
 
     private fun postOpponentBadge(square: String, label: String, flipped: Boolean) {
