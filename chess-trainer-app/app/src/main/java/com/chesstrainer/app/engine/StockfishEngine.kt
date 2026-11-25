@@ -65,6 +65,8 @@ class StockfishEngine(private val binaryPath: String) {
         private const val QUIT_WAIT_MS = 1_000L
         private const val DESTROY_WAIT_MS = 500L
         private const val POLL_INTERVAL_MS = 100L
+        private const val ENGINE_THREADS = 3
+        private const val ENGINE_HASH_MB = 128
         /** Number of final search depths compared by [AnalysisResult.evalSwing]. */
         private const val SWING_DEPTHS = 4
 
@@ -134,8 +136,10 @@ class StockfishEngine(private val binaryPath: String) {
                 return false
             }
 
-            send("setoption name Threads value 4")
-            send("setoption name Hash value 256")
+            // Sized for a mid-range phone (2 big + 6 little cores): more threads or a larger
+            // hash table make Android more likely to kill the process.
+            send("setoption name Threads value $ENGINE_THREADS")
+            send("setoption name Hash value $ENGINE_HASH_MB")
 
             if (!send("isready") ||
                 waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
@@ -165,7 +169,7 @@ class StockfishEngine(private val binaryPath: String) {
      * the position after a move without computing its FEN.
      *
      * @return the analysis, or null if the engine could not be started, died during the
-     * search, or did not produce "bestmove" within 30 seconds.
+     * search, or produced nothing usable before the search timeout.
      */
     fun analyze(fen: String, depth: Int = 12, moves: List<String> = emptyList()): AnalysisResult? =
         analyzeMultiPv(fen, depth, 1, moves)?.firstOrNull()
@@ -174,6 +178,10 @@ class StockfishEngine(private val binaryPath: String) {
      * Same as [analyze] but asks the engine for [lineCount] principal variations.
      * The returned list is ordered best line first and may contain fewer than
      * [lineCount] entries when the position has fewer legal moves.
+     *
+     * With [moveTimeMs] > 0 the search is limited by both [depth] and the time: it ends at
+     * whichever is reached first, so a simple position (forced mate, single legal move) returns
+     * well before the time is up.
      */
     fun analyzeMultiPv(
         fen: String,
@@ -216,7 +224,8 @@ class StockfishEngine(private val binaryPath: String) {
                 append("position fen ").append(fen.trim())
                 if (moves.isNotEmpty()) append(" moves ").append(moves.joinToString(" "))
             }
-            val goCommand = if (moveTimeMs > 0) "go movetime $moveTimeMs" else "go depth $depth"
+            // Both limits are sent: the engine stops at whichever comes first.
+            val goCommand = if (moveTimeMs > 0) "go depth $depth movetime $moveTimeMs" else "go depth $depth"
             if (!send(position) || !send(goCommand)) {
                 markDeadIfNeeded()
                 return null
@@ -254,29 +263,63 @@ class StockfishEngine(private val binaryPath: String) {
             }
 
             if (bestMove == null) {
-                if (process?.isAlive == true) {
-                    send("stop")
-                    val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
-                    while (bestMove == null) {
-                        val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
-                        if (stopLine.startsWith("bestmove")) {
-                            bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
-                        } else if (stopLine.startsWith("info ")) {
-                            record(parseInfo(stopLine) ?: continue)
-                        }
-                    }
-                }
-                if (bestMove == null && infos.isNotEmpty()) {
-                    bestMove = infos[1]?.pv?.firstOrNull() ?: infos.values.firstOrNull()?.pv?.firstOrNull()
-                }
-                if (bestMove == null) {
+                // The process died mid-search: whatever was collected comes from a half-finished
+                // search, so nothing is returned and the next call restarts the engine.
+                if (process?.isAlive != true) {
                     markDeadIfNeeded()
                     return null
+                }
+                send("stop")
+                val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
+                while (bestMove == null) {
+                    val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
+                    if (stopLine.startsWith("bestmove")) {
+                        bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
+                    } else if (stopLine.startsWith("info ")) {
+                        record(parseInfo(stopLine) ?: continue)
+                    }
+                }
+                if (bestMove == null) {
+                    // Still no bestmove: the engine is either dead or still searching. Left
+                    // alive, its late bestmove would be read as the answer of the next search
+                    // and every later result would be one search behind, so it is torn down and
+                    // the next call starts a fresh process.
+                    val diedMeanwhile = process?.isAlive != true
+                    Log.w(TAG, "No bestmove before the timeout (process dead=$diedMeanwhile); restarting the engine")
+                    synchronized(stateLock) { shutdownProcess() }
+                    if (diedMeanwhile) return null
+                    bestMove = infos[1]?.pv?.firstOrNull() ?: infos.values.firstOrNull()?.pv?.firstOrNull()
+                    if (bestMove == null) return null
                 }
             }
 
             return buildResults(bestMove, infos, bestLineHistory, byFirstMove)
         }
+    }
+
+    /**
+     * Tells the engine that the next position belongs to a different game ("ucinewgame"), which
+     * clears its hash table and search history so nothing from the previous game carries over.
+     * Call it when a new game starts, not between positions of the same game: the hash is what
+     * makes consecutive positions fast.
+     *
+     * Blocks until the engine is ready again (and until any running search has finished), so
+     * call it off the main thread. Does not start the engine: if it is not running there is
+     * nothing to clear and the next [analyze] call starts a fresh process anyway.
+     *
+     * @return true if the engine acknowledged, false if it is not running or did not answer.
+     */
+    fun newGame(): Boolean = analysisLock.withLock {
+        if (!isReady()) return false
+        val queue = lines
+        queue.clear()
+        if (!send("ucinewgame") || !send("isready") ||
+            waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
+        ) {
+            markDeadIfNeeded()
+            return false
+        }
+        true
     }
 
     /** Interrupts the current search; the pending [analyze] call returns promptly. */
