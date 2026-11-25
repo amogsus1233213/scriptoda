@@ -973,7 +973,17 @@ class AnalysisCoordinator(
         val mate = analysis.mate ?: return false
         if (!analysis.mateConfirmed) return false
         val previous = analysis.previousMate ?: return false
-        return (previous > 0) == (mate > 0) && abs(mate - previous) <= MATE_STABLE_MAX_DELTA
+        if ((previous > 0) != (mate > 0)) return false
+        if (abs(mate - previous) > MATE_STABLE_MAX_DELTA) return false
+        // The engine must have searched deep enough to actually prove the mate. A mate in N
+        // is 2N-1 plies; require the search depth to reach at least that far. Without this,
+        // a shallow depth can "settle" on a mate distance that deeper search will revise.
+        val requiredDepth = 2 * abs(mate) - 1
+        if (analysis.depth < requiredDepth) {
+            Log.d(TAG, "Mate in $mate not settled: depth ${analysis.depth} < required $requiredDepth")
+            return false
+        }
+        return true
     }
 
     /**
@@ -2772,7 +2782,11 @@ class AnalysisCoordinator(
         mateLine = when {
             // User is already following a sequence (played > 0): never replace mid-execution.
             existing != null && existing.played > 0 -> existing
-            // New settled line available: accept it.
+            // New settled line available: accept it, but only if it doesn't lengthen an
+            // already-committed shorter mate (a shorter find is an improvement; a longer one
+            // means the engine changed its mind and the first was likely wrong).
+            newLine != null && existing != null && existing.played == 0 &&
+                newLine.pv.size > existing.pv.size -> existing
             newLine != null -> newLine
             // No new line but an existing unplayed line: keep it on screen.
             existing != null && existing.played == 0 -> existing
