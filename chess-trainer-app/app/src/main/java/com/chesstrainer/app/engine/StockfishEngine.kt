@@ -33,6 +33,21 @@ data class AnalysisResult(
      * Null when unknown (too few depths, a mate score, or not the best line).
      */
     val evalSwing: Int? = null,
+    /**
+     * False when [mate] is only preliminary: it comes from a bound ("mate 12 lowerbound": a mate
+     * in 12 or sooner, the true distance is not known yet), or a deeper iteration failed low on
+     * it before the search ended. The side still wins by force, but the distance and the PV must
+     * not be shown as a move sequence. Meaningless when [mate] is null.
+     */
+    val mateConfirmed: Boolean = true,
+    /**
+     * Mate score the same first move had at the previous completed search depth (exact scores
+     * only, same point of view as [mate]). Null when [mate] is null, when the previous depth had
+     * no mate score or another best move, or when this is not the engine's best line. Lets the
+     * caller require a mate distance that has stopped changing: an intermediate "mate 12" that
+     * becomes "mate 2" one depth later shows up here.
+     */
+    val previousMate: Int? = null,
 )
 
 /**
@@ -382,12 +397,29 @@ class StockfishEngine(private val binaryPath: String) {
             val info = parsed.copy(order = ++order)
             recordBestLine(bestLineHistory, info)
             val existing = infos[info.multiPv]
-            if (shouldReplace(existing, info)) infos[info.multiPv] = keepLongerPv(existing, info)
+            if (shouldReplace(existing, info)) {
+                infos[info.multiPv] = keepLongerPv(existing, info)
+            } else if (existing != null && failsLowOn(existing, info)) {
+                // The stored exact mate stays (the bound has no score to put in its place), but
+                // it is no longer the last word of the search.
+                infos[info.multiPv] = existing.copy(doubted = true)
+            }
             val first = info.pv.firstOrNull() ?: return
             val known = byFirstMove[first]
-            // Newest wins, except that a bound never takes the place of an exact score.
-            if (known == null || !info.isBound || known.isBound) {
-                byFirstMove[first] = keepLongerPv(known, info)
+            when {
+                known == null -> byFirstMove[first] = info
+                // A shorter mate already proven for this move is not undone by a longer one from
+                // a search that is not deeper (a helper thread's line, an aspiration re-search):
+                // that would bring a replaced intermediate score back. The move was seen again,
+                // though, so the line counts as new.
+                isShorterMate(known, info) && info.depth <= known.depth ->
+                    byFirstMove[first] = known.copy(order = info.order)
+                // A shorter proven mate always wins, bound or not.
+                isShorterMate(info, known) -> byFirstMove[first] = info
+                // Otherwise the newest wins, except that a bound never takes the place of an
+                // exact score.
+                !info.isBound || known.isBound -> byFirstMove[first] = keepLongerPv(known, info)
+                failsLowOn(known, info) -> byFirstMove[first] = known.copy(doubted = true)
             }
         }
         var bestMove: String? = null
@@ -510,6 +542,11 @@ class StockfishEngine(private val binaryPath: String) {
         val isLowerBound: Boolean = false,
         /** Position of the line in the engine's output of one search (1, 2, ...). */
         val order: Int = 0,
+        /**
+         * Set on an exact mate score when a deeper iteration failed low on it afterwards
+         * ("mate 12 upperbound": at best a mate in 12, maybe none): see [failsLowOn].
+         */
+        val doubted: Boolean = false,
     ) {
         /**
          * True if the line's mate score stands for a forced mate. An exact score does. A bound
@@ -524,8 +561,40 @@ class StockfishEngine(private val binaryPath: String) {
         val isExactMate: Boolean get() = mate != null && !isBound
     }
 
+    /**
+     * True if both lines prove a mate for the side to move and [a]'s is the shorter one. "mate 2
+     * lowerbound" counts: it says mate in 2 or sooner. Only told for the mating side: a shorter
+     * "getting mated" is worse, not better, and is left to the ordinary depth rules.
+     */
+    private fun isShorterMate(a: InfoLine, b: InfoLine): Boolean {
+        val am = a.mate ?: return false
+        val bm = b.mate ?: return false
+        return a.provesMate && b.provesMate && am > 0 && bm > 0 && am < bm
+    }
+
+    /**
+     * True if [candidate] is a fail-low of a deeper iteration on the exact mate held in
+     * [existing]: an upper bound for the same move (or with no move at all), whatever its score.
+     * The stored mate was then not confirmed by the deeper search.
+     */
+    private fun failsLowOn(existing: InfoLine, candidate: InfoLine): Boolean {
+        val mate = existing.mate ?: return false
+        if (existing.isBound || mate <= 0) return false
+        if (!candidate.isBound || candidate.isLowerBound || candidate.depth <= existing.depth) return false
+        val move = candidate.pv.firstOrNull()
+        return move == null || move == existing.pv.firstOrNull()
+    }
+
     private fun shouldReplace(existing: InfoLine?, candidate: InfoLine): Boolean {
         if (existing == null) return true
+        // A shorter mate is the better score and always replaces a longer one, whatever the
+        // depths and whether it is exact or a lower bound: the longer one ("mate 12" before
+        // "mate 2") was an intermediate result and its PV is not the mating line. Without a PV
+        // the new line could not be tied to a move, so it must have one.
+        if (isShorterMate(candidate, existing) && candidate.pv.isNotEmpty()) return true
+        // The reverse: a longer mate from a search that is not deeper never replaces a shorter
+        // proven one.
+        if (isShorterMate(existing, candidate) && candidate.depth <= existing.depth) return false
         if (candidate.isBound && candidate.mate != null) {
             // A mate bound that proves no mate ("score mate 3 upperbound") never takes the place
             // of an exact score, whatever its depth.
@@ -581,6 +650,20 @@ class StockfishEngine(private val binaryPath: String) {
         if (history.size < SWING_DEPTHS) return null
         val scores = history.takeLast(SWING_DEPTHS).map { it.cp ?: return null }
         return scores.max() - scores.min()
+    }
+
+    /**
+     * Mate score that the first move of [info] had at the search depth before the one [info]
+     * comes from, or null if that cannot be told: [info] is not the last exact best line of the
+     * search, the depth before had another best move, or it had no mate score.
+     */
+    private fun previousMate(history: List<InfoLine>, info: InfoLine): Int? {
+        if (history.size < 2) return null
+        val last = history[history.size - 1]
+        val move = info.pv.firstOrNull() ?: return null
+        if (last.depth != info.depth || last.mate != info.mate || last.pv.firstOrNull() != move) return null
+        val before = history[history.size - 2]
+        return before.mate?.takeIf { before.pv.firstOrNull() == move }
     }
 
     private fun parseInfo(line: String): InfoLine? {
@@ -718,6 +801,8 @@ class StockfishEngine(private val binaryPath: String) {
                 if (move == bestMove) displaced = slot
             }
             val mate = info.mate?.takeIf { info.provesMate && mateIsForMove }
+            // Preliminary: a bound gives no distance, a doubted score was failed low on.
+            val mateConfirmed = mate == null || (!info.isBound && !info.doubted)
             val eval = when {
                 mate != null -> mateToCp(mate)
                 info.mate != null -> {
@@ -739,6 +824,12 @@ class StockfishEngine(private val binaryPath: String) {
                 depth = info.depth,
                 pv = pv,
                 evalSwing = if (index == 1) evalSwing(bestLineHistory) else null,
+                mateConfirmed = mateConfirmed,
+                previousMate = if (index == 1 && mate != null && mateConfirmed && move == info.pv.firstOrNull()) {
+                    previousMate(bestLineHistory, info)
+                } else {
+                    null
+                },
             )
         }
     }
