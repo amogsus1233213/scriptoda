@@ -149,7 +149,7 @@ class AnalysisCoordinator(
          * Most the mate distance may differ between the last two search depths for the mate to
          * count as settled; see [mateIsSettled].
          */
-        private const val MATE_STABLE_MAX_DELTA = 2
+        private const val MATE_STABLE_MAX_DELTA = 1
 
         /**
          * Eval change (cp, white's POV) between two consecutive analyses of nearby positions
@@ -426,6 +426,11 @@ class AnalysisCoordinator(
         val lines: List<SuggestedLineData>,
         val flipped: Boolean,
         var played: Int = 0,
+    )
+
+    private class PremovePreviewResult(
+        val base: CharArray,
+        val premoveCount: Int,
     )
 
     /**
@@ -2749,12 +2754,20 @@ class AnalysisCoordinator(
         // the opponent's reply before each of them. The line that delivers mate is the target.
         val premoves = premoveLines(bestAnalysis, best, sign, fen)
         suggestions += premoves
-        mateLine = when {
+        val newLine = when {
             bestAnalysis == null -> null
             premoves.isNotEmpty() -> MateLine(bestAnalysis.pv, premoves, flipped)
-            // Mate in one: no premoves, but the line is kept (with no arrows after the first)
-            // so that playing the arrow is recognised as delivering the mate.
             moverMate == 1 -> MateLine(listOf(bestAnalysis.bestMove), emptyList(), flipped)
+            else -> null
+        }
+        val existing = mateLine
+        mateLine = when {
+            // User is already following a sequence (played > 0): never replace mid-execution.
+            existing != null && existing.played > 0 -> existing
+            // New settled line available: accept it.
+            newLine != null -> newLine
+            // No new line but an existing unplayed line: keep it on screen.
+            existing != null && existing.played == 0 -> existing
             else -> null
         }
 
@@ -3062,12 +3075,17 @@ class AnalysisCoordinator(
      *   the opponent is about to answer it, and the user is looking at the move to premove;
      * - the later replies keep the step of the user move they answer.
      * Empty when no user move is left.
+     *
+     * [premoveOffset]: number of user premoves already queued on the board. Each queued premove
+     * accounts for 2 plies (the opponent's expected reply + the user's queued move), so the
+     * arrows are shifted forward by premoveOffset * 2 plies beyond [played].
      */
-    private fun remainingMateLines(line: MateLine): List<SuggestedLineData> {
-        // lines[i] is pv[i + 1], so with `played` plies done the first one left is lines[played - 1].
-        var rest = line.lines.drop((line.played - 1).coerceAtLeast(0))
+    private fun remainingMateLines(line: MateLine, premoveOffset: Int = 0): List<SuggestedLineData> {
+        val effectivePlayed = line.played + premoveOffset * 2
+        // lines[i] is pv[i + 1], so with effectivePlayed plies done the first one left is lines[effectivePlayed - 1].
+        var rest = line.lines.drop((effectivePlayed - 1).coerceAtLeast(0))
         // An odd number of plies played: the user moved last and rest starts with the reply to it.
-        if (line.played % 2 == 1 && rest.firstOrNull()?.isOpponentReply == true) rest = rest.drop(1)
+        if (effectivePlayed % 2 == 1 && rest.firstOrNull()?.isOpponentReply == true) rest = rest.drop(1)
         val next = rest.firstOrNull { !it.isOpponentReply } ?: return emptyList()
         val shift = next.step - 1
         var first = true
@@ -3076,7 +3094,6 @@ class AnalysisCoordinator(
                 data.isOpponentReply -> data.copy(step = (data.step - shift).coerceAtLeast(1))
                 first -> {
                     first = false
-                    // The overlay takes its coach text from the main arrow; no notation in it.
                     data.copy(
                         step = 1,
                         commentary = if (data.isMateTarget) MATE_LAST_MOVE_COMMENTARY else MATE_FOLLOW_COMMENTARY,
@@ -3166,9 +3183,7 @@ class AnalysisCoordinator(
      * Premoves exist only while the opponent is to move, which in the line is after an odd
      * number of plies (the PV starts with a move of the user). Changes nothing.
      */
-    private fun premovePreviewBase(line: MateLine, before: CharArray, after: CharArray): CharArray? {
-        // The line is the user's (see render), and so are the pieces its premoves move. Taken
-        // from the line itself, so it cannot disagree with the arrows drawn from it.
+    private fun premovePreviewBase(line: MateLine, before: CharArray, after: CharArray): PremovePreviewResult? {
         val userIsWhite = !line.flipped
         var board = before
         for (r in 0..MAX_MATE_CATCH_UP_PLIES) {
@@ -3177,29 +3192,30 @@ class AnalysisCoordinator(
                 board = applyUci(board, uci)?.second ?: return null
             }
             if ((line.played + r) % 2 == 0) continue
-            if (showsPremoves(line, board, line.played + r + 1, after, userIsWhite)) return board
+            val count = countPremoves(line, board, line.played + r + 1, after, userIsWhite)
+            if (count > 0) return PremovePreviewResult(board, count)
         }
         return null
     }
 
     /**
-     * True if [after] is [shown] with the user's move `pv[index]` of [line] drawn as a queued
-     * premove, alone or followed by the user's moves after it (`index + 2`, ...), each in any
-     * of the ways [premovePictures] knows a premove to be drawn.
+     * Returns the number of user premoves drawn on [shown] that match pv starting at [index],
+     * or 0 if [after] does not match any premove picture. Each premove is at index, index+2, ...
      */
-    private fun showsPremoves(
+    private fun countPremoves(
         line: MateLine,
         shown: CharArray,
         index: Int,
         after: CharArray,
         userIsWhite: Boolean,
-    ): Boolean {
-        val uci = line.pv.getOrNull(index) ?: return false
+    ): Int {
+        val uci = line.pv.getOrNull(index) ?: return 0
         for (next in premovePictures(shown, uci, userIsWhite)) {
-            if (next.contentEquals(after)) return true
-            if (showsPremoves(line, next, index + 2, after, userIsWhite)) return true
+            if (next.contentEquals(after)) return 1
+            val deeper = countPremoves(line, next, index + 2, after, userIsWhite)
+            if (deeper > 0) return 1 + deeper
         }
-        return false
+        return 0
     }
 
     /**
