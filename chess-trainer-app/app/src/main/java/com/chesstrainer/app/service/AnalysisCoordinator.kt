@@ -1511,7 +1511,7 @@ class AnalysisCoordinator(
         if (accessibilityMissedBoards != MISSED_FRAMES_BEFORE_CLEAR) return
         Log.d(TAG, "No board on screen for $accessibilityMissedBoards accessibility frames; clearing the overlay")
         stablePlacement = null
-        postOverlayClear()
+        postOverlayClear(dropMateLine = mateLine == null)
         if (boardVisible) {
             boardVisible = false
             lastHintStatus = STATUS_LOOKING
@@ -1756,7 +1756,7 @@ class AnalysisCoordinator(
         missedFrames++
         if (boardVisible && missedFrames >= MISSED_FRAMES_BEFORE_CLEAR) {
             boardVisible = false
-            postOverlayClear()
+            postOverlayClear(dropMateLine = mateLine == null)
             lastHintStatus = STATUS_LOOKING
             postStatus(STATUS_LOOKING)
         }
@@ -1811,8 +1811,7 @@ class AnalysisCoordinator(
         val after = parsePlacement(placement) ?: return false
         if (matchMateLine(line, before, after) != null) return true
         // The same, with further queued premoves of the line already drawn on the board.
-        val userIsWhite = whiteAtBottom ?: lastKnownOrientation ?: true
-        return premovePreviewBase(line, before, after, userIsWhite) != null
+        return premovePreviewBase(line, before, after) != null
     }
 
     /**
@@ -1983,7 +1982,7 @@ class AnalysisCoordinator(
                 // user's. Drop them and force a re-analysis of the current placement.
                 currentAnalyses = null
                 stablePlacement = null
-                postOverlayClear()
+                postOverlayClear(dropMateLine = mateLine == null)
             } else {
                 resetTracking()
                 postOverlayClear()
@@ -2067,8 +2066,17 @@ class AnalysisCoordinator(
      *   when it was read from the screen by vision (may contain misreads).
      * @param allowPreview false for the inner call that handles the position under a premove
      *   preview (see below), which must not be looked at as a preview again.
+     * @param screenPlacement what the board shows right now. It differs from [placement] only
+     *   in that inner call, where [placement] is the position really reached and the screen
+     *   shows queued premoves on top of it. Engine work is tied to this one, as it is what the
+     *   capture and poll threads compare the live board against ([interruptStaleSearch]).
      */
-    private fun onPositionChanged(placement: String, fromAccessibility: Boolean, allowPreview: Boolean = true) {
+    private fun onPositionChanged(
+        placement: String,
+        fromAccessibility: Boolean,
+        allowPreview: Boolean = true,
+        screenPlacement: String = placement,
+    ) {
         EngineStats.positionsSeen++
         positionStale = false
         checkTurnTrackingSources()
@@ -2091,18 +2099,26 @@ class AnalysisCoordinator(
             val prevPlacement = prevFen?.substringBefore(' ')
             if (line != null && prevPlacement != null && placement != START_PLACEMENT) {
                 val before = parsePlacement(prevPlacement)
-                val real = if (before != null) premovePreviewBase(line, before, after, userIsWhite) else null
+                val real = if (before != null) premovePreviewBase(line, before, after) else null
                 if (real != null) {
                     val realPlacement = placementOf(real)
                     premovePreviewPlacement = placement
+                    guardedPlacement = null
+                    guardedCount = 0
                     if (realPlacement == prevPlacement) {
                         Log.d(TAG, "MateLine premove preview: nothing played yet, line kept " +
                             "(played=${line.played}, pv.size=${line.pv.size})")
+                        // Drawn again (the same picture, so nothing moves on screen): the arrows
+                        // must be there for as long as the line is, whatever took them down.
+                        val remaining = remainingMateLines(line)
+                        if (remaining.isNotEmpty()) postMultiSuggestion(remaining, line.flipped)
                         return
                     }
                     Log.d(TAG, "MateLine premove preview on top of played moves: handling $realPlacement " +
                         "(played=${line.played}, pv.size=${line.pv.size})")
-                    onPositionChanged(realPlacement, fromAccessibility, allowPreview = false)
+                    onPositionChanged(
+                        realPlacement, fromAccessibility, allowPreview = false, screenPlacement = placement,
+                    )
                     return
                 }
             }
@@ -2181,7 +2197,7 @@ class AnalysisCoordinator(
                                 // disappears with them, a real position is still there after.
                                 Log.d(TAG, "Unexplained small change read $guardedCount times; " +
                                     "clearing the arrows to tell a misread from a real change: $placement")
-                                postOverlayClear()
+                                postOverlayClear(dropMateLine = false)
                             }
                             return
                         }
@@ -2284,8 +2300,9 @@ class AnalysisCoordinator(
                 // The last move of the mate was played: nothing left to show but the result.
                 if (delivered) postCoachMessage(MATE_DELIVERED_COMMENTARY)
             }
-            val (analysedBefore, classified) =
-                classifyInterruptibly(placement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
+            val (analysedBefore, classified) = classifyInterruptibly(
+                screenPlacement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier,
+            )
             if (!running.get()) return
             previousAnalysis = analysedBefore
             lastClassified = classified
@@ -2335,7 +2352,7 @@ class AnalysisCoordinator(
         val newAnalyses = recentlyShown(newFen) ?: run {
             val searchMs = searchTimeMs()
             postOverlayThinking(searchMs)
-            analyzeInterruptibly(newFen, placement, searchMs)
+            analyzeInterruptibly(newFen, screenPlacement, searchMs)
         }
         if (!running.get()) return
 
@@ -2360,19 +2377,20 @@ class AnalysisCoordinator(
         }
         // Do not draw arrows for a position that already changed while the engine was busy.
         val live = liveAccessibilityPlacement()
-        if (positionStale || (live != null && live != placement)) {
+        if (positionStale || (live != null && live != screenPlacement)) {
             // An interrupted search is too shallow to keep for classifying the next move.
             if (positionStale) currentAnalyses = null
             stablePlacement = null
-            postOverlayClear()
+            postOverlayClear(dropMateLine = mateLine == null)
             return
         }
         render()
-        retryIfAnalysisFailed(placement, newAnalyses)
+        retryIfAnalysisFailed(screenPlacement, newAnalyses)
 
         // Only now, with the arrows on screen, classify the opponent's move for its badge.
-        val (analysedBefore, classified) =
-            classifyInterruptibly(placement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
+        val (analysedBefore, classified) = classifyInterruptibly(
+            screenPlacement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier,
+        )
         if (!running.get()) return
         previousAnalysis = analysedBefore
         lastClassified = classified
@@ -2382,7 +2400,7 @@ class AnalysisCoordinator(
             // move turns out to be remarkable, render again so the coach can react to it.
             if (classified.classification in COACH_REACTS_TO_OPPONENT) {
                 val stillLive = liveAccessibilityPlacement()
-                if (stillLive == null || stillLive == placement) render()
+                if (stillLive == null || stillLive == screenPlacement) render()
             }
         }
     }
@@ -2549,10 +2567,15 @@ class AnalysisCoordinator(
         val flipped = !userIsWhite
         val usersTurn = whiteToMove == userIsWhite
         // Never draw the opponent's best move: suggestions are only shown on the user's turn.
-        if (!usersTurn) { postOverlayClear(); return }
+        // But during an active mate sequence, premove arrows are managed by advanceMateLine,
+        // not by render() — do not clear them here.
+        if (!usersTurn) {
+            if (mateLine == null) postOverlayClear()
+            return
+        }
 
         if (analyses.isNullOrEmpty()) {
-            postOverlayClear()
+            if (mateLine == null) postOverlayClear()
             return
         }
 
@@ -2848,11 +2871,11 @@ class AnalysisCoordinator(
         }
     }
 
-    private fun postOverlayClear() {
-        // Nothing of a forced mate is on screen any more, so there is nothing to keep.
-        mateLine = null
+    private fun postOverlayClear(dropMateLine: Boolean = true) {
+        if (dropMateLine) {
+            mateLine = null
+        }
         mainHandler.post {
-            // The opponent's badge belongs to the position whose arrows are removed here.
             OverlayService.instance?.clearSuggestion()
             OverlayService.instance?.clearOpponentBadge()
         }
@@ -3005,12 +3028,10 @@ class AnalysisCoordinator(
      * Premoves exist only while the opponent is to move, which in the line is after an odd
      * number of plies (the PV starts with a move of the user). Changes nothing.
      */
-    private fun premovePreviewBase(
-        line: MateLine,
-        before: CharArray,
-        after: CharArray,
-        userIsWhite: Boolean,
-    ): CharArray? {
+    private fun premovePreviewBase(line: MateLine, before: CharArray, after: CharArray): CharArray? {
+        // The line is the user's (see render), and so are the pieces its premoves move. Taken
+        // from the line itself, so it cannot disagree with the arrows drawn from it.
+        val userIsWhite = !line.flipped
         var board = before
         for (r in 0..MAX_MATE_CATCH_UP_PLIES) {
             if (r > 0) {
@@ -3018,46 +3039,69 @@ class AnalysisCoordinator(
                 board = applyUci(board, uci)?.second ?: return null
             }
             if ((line.played + r) % 2 == 0) continue
-            var shown = board
-            var index = line.played + r + 1
-            while (true) {
-                val uci = line.pv.getOrNull(index) ?: break
-                shown = applyPremove(shown, uci, userIsWhite) ?: break
-                if (shown.contentEquals(after)) return board
-                index += 2
-            }
+            if (showsPremoves(line, board, line.played + r + 1, after, userIsWhite)) return board
         }
         return null
     }
 
     /**
-     * [board] with the user's queued premove [uci] drawn on it: the piece simply stands on its
-     * target square (a promoting pawn as the new piece, a castling king with its rook moved).
-     * Null when [uci] is malformed or no piece of the user stands on its start square.
+     * True if [after] is [shown] with the user's move `pv[index]` of [line] drawn as a queued
+     * premove, alone or followed by the user's moves after it (`index + 2`, ...), each in any
+     * of the ways [premovePictures] knows a premove to be drawn.
      */
-    private fun applyPremove(board: CharArray, uci: String, userIsWhite: Boolean): CharArray? {
-        if (!isUciMove(uci)) return null
-        val from = squareIndex(uci.substring(0, 2)) ?: return null
-        val to = squareIndex(uci.substring(2, 4)) ?: return null
+    private fun showsPremoves(
+        line: MateLine,
+        shown: CharArray,
+        index: Int,
+        after: CharArray,
+        userIsWhite: Boolean,
+    ): Boolean {
+        val uci = line.pv.getOrNull(index) ?: return false
+        for (next in premovePictures(shown, uci, userIsWhite)) {
+            if (next.contentEquals(after)) return true
+            if (showsPremoves(line, next, index + 2, after, userIsWhite)) return true
+        }
+        return false
+    }
+
+    /**
+     * [board] with the user's queued premove [uci] drawn on it, in every way a chess app may
+     * draw it. The piece always stands on its target square, replacing whatever is there (the
+     * piece it is expected to capture, or a piece of the user's own that the opponent's reply
+     * is expected to take first); nothing else is taken off, as an en passant victim is not
+     * next to the pawn before the opponent has replied. The first board is the move as it will
+     * look once played: a promoting pawn as the new piece, a castling king with its rook
+     * moved. After it come the pictures of an app that only moves the piece that was touched:
+     * the pawn still a pawn on the last rank, the king castled with the rook left at home.
+     * Empty when [uci] is malformed or no piece of the user stands on its start square.
+     */
+    private fun premovePictures(board: CharArray, uci: String, userIsWhite: Boolean): List<CharArray> {
+        if (!isUciMove(uci)) return emptyList()
+        val from = squareIndex(uci.substring(0, 2)) ?: return emptyList()
+        val to = squareIndex(uci.substring(2, 4)) ?: return emptyList()
         val piece = board[from]
-        if (piece == EMPTY || from == to || piece.isUpperCase() != userIsWhite) return null
-        val next = board.copyOf()
-        next[from] = EMPTY
-        var landed = piece
+        if (piece == EMPTY || from == to || piece.isUpperCase() != userIsWhite) return emptyList()
+        val moved = board.copyOf()
+        moved[from] = EMPTY
+        moved[to] = piece
         val kind = piece.lowercaseChar()
         if (kind == 'p' && to / 8 == (if (userIsWhite) 7 else 0)) {
             val p = (uci.getOrNull(4) ?: 'q').lowercaseChar()
-            if (p !in "nbrq") return null
-            landed = if (userIsWhite) p.uppercaseChar() else p
-        } else if (kind == 'k' && abs(to % 8 - from % 8) == 2) {
+            if (p !in "nbrq") return emptyList()
+            val promoted = moved.copyOf()
+            promoted[to] = if (userIsWhite) p.uppercaseChar() else p
+            return listOf(promoted, moved)
+        }
+        if (kind == 'k' && abs(to % 8 - from % 8) == 2) {
             val base = (from / 8) * 8
             val rookFrom = if (to % 8 == 6) base + 7 else base
             val rookTo = if (to % 8 == 6) base + 5 else base + 3
-            next[rookTo] = next[rookFrom]
-            next[rookFrom] = EMPTY
+            val castled = moved.copyOf()
+            castled[rookTo] = castled[rookFrom]
+            castled[rookFrom] = EMPTY
+            return listOf(castled, moved)
         }
-        next[to] = landed
-        return next
+        return listOf(moved)
     }
 
     /**
