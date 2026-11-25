@@ -107,10 +107,12 @@ class AnalysisCoordinator(
         private const val QUALITY_CUTOFF_CP = 150
 
         /**
-         * Extra user moves of a forced mate drawn as numbered waypoints (after move 1). With
-         * move 1 that is 8 steps, one per color of the overlay's step palette.
+         * Extra user moves of a forced mate drawn as numbered premoves (after move 1). With
+         * move 1 that is 8 steps; the overlay's MAX_PREMOVES must not be smaller than this.
          */
         private const val MAX_MATE_PREMOVES = 7
+        /** Coach text while the rest of a forced mate stays on screen after a move of it. */
+        private const val MATE_FOLLOW_COMMENTARY = "Mate is forced. Keep following the numbered arrows."
 
         /** Time (ms) of one follow-up search that completes a mate PV; see [completeMatePv]. */
         private const val MATE_PV_STEP_MS = 200
@@ -346,6 +348,27 @@ class AnalysisCoordinator(
     private var shownKey: String? = null
     private var shownAtMs = 0L
     private var shownAnalyses: List<AnalysisResult>? = null
+
+    /**
+     * The forced mate whose arrows are on the overlay, kept while the game follows it.
+     * [lines] are the arrows after the first move as [premoveLines] returned them: `lines[i]`
+     * is the move `pv[i + 1]`. [played] counts the plies of [pv] played on the board so far.
+     */
+    private class MateLine(
+        val pv: List<String>,
+        val lines: List<SuggestedLineData>,
+        val flipped: Boolean,
+        var played: Int = 0,
+    )
+
+    /**
+     * Set by [render] when it draws a forced mate with premoves, dropped by every clearing of
+     * the overlay ([postOverlayClear]) and as soon as a move leaves the line. While it is set
+     * and the moves played are the expected ones, the remaining arrows stay on screen: the user
+     * is queueing premoves from them and must not lose them when the first move is played and
+     * the position is searched again. See [advanceMateLine]. Worker thread only.
+     */
+    private var mateLine: MateLine? = null
 
     /** Placement and eval (white's POV) of the last main search, for [checkEvalSanity]. */
     private var lastSearchedPlacement: String? = null
@@ -1771,7 +1794,14 @@ class AnalysisCoordinator(
             lastUserClassified = null
             postClearOpponentBadge()
             postClearCoachMessage()
-            postOverlayClear()
+            // Following the forced mate on screen: its remaining arrows stay, the user is
+            // about to premove them. Any other move clears the overlay as usual.
+            val remaining = advanceMateLine(move)
+            if (remaining.isNotEmpty()) {
+                postMultiSuggestion(remaining, mateLine?.flipped ?: !userIsWhite)
+            } else {
+                postOverlayClear()
+            }
             val (analysedBefore, classified) =
                 classifyInterruptibly(placement, beforeFen, move, beforeAnalysis, olderAnalysis, multiPvForClassifier)
             if (!running.get()) return
@@ -1792,9 +1822,14 @@ class AnalysisCoordinator(
         // Opponent just moved → user's turn.  The user-facing analysis runs first so the arrows
         // appear as soon as possible; the opponent's move is classified afterwards.
         // A position shown moments ago (duplicate or flickering events) is not searched again.
+        // The opponent played the reply the forced mate on screen expected: the user's remaining
+        // premoves stay visible through the search, until the new analysis replaces them.
+        val remainingMate = advanceMateLine(move)
+        val keepPremoves = remainingMate.isNotEmpty()
+        if (keepPremoves) postMultiSuggestion(remainingMate, mateLine?.flipped ?: !userIsWhite)
         val newAnalyses = recentlyShown(newFen) ?: run {
             val searchMs = searchTimeMs()
-            postOverlayThinking(searchMs)
+            postOverlayThinking(searchMs, keepArrows = keepPremoves)
             analyzeInterruptibly(newFen, placement, searchMs)
         }
         if (!running.get()) return
@@ -1824,7 +1859,10 @@ class AnalysisCoordinator(
             // An interrupted search is too shallow to keep for classifying the next move.
             if (positionStale) currentAnalyses = null
             stablePlacement = null
-            postOverlayClear()
+            // A queued premove may already have been played. The mate's arrows stay until the
+            // board is read again (forced by the line above): that read either continues the
+            // line or clears the overlay.
+            if (!keepPremoves) postOverlayClear()
             return
         }
         render()
@@ -2102,12 +2140,25 @@ class AnalysisCoordinator(
         } else {
             generated
         }
-        // Forced mate by the user: the best arrow is move 1 of the numbered sequence, so the
-        // overlay badges its source piece with "1". Any other line keeps step 0 (no numbering).
+        // Forced mate by the user: the best arrow is move 1 of the sequence (the bold teal
+        // arrow, itself unnumbered). Any other line keeps step 0.
         val mateStep = if (moverMate != null && moverMate > 0) 1 else 0
-        suggestions[0] = best.copy(commentary = commentary, step = mateStep)
-        // Forced mate only: the user's later moves of the mating line, numbered 2, 3, ...
-        suggestions += premoveLines(bestAnalysis, best, sign)
+        // Mate in one: the best arrow is itself the mating move, so it carries the mate target.
+        suggestions[0] = best.copy(
+            commentary = commentary,
+            step = mateStep,
+            isMateTarget = moverMate == 1,
+            mateKingSquare = if (moverMate == 1) opponentKingSquare(fen) else null,
+        )
+        // Forced mate only: the user's later moves of the mating line, numbered 2, 3, ..., with
+        // the opponent's reply before each of them. The line that delivers mate is the target.
+        val premoves = premoveLines(bestAnalysis, best, sign, fen)
+        suggestions += premoves
+        mateLine = if (premoves.isNotEmpty() && bestAnalysis != null) {
+            MateLine(bestAnalysis.pv, premoves, flipped)
+        } else {
+            null
+        }
 
         postMultiSuggestion(suggestions, flipped)
         // Remember what is on screen so the same position is not re-analysed right away. The
@@ -2124,7 +2175,7 @@ class AnalysisCoordinator(
      * be drawn with their number. The PV alternates user move, opponent reply, ..., so the
      * user's moves sit at the even indices.
      *
-     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]), each in its step's color.
+     * A forced mate shows every remaining move of the mate (up to [MAX_MATE_PREMOVES]).
      * Each line carries both squares of its UCI move: `from` is the piece to move (the overlay
      * numbers it with `step`), `to` is where it goes. `step` runs 2, 3, ...; step 1 is the best
      * arrow itself, set in [render]. Note that `from` is the square in the position after the
@@ -2132,12 +2183,25 @@ class AnalysisCoordinator(
      * move's `to`, which may be empty on the current board.
      * Any other line shows no follow-up moves at all: numbered steps are reserved for forced
      * mates, so an ordinary suggestion is just its one arrow.
+     *
+     * The opponent's replies (the odd PV indices) are returned too, each right before the user
+     * move that answers it, in PV order. A reply has [SuggestedLineData.isOpponentReply] set, no
+     * mate distance, and the step of the user move it replies to: the reply to the best arrow is
+     * step 1, the reply to premove 2 is step 2, and so on. A reply is only returned when the user
+     * move after it is, so the sequence always ends on a user move.
+     * The user move that delivers the mate (mate in 1 left) has
+     * [SuggestedLineData.isMateTarget] set. It is absent when the sequence is cut short, by
+     * [MAX_MATE_PREMOVES] or by a PV that ends early.
+     * That line also carries [SuggestedLineData.mateKingSquare]: the opponent king's square at
+     * the moment of mate, taken from [fen] and moved along with any king moves among the replies.
      * @param sign +1 if the user (side to move) is white, -1 if black
+     * @param fen the position on the board now, with the user to move
      */
     private fun premoveLines(
         analysis: AnalysisResult?,
         best: SuggestedLineData,
         sign: Int,
+        fen: String,
     ): List<SuggestedLineData> {
         analysis ?: return emptyList()
         val pv = analysis.pv
@@ -2148,15 +2212,33 @@ class AnalysisCoordinator(
         val userMate = analysis.mate?.takeIf { it > 0 } ?: return emptyList()
         val count = minOf(userMate - 1, MAX_MATE_PREMOVES)
 
-        val lines = ArrayList<SuggestedLineData>(count.coerceAtLeast(0))
+        val lines = ArrayList<SuggestedLineData>(2 * count.coerceAtLeast(0))
+        // Where the opponent's king stands; follows the king through the replies below.
+        var kingSquare = opponentKingSquare(fen)
         for (step in 2..count + 1) {
             val index = (step - 1) * 2
             val move = pv.getOrNull(index)
             if (move == null || !isUciMove(move) || !isUciMove(pv[index - 1])) {
                 Log.w(TAG, "Mate in $userMate: PV ends before move $step (${pv.size} plies), " +
-                    "showing ${lines.size} of $count premoves")
+                    "showing ${lines.count { !it.isOpponentReply }} of $count premoves")
                 break
             }
+            // The opponent's reply to the user's previous move (step - 1), played before this one.
+            val reply = pv[index - 1]
+            // A reply that starts on the king's square is a king move (castling included: its
+            // UCI form is the king's own two-square move).
+            if (reply.substring(0, 2) == kingSquare) kingSquare = reply.substring(2, 4)
+            lines += SuggestedLineData(
+                from = reply.substring(0, 2),
+                to = reply.substring(2, 4),
+                evalCp = best.evalCp,
+                mateIn = null,
+                label = "",
+                labelColor = MoveColors.NEUTRAL,
+                rank = 1,
+                step = step - 1,
+                isOpponentReply = true,
+            )
             // Mate distance left once the earlier moves are played, so the last arrow is M1.
             val left = userMate - (step - 1)
             lines += SuggestedLineData(
@@ -2168,9 +2250,38 @@ class AnalysisCoordinator(
                 labelColor = MoveColors.MATE,
                 rank = 1,
                 step = step,
+                isMateTarget = left == 1,
+                mateKingSquare = if (left == 1) kingSquare else null,
             )
         }
         return lines
+    }
+
+    /**
+     * Square of the king of the side NOT to move in [fen] (the opponent when it is the user's
+     * turn), e.g. "g8". Null if the FEN is malformed or has no such king.
+     */
+    private fun opponentKingSquare(fen: String): String? {
+        val fields = fen.trim().split(' ')
+        val king = when (fields.getOrNull(1)) {
+            "w" -> 'k'
+            "b" -> 'K'
+            else -> return null
+        }
+        val ranks = fields[0].split('/')
+        if (ranks.size != 8) return null
+        for ((row, rankText) in ranks.withIndex()) {
+            var file = 0
+            for (c in rankText) {
+                if (c.isDigit()) {
+                    file += c - '0'
+                } else {
+                    if (c == king && file in 0..7) return "${'a' + file}${8 - row}"
+                    file++
+                }
+            }
+        }
+        return null
     }
 
     /** True for a well-formed UCI move such as "e2e4" or "e7e8q". */
@@ -2198,6 +2309,9 @@ class AnalysisCoordinator(
                         rank = s.rank,
                         commentary = s.commentary,
                         step = s.step,
+                        isOpponentReply = s.isOpponentReply,
+                        isMateTarget = s.isMateTarget,
+                        mateKingSquare = s.mateKingSquare,
                     )
                 }
                 overlay.showMultiSuggestion(lines, flipped)
@@ -2206,7 +2320,35 @@ class AnalysisCoordinator(
     }
 
     private fun postOverlayClear() {
+        // Nothing of a forced mate is on screen any more, so there is nothing to keep.
+        mateLine = null
         mainHandler.post { OverlayService.instance?.clearSuggestion() }
+    }
+
+    /**
+     * Records [move] as played against the forced mate on screen ([mateLine]) and returns the
+     * arrows of that mate still to be played: the opponent's replies and the user's numbered
+     * moves, with their original numbers. Empty, and the line forgotten, when no mate is on
+     * screen, [move] is not its next move, or nothing is left of it (the mate was delivered).
+     */
+    private fun advanceMateLine(move: InferredMove): List<SuggestedLineData> {
+        val line = mateLine ?: return emptyList()
+        val expected = line.pv.getOrNull(line.played)
+        // Compared by squares only: a promotion piece may be written differently or be missing.
+        val uci = move.uci
+        if (expected == null || expected.length < 4 || !expected.regionMatches(0, uci, 0, 4, ignoreCase = true)) {
+            mateLine = null
+            return emptyList()
+        }
+        line.played++
+        // lines[i] is pv[i + 1], so with `played` plies done the first one left is lines[played - 1].
+        val remaining = line.lines.drop(line.played - 1)
+        if (remaining.isEmpty()) {
+            mateLine = null
+            return emptyList()
+        }
+        // The overlay takes its coach text from the first line; arrows carry no notation.
+        return listOf(remaining[0].copy(commentary = MATE_FOLLOW_COMMENTARY)) + remaining.drop(1)
     }
 
     private fun postOpponentBadge(square: String, label: String, flipped: Boolean) {
@@ -2247,13 +2389,17 @@ class AnalysisCoordinator(
     /**
      * Puts the overlay into its "thinking" state for a search of [searchMs], which it counts
      * down live. The deadline is taken here, as the search starts right after this call.
+     * @param keepArrows leave the arrows of a forced mate that is being followed on screen
      */
-    private fun postOverlayThinking(searchMs: Int) {
+    private fun postOverlayThinking(searchMs: Int, keepArrows: Boolean = false) {
         val deadline = SystemClock.elapsedRealtime() + searchMs
         mainHandler.post {
             // Whatever the main thread's delay ate is taken off the countdown.
             val remaining = deadline - SystemClock.elapsedRealtime()
-            OverlayService.instance?.showThinking(if (searchMs >= 1000) remaining.coerceAtLeast(0L) else 0L)
+            OverlayService.instance?.showThinking(
+                if (searchMs >= 1000) remaining.coerceAtLeast(0L) else 0L,
+                keepArrows,
+            )
         }
     }
 
@@ -2426,6 +2572,18 @@ class AnalysisCoordinator(
          * and [to] is where it goes.
          */
         val step: Int = 0,
+        /**
+         * An opponent reply inside the mate sequence, not a move for the user to play. Its
+         * [step] is the step of the user move it replies to; it has no mate distance or label.
+         */
+        val isOpponentReply: Boolean = false,
+        /** The user move that delivers the checkmate: the last move of the mate sequence. */
+        val isMateTarget: Boolean = false,
+        /**
+         * Only on the [isMateTarget] line: the square the opponent's king is mated on (where the
+         * overlay draws its ring). Null if the king could not be located.
+         */
+        val mateKingSquare: String? = null,
     )
 
     private data class InferredMove(
