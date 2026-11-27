@@ -2376,6 +2376,7 @@ class AnalysisCoordinator(
                     "from=${prevFen?.substringBefore(' ')}, to=$placement")
             }
             mateLine = null
+            lastCommittedMate = null
             resyncTo(
                 placement,
                 after,
@@ -3062,6 +3063,7 @@ class AnalysisCoordinator(
     private fun postOverlayClear(dropMateLine: Boolean = true) {
         if (dropMateLine) {
             mateLine = null
+            lastCommittedMate = null
         }
         mainHandler.post {
             OverlayService.instance?.clearSuggestion()
@@ -3169,6 +3171,7 @@ class AnalysisCoordinator(
             mateDelivered = wasLastUserMove &&
                 (line.lines.lastOrNull()?.isMateTarget == true || (line.lines.isEmpty() && line.played == 1))
             mateLine = null
+            lastCommittedMate = null
         }
         return remaining
     }
