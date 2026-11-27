@@ -19,7 +19,8 @@ object ViewTreeReader {
     fun traverse(root: AccessibilityNodeInfo?, maxDepth: Int = 20): List<NodeData> {
         if (root == null) return emptyList()
         val results = mutableListOf<NodeData>()
-        traverseRecursive(root, 0, maxDepth, results)
+        val bounds = android.graphics.Rect()
+        traverseRecursive(root, 0, maxDepth, results, bounds)
         return results
     }
 
@@ -28,10 +29,10 @@ object ViewTreeReader {
         depth: Int,
         maxDepth: Int,
         results: MutableList<NodeData>,
+        bounds: android.graphics.Rect,
     ) {
         if (depth > maxDepth) return
 
-        val bounds = android.graphics.Rect()
         node.getBoundsInScreen(bounds)
 
         results.add(NodeData(
@@ -48,8 +49,11 @@ object ViewTreeReader {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            traverseRecursive(child, depth + 1, maxDepth, results)
-            child.recycle()
+            try {
+                traverseRecursive(child, depth + 1, maxDepth, results, bounds)
+            } finally {
+                child.recycle()
+            }
         }
     }
 }

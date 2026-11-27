@@ -260,6 +260,10 @@ class BoardAccessibilityService : AccessibilityService() {
             }
         } catch (e: RuntimeException) {
             Log.w(TAG, "Could not read the window list", e)
+            best?.let {
+                try { it.recycle() } catch (_: RuntimeException) {}
+                best = null
+            }
         }
         if (best == null) {
             AccessibilityData.lastRejectReason = if (activePackage == null && windowCount == 0) {
@@ -547,12 +551,14 @@ class BoardAccessibilityService : AccessibilityService() {
     }
 
     /** Indented node listing for debugging. */
-    private fun dump(nodes: List<ViewTreeReader.NodeData>): String = buildString {
+    private fun dump(nodes: List<ViewTreeReader.NodeData>): String = buildString(
+        minOf(nodes.size, DUMP_NODES) * 80
+    ) {
         for (n in nodes.take(DUMP_NODES)) {
-            append("  ".repeat(n.depth))
+            append("  ".repeat(n.depth.coerceAtMost(20)))
             append(n.className)
-            if (n.text != null) append(" text=\"${n.text}\"")
-            if (n.contentDescription != null) append(" desc=\"${n.contentDescription}\"")
+            if (n.text != null) append(" text=\"${n.text.take(80)}\"")
+            if (n.contentDescription != null) append(" desc=\"${n.contentDescription.toString().take(80)}\"")
             if (n.viewId != null) append(" id=${n.viewId}")
             append(" [${n.boundsLeft},${n.boundsTop}-${n.boundsRight},${n.boundsBottom}]")
             appendLine()

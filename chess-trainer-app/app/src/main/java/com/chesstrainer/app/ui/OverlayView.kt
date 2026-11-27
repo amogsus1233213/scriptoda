@@ -1103,6 +1103,10 @@ class ArrowView(
 
     override fun onDetachedFromWindow() {
         stopAdvancePulse()
+        drawableCache.clear()
+        arrows = emptyList()
+        premoves = emptyList()
+        opponentReplies = emptyList()
         super.onDetachedFromWindow()
     }
 

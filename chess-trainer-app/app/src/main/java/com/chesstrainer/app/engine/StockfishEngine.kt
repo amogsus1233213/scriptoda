@@ -901,6 +901,14 @@ class StockfishEngine(private val binaryPath: String) {
             writer = null
         }
         process?.let { p ->
+            try {
+                p.inputStream?.close()
+            } catch (_: IOException) {
+            }
+            try {
+                p.errorStream?.close()
+            } catch (_: IOException) {
+            }
             p.destroy()
             try {
                 if (!p.waitFor(DESTROY_WAIT_MS, TimeUnit.MILLISECONDS)) p.destroyForcibly()
@@ -910,7 +918,14 @@ class StockfishEngine(private val binaryPath: String) {
             }
         }
         process = null
-        readerThread?.interrupt()
+        readerThread?.let { t ->
+            t.interrupt()
+            try {
+                t.join(DESTROY_WAIT_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
         readerThread = null
         currentMultiPv = 1
     }
