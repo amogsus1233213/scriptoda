@@ -579,6 +579,11 @@ class AnalysisCoordinator(
         accessibilityPoller = null
         // Interrupt a running search so the teardown below is not stuck behind it.
         engine?.stop()
+        // Clear volatile cross-thread state so a stale value from this run does not leak into
+        // the next start().
+        searchingPlacement = null
+        positionStale = false
+        polledPlacement = null
         submit {
             engine?.quit()
             engine = null
@@ -909,9 +914,12 @@ class AnalysisCoordinator(
         val validated = validatedAnalyses(fen, raw)
         checkEvalSanity(fen, validated?.firstOrNull())
         if (validated.isNullOrEmpty()) return validated
+        if (positionStale || !running.get()) return validated
         val trusted = trustedMates(fen, validated)
         // Only the best line gets numbered follow-up moves, so only its PV is completed.
-        return listOf(verifiedMatePv(fen, completeMatePv(fen, trusted[0], searchMs))) + trusted.drop(1)
+        val completed = completeMatePv(fen, trusted[0], searchMs)
+        if (positionStale || !running.get()) return listOf(completed) + trusted.drop(1)
+        return listOf(verifiedMatePv(fen, completed)) + trusted.drop(1)
     }
 
     /**
@@ -1388,6 +1396,9 @@ class AnalysisCoordinator(
             } catch (t: Exception) {
                 Log.e(TAG, "Worker task failed", t)
                 recoverFromWorkerFailure()
+            } catch (e: OutOfMemoryError) {
+                Log.e(TAG, "Worker task OOM", e)
+                recoverFromWorkerFailure()
             }
         }
         true
@@ -1407,6 +1418,11 @@ class AnalysisCoordinator(
     private fun recoverFromWorkerFailure() {
         mateLine = null
         mateDelivered = false
+        premovePreviewPlacement = null
+        lineHoldSinceMs = 0L
+        lastCommittedMate = null
+        guardedPlacement = null
+        guardedCount = 0
         if (workerFailures >= MAX_WORKER_FAILURE_RETRIES) return
         workerFailures++
         stablePlacement = null
@@ -1421,7 +1437,12 @@ class AnalysisCoordinator(
         ensureTemplatesLoaded()
 
         val px = Pixels(bitmap)
-        val grid = BoardLocator.locate(px)
+        val grid = try {
+            BoardLocator.locate(px)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Board location failed", e)
+            null
+        }
         if (grid == null) {
             onBoardMissing()
             if (!boardVisible) postHintStatus(STATUS_LOOKING)
@@ -1463,7 +1484,11 @@ class AnalysisCoordinator(
         // Track all readings since last stable position for majority vote
         if (placement != stablePlacement) {
             candidateFramesSinceStable++
-            candidateHistory[placement] = (candidateHistory[placement] ?: 0) + 1
+            if (candidateHistory.size < 32) {
+                candidateHistory[placement] = (candidateHistory[placement] ?: 0) + 1
+            } else {
+                candidateHistory[placement]?.let { candidateHistory[placement] = it + 1 }
+            }
         }
 
         // candidatePlacement == placement here, so candidateCount counts consecutive reads of it.
