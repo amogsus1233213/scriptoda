@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base surfaces -->
+    <color name="background">#161512</color>
+    <color name="surface">#262421</color>
+    <color name="surface_variant">#3C3A36</color>
+
+    <!-- Text -->
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#BABABA</color>
+
+    <!-- Accents -->
+    <color name="accent_green">#7FA650</color>
+    <color name="accent_green_dark">#5D7E3A</color>
+    <color name="accent_red">#CA3431</color>
+    <color name="accent_blue">#5BAAEF</color>
+    <color name="accent_yellow">#F7C631</color>
+
+    <!-- Move classifications -->
+    <color name="move_best">#96BC4B</color>
+    <color name="move_good">#7FA650</color>
+    <color name="move_great">#5BAAEF</color>
+    <color name="move_inaccuracy">#F7C631</color>
+    <color name="move_mistake">#E58F2A</color>
+    <color name="move_blunder">#CA3431</color>
+
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- Launcher -->
+    <color name="launcher_bg">#EEEED2</color>
+</resources>

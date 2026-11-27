@@ -1,0 +1,1109 @@
+package com.chesstrainer.app.engine
+
+import android.util.Log
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.File
+import java.io.IOException
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+/**
+ * Result of a single engine search.
+ *
+ * [eval] is always expressed in centipawns from the side-to-move point of view.
+ * When the engine reports a forced mate, [mate] holds the number of moves to mate
+ * (positive = side to move mates, negative = side to move gets mated, 0 = side to
+ * move is already checkmated) and [eval] is set to a large value
+ * ([StockfishEngine.MATE_SCORE] minus the mate distance) with the matching sign.
+ */
+data class AnalysisResult(
+    val bestMove: String,       // UCI format e.g. "e2e4"; empty if there is no legal move
+    val eval: Int,              // centipawns from side-to-move POV
+    val mate: Int?,             // moves to mate (positive = winning), null if no mate
+    val depth: Int,
+    val pv: List<String>,       // principal variation moves
+    /**
+     * How far the score of this line moved (max - min, centipawns) over the last few search
+     * depths. Small = the evaluation has settled, so the later PV moves can be trusted as a plan.
+     * Null when unknown (too few depths, a mate score, or not the best line).
+     */
+    val evalSwing: Int? = null,
+    /**
+     * False when [mate] is only preliminary: it comes from a bound ("mate 12 lowerbound": a mate
+     * in 12 or sooner, the true distance is not known yet), or a deeper iteration failed low on
+     * it before the search ended. The side still wins by force, but the distance and the PV must
+     * not be shown as a move sequence. Meaningless when [mate] is null.
+     */
+    val mateConfirmed: Boolean = true,
+    /**
+     * Mate score the same first move had at the previous completed search depth (exact scores
+     * only, same point of view as [mate]). Null when [mate] is null, when the previous depth had
+     * no mate score or another best move, or when this is not the engine's best line. Lets the
+     * caller require a mate distance that has stopped changing: an intermediate "mate 12" that
+     * becomes "mate 2" one depth later shows up here.
+     */
+    val previousMate: Int? = null,
+)
+
+/**
+ * Runs a Stockfish binary as a child process and talks to it over UCI.
+ *
+ * Engine output is consumed by a dedicated daemon reader thread and handed to callers
+ * through a queue. All searches are serialized through a lock, so the instance can be
+ * shared between threads. Every call except [stop] blocks, so call them off the main thread.
+ *
+ * If the process dies, the next [analyze] call restarts it transparently.
+ *
+ * The hash table is the engine's one large allocation. [ENGINE_HASH_MB] is only the first size
+ * tried: when the engine dies or stops answering while allocating it, or is killed later during a
+ * search (Android's low memory killer), the size is halved, down to [MIN_HASH_MB], and the
+ * engine is started again. The reduced size is kept for the lifetime of this instance, so a size
+ * that got the engine killed is not tried again. [hashMb] tells the size in use.
+ */
+class StockfishEngine(private val binaryPath: String) {
+
+    companion object {
+        /** Base value used to represent mate scores in centipawns. */
+        const val MATE_SCORE = 100_000
+
+        /**
+         * Eval (cp) given to a line whose mate score could not be trusted: clearly winning, but
+         * well below the range that stands for a forced mate.
+         */
+        const val UNPROVEN_MATE_CP = 5_000
+
+        private const val TAG = "StockfishEngine"
+
+        private const val ANALYSIS_TIMEOUT_MS = 10_000L
+        private const val HANDSHAKE_TIMEOUT_MS = 5_000L
+        private const val READY_TIMEOUT_MS = 3_000L
+        private const val STOP_DRAIN_TIMEOUT_MS = 1_000L
+        private const val OPTION_TIMEOUT_MS = 1_000L
+        private const val QUIT_WAIT_MS = 1_000L
+        private const val DESTROY_WAIT_MS = 500L
+        private const val POLL_INTERVAL_MS = 100L
+        /**
+         * Once the process is found dead, how long [waitForLine] still waits for the reader
+         * thread to hand over what the engine wrote before exiting (and the end-of-stream marker).
+         */
+        private const val DEAD_PROCESS_GRACE_MS = 300L
+        /**
+         * How long [stop] and [interruptSearch] wait for the write lock. They are called from the
+         * main thread and must never block on a search thread that is stuck writing.
+         */
+        private const val STOP_LOCK_WAIT_MS = 50L
+        private const val ENGINE_THREADS = 6
+        /** First hash size tried. See the class comment for the fallback. */
+        private const val ENGINE_HASH_MB = 512
+        /** The hash size is never reduced below this. */
+        private const val MIN_HASH_MB = 64
+        /**
+         * Time given to the engine to allocate and clear the hash table ("setoption name Hash",
+         * "ucinewgame"). Clearing a large table on a phone short of memory takes far longer than
+         * a plain "isready".
+         */
+        private const val HASH_READY_TIMEOUT_MS = 10_000L
+        /** Number of final search depths compared by [AnalysisResult.evalSwing]. */
+        private const val SWING_DEPTHS = 4
+
+        /** Sentinel pushed by the reader thread when the engine's stdout closes. */
+        private val EOF_MARKER = String(charArrayOf('\u0000'))
+
+        private val WHITESPACE = Regex("\\s+")
+
+        /** A move in UCI long algebraic notation ("e2e4", "e7e8q"). */
+        private val UCI_MOVE = Regex("[a-h][1-8][a-h][1-8][qrbn]?")
+    }
+
+    private val analysisLock = ReentrantLock()
+    private val stateLock = Any()
+    private val writeLock = ReentrantLock()
+
+    @Volatile private var process: Process? = null
+    @Volatile private var writer: BufferedWriter? = null
+    @Volatile private var readerThread: Thread? = null
+    @Volatile private var lines: LinkedBlockingQueue<String> = LinkedBlockingQueue()
+    @Volatile private var initialized = false
+    @Volatile private var currentMultiPv = 1
+
+    /** Hash size (MB) the next launch asks for. Only ever reduced. */
+    @Volatile private var targetHashMb = ENGINE_HASH_MB
+    /** Incremented by every [quit], so a search can tell a requested shutdown from a death. */
+    private val quitCount = AtomicInteger()
+    /** Set when the process died on its own during the current search. Guarded by [analysisLock]. */
+    @Volatile private var searchDied = false
+    /**
+     * Set when the process was alive but stopped answering during the current search and was
+     * torn down for it. Worth a retry on a fresh process, but not a reason to shrink the hash.
+     * Guarded by [analysisLock].
+     */
+    @Volatile private var searchHung = false
+
+    /**
+     * Hash size (MB) the running engine was configured with, 0 while it is not running. Lower
+     * than the default when larger sizes could not be allocated or got the engine killed.
+     */
+    @Volatile var hashMb = 0
+        private set
+
+    private enum class Launch { READY, HASH_FAILED, FAILED }
+
+    /**
+     * Launches the engine process and performs the UCI handshake. If the engine cannot take the
+     * hash size asked for, it is launched again with half of it until one works.
+     *
+     * @return true if the engine answered "uciok" and "readyok", false otherwise.
+     */
+    fun start(): Boolean = synchronized(stateLock) { startLocked() }
+
+    private fun startLocked(): Boolean {
+        if (isReady()) return true
+        while (true) {
+            val hash = targetHashMb.coerceAtLeast(MIN_HASH_MB)
+            when (launch(hash)) {
+                Launch.READY -> {
+                    hashMb = hash
+                    Log.i(TAG, "Engine ready: Hash=$hash MB, Threads=$ENGINE_THREADS" +
+                        if (hash < ENGINE_HASH_MB) " (reduced from $ENGINE_HASH_MB MB)" else "")
+                    return true
+                }
+                Launch.FAILED -> return false
+                Launch.HASH_FAILED -> if (!reduceHash("could not be allocated")) {
+                    Log.e(TAG, "Engine does not start even with Hash=$hash MB; giving up for now")
+                    return false
+                }
+            }
+        }
+    }
+
+    /**
+     * Halves the hash size used by the next launch.
+     *
+     * @return false if it already was at [MIN_HASH_MB].
+     */
+    private fun reduceHash(why: String): Boolean {
+        val current = targetHashMb
+        if (current <= MIN_HASH_MB) return false
+        val next = (current / 2).coerceAtLeast(MIN_HASH_MB)
+        targetHashMb = next
+        Log.w(TAG, "Hash=$current MB $why; next attempt uses $next MB")
+        return true
+    }
+
+    /** One launch attempt with a hash table of [hash] MB. Leaves no process behind on failure. */
+    private fun launch(hash: Int): Launch {
+        shutdownProcess()
+        Log.i(TAG, "Starting engine with Hash=$hash MB (device MemAvailable: ${memAvailableMb() ?: "?"} MB)")
+
+        return try {
+            val p = ProcessBuilder(binaryPath)
+                .redirectErrorStream(true)
+                .start()
+            val queue = LinkedBlockingQueue<String>()
+            val reader = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
+            val thread = Thread({
+                try {
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        val trimmed = line.trim()
+                        if (trimmed.isNotEmpty()) queue.offer(trimmed)
+                    }
+                } catch (_: IOException) {
+                    // Stream closed: the process exited or was destroyed.
+                } finally {
+                    queue.offer(EOF_MARKER)
+                    try {
+                        reader.close()
+                    } catch (_: IOException) {
+                    }
+                }
+            }, "stockfish-reader").apply {
+                isDaemon = true
+            }
+
+            process = p
+            writer = BufferedWriter(OutputStreamWriter(p.outputStream, Charsets.UTF_8))
+            lines = queue
+            readerThread = thread
+            currentMultiPv = 1
+            thread.start()
+
+            if (!send("uci") ||
+                waitForLine(queue, deadlineAfter(HANDSHAKE_TIMEOUT_MS)) { it == "uciok" } == null
+            ) {
+                Log.e(TAG, "No uciok from the engine (${describeExit(p)})")
+                shutdownProcess()
+                return Launch.FAILED
+            }
+
+            // Threads first and on its own: a failure here has nothing to do with the hash size.
+            if (!send("setoption name Threads value $ENGINE_THREADS") || !send("isready") ||
+                waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
+            ) {
+                Log.e(TAG, "Engine did not accept Threads=$ENGINE_THREADS (${describeExit(p)})")
+                shutdownProcess()
+                return Launch.FAILED
+            }
+
+            // The engine allocates and clears the table while handling this option. When it
+            // cannot, it prints an error and exits, or Android kills it; "isready" is answered
+            // only once the table is in place.
+            var lastOutput = ""
+            val hashSet = send("setoption name Hash value $hash") && send("isready") &&
+                waitForLine(queue, deadlineAfter(HASH_READY_TIMEOUT_MS)) {
+                    if (it != "readyok") lastOutput = it
+                    it == "readyok"
+                } != null
+            // Second check: a full "uci" round trip proves the engine survived the allocation
+            // and still answers commands.
+            val alive = hashSet && p.isAlive && send("uci") &&
+                waitForLine(queue, deadlineAfter(HANDSHAKE_TIMEOUT_MS)) { it == "uciok" } != null &&
+                p.isAlive
+            if (!alive && Thread.currentThread().isInterrupted) {
+                // The caller gave up while waiting; that says nothing about the hash size.
+                Log.w(TAG, "Interrupted while setting Hash=$hash MB")
+                shutdownProcess()
+                return Launch.FAILED
+            }
+            if (!alive) {
+                Log.w(TAG, "Engine lost while setting Hash=$hash MB (${describeExit(p)})" +
+                    if (lastOutput.isNotEmpty()) ", last output: $lastOutput" else "")
+                shutdownProcess()
+                return Launch.HASH_FAILED
+            }
+
+            initialized = true
+            Launch.READY
+        } catch (e: IOException) {
+            Log.e(TAG, "Could not launch the engine", e)
+            shutdownProcess()
+            Launch.FAILED
+        } catch (e: RuntimeException) {
+            // SecurityException and anything else the process launch can throw.
+            Log.e(TAG, "Could not launch the engine", e)
+            shutdownProcess()
+            Launch.FAILED
+        }
+    }
+
+    /** "still running" or the exit code of [p], for the log. */
+    private fun describeExit(p: Process): String = try {
+        "exit code ${p.exitValue()}"
+    } catch (_: IllegalThreadStateException) {
+        "still running, not answering"
+    }
+
+    /** The kernel's estimate of the memory available without swapping, or null if unknown. */
+    private fun memAvailableMb(): Long? = try {
+        File("/proc/meminfo").useLines { all ->
+            all.firstOrNull { it.startsWith("MemAvailable:") }
+                ?.split(WHITESPACE)?.getOrNull(1)?.toLongOrNull()?.div(1024)
+        }
+    } catch (_: IOException) {
+        null
+    } catch (_: RuntimeException) {
+        null
+    }
+
+    /** True when the process is alive and the UCI handshake has completed. */
+    fun isReady(): Boolean = initialized && process?.isAlive == true
+
+    /**
+     * Searches [fen] to [depth] plies and returns the deepest principal variation.
+     *
+     * [moves] (UCI format) are applied to [fen] before searching, which allows analysing
+     * the position after a move without computing its FEN.
+     *
+     * @return the analysis, or null if the engine could not be started, died during the
+     * search, or produced nothing usable before the search timeout.
+     */
+    fun analyze(fen: String, depth: Int = 12, moves: List<String> = emptyList()): AnalysisResult? =
+        analyzeMultiPv(fen, depth, 1, moves)?.firstOrNull()
+
+    /**
+     * Same as [analyze] but asks the engine for [lineCount] principal variations.
+     * The returned list is ordered best line first and may contain fewer than
+     * [lineCount] entries when the position has fewer legal moves.
+     *
+     * With [moveTimeMs] > 0 the search is limited by both [depth] and the time: it ends at
+     * whichever is reached first, so a simple position (forced mate, single legal move) returns
+     * well before the time is up.
+     */
+    fun analyzeMultiPv(
+        fen: String,
+        depth: Int = 12,
+        lineCount: Int = 1,
+        moves: List<String> = emptyList(),
+        moveTimeMs: Int = 0
+    ): List<AnalysisResult>? {
+        require(depth > 0) { "depth must be positive" }
+        require(lineCount > 0) { "lineCount must be positive" }
+
+        // Last line of defence for every caller: a malformed position makes the engine search
+        // garbage or crash, so it is never sent.
+        PositionValidator.fenError(fen)?.let { error ->
+            Log.w(TAG, "Refusing to analyse invalid FEN ($error): $fen")
+            return null
+        }
+
+        moves.firstOrNull { !UCI_MOVE.matches(it) }?.let { bad ->
+            Log.w(TAG, "Refusing to analyse with malformed move '$bad' in $moves")
+            return null
+        }
+
+        analysisLock.withLock {
+            // A second attempt only after the engine died on its own: it is restarted (with a
+            // smaller hash table) and the same position searched again, so that a killed engine
+            // costs a delay and not the answer.
+            repeat(2) { attempt ->
+                val quitsBefore = quitCount.get()
+                searchDied = false
+                searchHung = false
+                val results = searchOnce(fen, depth, lineCount, moves, moveTimeMs)
+                if (results != null) return results
+                // Nothing to retry if the engine is alive, was shut down on purpose, or the
+                // calling thread is being stopped.
+                if ((!searchDied && !searchHung) || quitCount.get() != quitsBefore ||
+                    Thread.currentThread().isInterrupted
+                ) {
+                    return null
+                }
+                if (searchDied) {
+                    reduceHash("in use when the engine died during a search")
+                    Log.w(TAG, "Engine died during a search" + if (attempt == 0) "; restarting and retrying" else " again")
+                } else {
+                    Log.w(TAG, "Engine stopped answering during a search" +
+                        if (attempt == 0) "; restarting and retrying" else " again")
+                }
+            }
+            return null
+        }
+    }
+
+    /** One search on the running engine (started if needed). Call with [analysisLock] held. */
+    private fun searchOnce(
+        fen: String,
+        depth: Int,
+        lineCount: Int,
+        moves: List<String>,
+        moveTimeMs: Int
+    ): List<AnalysisResult>? {
+        if (!isReady() && !start()) return null
+        val queue = lines
+
+        discardPending(queue)
+        if (!send("isready") ||
+            waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
+        ) {
+            abandon("No readyok before the search")
+            return null
+        }
+
+        if (lineCount != currentMultiPv) {
+            if (!send("setoption name MultiPV value $lineCount")) {
+                abandon("Could not set MultiPV")
+                return null
+            }
+            currentMultiPv = lineCount
+        }
+
+        val position = buildString {
+            append("position fen ").append(fen.trim())
+            if (moves.isNotEmpty()) append(" moves ").append(moves.joinToString(" "))
+        }
+        // Both limits are sent: the engine stops at whichever comes first.
+        val goCommand = if (moveTimeMs > 0) "go depth $depth movetime $moveTimeMs" else "go depth $depth"
+        if (!send(position) || !send(goCommand)) {
+            abandon("Could not send the search")
+            return null
+        }
+
+        val deadline = deadlineAfter(if (moveTimeMs > 0) moveTimeMs.toLong() + ANALYSIS_TIMEOUT_MS else ANALYSIS_TIMEOUT_MS)
+        val infos = HashMap<Int, InfoLine>()
+        // Exact scores of the best line, one per depth, to tell how settled the eval is.
+        val bestLineHistory = ArrayList<InfoLine>()
+        // Latest line seen for each first move, whatever its multipv slot or depth; see
+        // [buildResults] for why the slots alone are not enough.
+        val byFirstMove = HashMap<String, InfoLine>()
+        var order = 0
+        fun record(parsed: InfoLine) {
+            val info = parsed.copy(order = ++order)
+            recordBestLine(bestLineHistory, info)
+            val existing = infos[info.multiPv]
+            if (shouldReplace(existing, info)) {
+                infos[info.multiPv] = keepLongerPv(existing, info)
+            } else if (existing != null && failsLowOn(existing, info)) {
+                // The stored exact mate stays (the bound has no score to put in its place), but
+                // it is no longer the last word of the search.
+                infos[info.multiPv] = existing.copy(doubted = true)
+            }
+            val first = info.pv.firstOrNull() ?: return
+            val known = byFirstMove[first]
+            when {
+                known == null -> byFirstMove[first] = info
+                // A shorter mate already proven for this move is not undone by a longer one from
+                // a search that is not deeper (a helper thread's line, an aspiration re-search):
+                // that would bring a replaced intermediate score back. The move was seen again,
+                // though, so the line counts as new.
+                isShorterMate(known, info) && info.depth <= known.depth ->
+                    byFirstMove[first] = known.copy(order = info.order)
+                // A shorter proven mate always wins, bound or not.
+                isShorterMate(info, known) -> byFirstMove[first] = info
+                // Otherwise the newest wins, except that a bound never takes the place of an
+                // exact score.
+                !info.isBound || known.isBound -> byFirstMove[first] = keepLongerPv(known, info)
+                failsLowOn(known, info) -> byFirstMove[first] = known.copy(doubted = true)
+            }
+        }
+        var bestMove: String? = null
+
+        while (bestMove == null) {
+            val line = waitForLine(queue, deadline) { true } ?: break
+            if (isBestMoveLine(line)) {
+                bestMove = parseBestMove(line)
+            } else if (line.startsWith("info ")) {
+                record(parseInfo(line) ?: continue)
+            }
+        }
+
+        if (bestMove == null) {
+            // The process died mid-search: whatever was collected comes from a half-finished
+            // search, so nothing is returned and the next call restarts the engine.
+            if (process?.isAlive != true || isEndOfStream(queue)) {
+                markDeadIfNeeded(force = true)
+                return null
+            }
+            // Timeout, or the calling thread was interrupted. Either way the engine is still
+            // searching and its bestmove must be collected here, or it would be taken as the
+            // answer of the next search. The interrupt flag is put aside for the drain (it would
+            // make every wait return at once) and restored afterwards.
+            val wasInterrupted = Thread.interrupted()
+            send("stop")
+            val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
+            while (bestMove == null) {
+                val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
+                if (isBestMoveLine(stopLine)) {
+                    bestMove = parseBestMove(stopLine)
+                } else if (stopLine.startsWith("info ")) {
+                    record(parseInfo(stopLine) ?: continue)
+                }
+            }
+            if (wasInterrupted) Thread.currentThread().interrupt()
+            if (bestMove == null) {
+                // Still no bestmove: the engine is either dead or still searching. Left
+                // alive, its late bestmove would be read as the answer of the next search
+                // and every later result would be one search behind, so it is torn down and
+                // the next call starts a fresh process.
+                val p = process
+                val diedMeanwhile = p?.isAlive != true
+                Log.w(TAG, "No bestmove before the timeout (process dead=$diedMeanwhile); restarting the engine")
+                shutdownIfCurrent(p)
+                if (diedMeanwhile) {
+                    searchDied = true
+                    return null
+                }
+                bestMove = infos[1]?.pv?.firstOrNull() ?: infos.values.firstOrNull()?.pv?.firstOrNull()
+                if (bestMove == null) return null
+            }
+        }
+
+        return buildResults(bestMove, infos, bestLineHistory, byFirstMove)
+    }
+
+    /**
+     * Tells the engine that the next position belongs to a different game ("ucinewgame"), which
+     * clears its hash table and search history so nothing from the previous game carries over.
+     * Call it when a new game starts, not between positions of the same game: the hash is what
+     * makes consecutive positions fast.
+     *
+     * Blocks until the engine is ready again (and until any running search has finished), so
+     * call it off the main thread. Does not start the engine: if it is not running there is
+     * nothing to clear and the next [analyze] call starts a fresh process anyway.
+     *
+     * @return true if the engine acknowledged, false if it is not running or did not answer.
+     */
+    fun newGame(): Boolean = analysisLock.withLock {
+        if (!isReady()) return false
+        val queue = lines
+        discardPending(queue)
+        // "ucinewgame" clears the whole hash table, hence the long timeout.
+        if (!send("ucinewgame") || !send("isready") ||
+            waitForLine(queue, deadlineAfter(HASH_READY_TIMEOUT_MS)) { it == "readyok" } == null
+        ) {
+            // A fresh process (started by the next search) has an empty hash table too, so
+            // tearing down an engine that does not answer loses nothing.
+            abandon("No readyok after ucinewgame")
+            return false
+        }
+        true
+    }
+
+    /** Interrupts the current search; the pending [analyze] call returns promptly. */
+    fun stop() {
+        if (process?.isAlive == true) send("stop", STOP_LOCK_WAIT_MS)
+    }
+
+    /**
+     * Sends "stop" without acquiring [analysisLock], so it can be called from another
+     * thread while [analyzeMultiPv] is waiting. The running search will produce a
+     * "bestmove" that [analyzeMultiPv] picks up.
+     */
+    fun interruptSearch() {
+        if (initialized && process?.isAlive == true) send("stop", STOP_LOCK_WAIT_MS)
+    }
+
+    /** Asks the engine to exit and releases the process. */
+    fun quit() {
+        quitCount.incrementAndGet()
+        synchronized(stateLock) {
+            val p = process ?: return
+            if (p.isAlive) {
+                send("quit")
+                try {
+                    p.waitFor(QUIT_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            shutdownProcess()
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------------------------
+
+    private data class InfoLine(
+        val depth: Int,
+        val multiPv: Int,
+        val cp: Int?,
+        val mate: Int?,
+        val isBound: Boolean,
+        val pv: List<String>,
+        /** Only meaningful with [isBound]: true for "lowerbound", false for "upperbound". */
+        val isLowerBound: Boolean = false,
+        /** Position of the line in the engine's output of one search (1, 2, ...). */
+        val order: Int = 0,
+        /**
+         * Set on an exact mate score when a deeper iteration failed low on it afterwards
+         * ("mate 12 upperbound": at best a mate in 12, maybe none): see [failsLowOn].
+         */
+        val doubted: Boolean = false,
+    ) {
+        /**
+         * True if the line's mate score stands for a forced mate. An exact score does. A bound
+         * does only in one direction: "mate 3 lowerbound" says the score is at least a mate in
+         * 3, so the side to move mates (in 3 or sooner), and "mate -3 upperbound" says it is
+         * mated. The other direction ("mate 3 upperbound": at most a mate in 3) proves nothing.
+         */
+        val provesMate: Boolean
+            get() = mate != null && (!isBound || (mate > 0) == isLowerBound)
+
+        /** True for an exact (not a bound) mate score. */
+        val isExactMate: Boolean get() = mate != null && !isBound
+    }
+
+    /**
+     * True if both lines prove a mate for the side to move and [a]'s is the shorter one. "mate 2
+     * lowerbound" counts: it says mate in 2 or sooner. Only told for the mating side: a shorter
+     * "getting mated" is worse, not better, and is left to the ordinary depth rules.
+     */
+    private fun isShorterMate(a: InfoLine, b: InfoLine): Boolean {
+        val am = a.mate ?: return false
+        val bm = b.mate ?: return false
+        return a.provesMate && b.provesMate && am > 0 && bm > 0 && am < bm
+    }
+
+    /**
+     * True if [candidate] is a fail-low of a deeper iteration on the exact mate held in
+     * [existing]: an upper bound for the same move (or with no move at all), whatever its score.
+     * The stored mate was then not confirmed by the deeper search.
+     */
+    private fun failsLowOn(existing: InfoLine, candidate: InfoLine): Boolean {
+        val mate = existing.mate ?: return false
+        if (existing.isBound || mate <= 0) return false
+        if (!candidate.isBound || candidate.isLowerBound || candidate.depth <= existing.depth) return false
+        val move = candidate.pv.firstOrNull()
+        return move == null || move == existing.pv.firstOrNull()
+    }
+
+    private fun shouldReplace(existing: InfoLine?, candidate: InfoLine): Boolean {
+        if (existing == null) return true
+        // A shorter mate is the better score and always replaces a longer one, whatever the
+        // depths and whether it is exact or a lower bound: the longer one ("mate 12" before
+        // "mate 2") was an intermediate result and its PV is not the mating line. Without a PV
+        // the new line could not be tied to a move, so it must have one.
+        if (isShorterMate(candidate, existing) && candidate.pv.isNotEmpty()) return true
+        // The reverse: a longer mate from a search that is not deeper never replaces a shorter
+        // proven one.
+        if (isShorterMate(existing, candidate) && candidate.depth <= existing.depth) return false
+        if (candidate.isBound && candidate.mate != null) {
+            // A mate bound that proves no mate ("score mate 3 upperbound") never takes the place
+            // of an exact score, whatever its depth.
+            if (!candidate.provesMate && !existing.isBound) return false
+            // One that does prove a mate ("score mate 3 lowerbound") is taken like any other
+            // line, except over an exact mate: that one has the true distance and the full PV.
+            if (existing.isExactMate) return false
+        }
+        if (candidate.depth < existing.depth) return false
+        if (candidate.depth > existing.depth) return true
+        // Prefer exact scores over lower/upper bounds at the same depth.
+        if (candidate.isBound && !existing.isBound) return false
+        // Bound lines often carry a truncated PV; keep the old one if the new one is empty.
+        return candidate.pv.isNotEmpty() || existing.pv.isEmpty()
+    }
+
+    /**
+     * [candidate] is about to replace [existing]. Fail-high / fail-low lines ("lowerbound" /
+     * "upperbound") and lines cut short by the hash table often carry only the first move or
+     * two of the line, and the search may end before the full line is printed again. If the new
+     * PV is just the start of the one already known (or is missing), the known continuation is
+     * kept: without it a forced mate arrives with a one-move PV and its later moves cannot be
+     * shown.
+     *
+     * The continuation is only kept when both lines carry the same mate score (or neither has
+     * one). The tail of a line that was not a mate, or was a mate of another length, is not the
+     * mating line: appended to a "mate in 3" it would be shown as moves 2 and 3 of a mate that
+     * they do not deliver.
+     */
+    private fun keepLongerPv(existing: InfoLine?, candidate: InfoLine): InfoLine {
+        if (existing == null || existing.pv.size <= candidate.pv.size) return candidate
+        if (existing.mate != candidate.mate) return candidate
+        val isPrefix = existing.pv.subList(0, candidate.pv.size) == candidate.pv
+        return if (isPrefix) candidate.copy(pv = existing.pv) else candidate
+    }
+
+    /** Keeps the latest exact score of the best line (multipv 1) for each depth, in depth order. */
+    private fun recordBestLine(history: MutableList<InfoLine>, info: InfoLine) {
+        if (info.multiPv != 1 || info.isBound) return
+        val last = history.lastOrNull()
+        when {
+            last == null || info.depth > last.depth -> history.add(info)
+            info.depth == last.depth -> history[history.size - 1] = info
+            // A lower depth than the last one seen: stale or out of order, ignore.
+        }
+    }
+
+    /**
+     * Score range of the best line over its last [SWING_DEPTHS] depths, or null if that cannot
+     * be told (too few depths or a mate score among them).
+     */
+    private fun evalSwing(history: List<InfoLine>): Int? {
+        if (history.size < SWING_DEPTHS) return null
+        val scores = history.takeLast(SWING_DEPTHS).map { it.cp ?: return null }
+        return scores.max() - scores.min()
+    }
+
+    /**
+     * Mate score that the first move of [info] had at the search depth before the one [info]
+     * comes from, or null if that cannot be told: [info] is not the last exact best line of the
+     * search, the depth before had another best move, or it had no mate score.
+     */
+    private fun previousMate(history: List<InfoLine>, info: InfoLine): Int? {
+        if (history.size < 2) return null
+        val last = history[history.size - 1]
+        val move = info.pv.firstOrNull() ?: return null
+        if (last.depth != info.depth || last.mate != info.mate || last.pv.firstOrNull() != move) return null
+        val before = history[history.size - 2]
+        return before.mate?.takeIf { before.pv.firstOrNull() == move }
+    }
+
+    private fun parseInfo(line: String): InfoLine? {
+        val tokens = line.split(WHITESPACE)
+        var depth: Int? = null
+        var multiPv = 1
+        var cp: Int? = null
+        var mate: Int? = null
+        var bound = false
+        var lowerBound = false
+        var pv: List<String> = emptyList()
+
+        var i = 1
+        while (i < tokens.size) {
+            when (tokens[i]) {
+                "depth" -> {
+                    depth = tokens.getOrNull(i + 1)?.toIntOrNull()
+                    i += 2
+                }
+                "multipv" -> {
+                    multiPv = tokens.getOrNull(i + 1)?.toIntOrNull()?.takeIf { it >= 1 } ?: 1
+                    i += 2
+                }
+                "score" -> {
+                    val kind = tokens.getOrNull(i + 1)
+                    val value = tokens.getOrNull(i + 2)?.toIntOrNull()
+                    when (kind) {
+                        "cp" -> cp = value
+                        "mate" -> mate = value
+                    }
+                    // Only skip the value when there is one: a truncated "score cp" must not
+                    // swallow the next key.
+                    i += if (value != null) 3 else 2
+                }
+                // Stockfish prints the bound after the "wdl" triple when UCI_ShowWDL is on, so
+                // it is not always right behind the score.
+                "lowerbound", "upperbound" -> {
+                    bound = true
+                    lowerBound = tokens[i] == "lowerbound"
+                    i++
+                }
+                "pv" -> {
+                    pv = tokens.subList(i + 1, tokens.size).toList()
+                    i = tokens.size
+                }
+                "string" -> {
+                    // "info string ..." carries free text only.
+                    return null
+                }
+                else -> i++
+            }
+        }
+
+        val d = depth?.takeIf { it >= 0 } ?: return null
+        if (cp == null && mate == null) return null
+        if (pv.any { !UCI_MOVE.matches(it) }) pv = pv.takeWhile { UCI_MOVE.matches(it) }
+        return InfoLine(d, multiPv, cp, mate, bound, pv, lowerBound)
+    }
+
+    /**
+     * Turns the stored lines into results, best line first.
+     *
+     * The bestmove is not always the first move of the multipv 1 line in [infos]: with several
+     * search threads Stockfish may take its answer from a helper thread, whose line it prints
+     * last and often at a lower depth than the one already stored (so it is not stored), and a
+     * stopped search can fall back to an earlier move. A forced mate must survive that, but the
+     * mate score must not be put on a move it was not found for. [byFirstMove] holds the latest
+     * line of every first move, so in that case:
+     *  - the bestmove's own line, if it is the newer one and proves a mate, is used whole;
+     *  - otherwise, if the stored line proves a mate for the side to move, its mating move is
+     *    returned instead of the bestmove: that mate is proven, the bestmove's is not;
+     *  - a proven "getting mated" score is kept on the bestmove: the best line loses by force,
+     *    so every move does.
+     */
+    private fun buildResults(
+        bestMoveToken: String,
+        infos: Map<Int, InfoLine>,
+        bestLineHistory: List<InfoLine> = emptyList(),
+        byFirstMove: Map<String, InfoLine> = emptyMap(),
+    ): List<AnalysisResult> {
+        val bestMove = if (bestMoveToken == "(none)" || bestMoveToken == "0000") "" else bestMoveToken
+
+        if (infos.isEmpty()) {
+            return listOf(AnalysisResult(bestMove, 0, null, 0, listOfNotNull(bestMove.ifEmpty { null })))
+        }
+
+        // Set when the bestmove is returned in place of the first move of the multipv 1 line:
+        // that line then takes the place of the bestmove's own slot further down, so no move is
+        // listed twice and the displaced one is not lost.
+        var displaced: InfoLine? = null
+
+        return infos.toSortedMap().map { (index, stored) ->
+            val slot = displaced?.takeIf { index > 1 && stored.pv.firstOrNull() == bestMove } ?: stored
+            var info = slot
+            var move = if (index == 1) {
+                bestMove.ifEmpty { slot.pv.firstOrNull().orEmpty() }
+            } else {
+                slot.pv.firstOrNull().orEmpty()
+            }
+            var pvAdjusted = slot.pv
+            val slotMove = slot.pv.firstOrNull()
+            val moveMismatch = index == 1 && bestMove.isNotEmpty() && slotMove != null && slotMove != bestMove
+            // False when the mate score of [info] belongs to another move than the one returned.
+            var mateIsForMove = true
+            if (moveMismatch) {
+                val own = byFirstMove[bestMove]?.takeIf { it.order > slot.order && it.provesMate }
+                val slotMate = slot.mate?.takeIf { slot.provesMate }
+                when {
+                    own != null && (own.mate ?: 0) > 0 -> {
+                        Log.d(TAG, "bestmove $bestMove is not the stored PV move $slotMove; using its own " +
+                            "line (mate ${own.mate}, depth ${own.depth})")
+                        info = own
+                        pvAdjusted = own.pv
+                    }
+                    slotMate != null && slotMate > 0 && slotMove != null -> {
+                        Log.w(TAG, "bestmove $bestMove has no mate line of its own; returning the proven " +
+                            "mating move $slotMove (mate $slotMate) instead")
+                        move = slotMove
+                    }
+                    own != null -> {
+                        info = own
+                        pvAdjusted = own.pv
+                    }
+                    slotMate != null -> pvAdjusted = listOf(bestMove)
+                    else -> {
+                        // No mate involved (or none proven): the arrow follows the bestmove. Its
+                        // own line, when one was seen, gives it its own score and continuation;
+                        // otherwise the PV is cut so that arrow and line stay consistent.
+                        val ownLine = byFirstMove[bestMove]?.takeIf { it.mate == null }
+                        if (ownLine != null) {
+                            info = ownLine
+                            pvAdjusted = ownLine.pv
+                        } else {
+                            pvAdjusted = listOf(bestMove)
+                            mateIsForMove = false
+                        }
+                    }
+                }
+                if (move == bestMove) displaced = slot
+            }
+            val mate = info.mate?.takeIf { info.provesMate && mateIsForMove }
+            // Preliminary: a bound gives no distance, a doubted score was failed low on.
+            val mateConfirmed = mate == null || (!info.isBound && !info.doubted)
+            val eval = when {
+                mate != null -> mateToCp(mate)
+                info.mate != null -> {
+                    Log.w(TAG, "Unproven mate score dropped (mate ${info.mate}, bound=${info.isBound}, " +
+                        "pv move ${info.pv.firstOrNull()}, bestmove $bestMove)")
+                    if ((info.mate ?: 0) > 0) UNPROVEN_MATE_CP else -UNPROVEN_MATE_CP
+                }
+                else -> info.cp ?: 0
+            }
+            val pv = when {
+                pvAdjusted.isNotEmpty() -> pvAdjusted
+                move.isNotEmpty() -> listOf(move)
+                else -> emptyList()
+            }
+            AnalysisResult(
+                bestMove = move,
+                eval = eval,
+                mate = mate,
+                depth = info.depth,
+                pv = pv,
+                evalSwing = if (index == 1) evalSwing(bestLineHistory) else null,
+                mateConfirmed = mateConfirmed,
+                previousMate = if (index == 1 && mate != null && mateConfirmed && move == info.pv.firstOrNull()) {
+                    previousMate(bestLineHistory, info)
+                } else {
+                    null
+                },
+            )
+        }
+    }
+
+    private fun mateToCp(mate: Int): Int = when {
+        mate > 0 -> MATE_SCORE - mate
+        mate < 0 -> -MATE_SCORE - mate
+        else -> -MATE_SCORE // "mate 0": side to move is checkmated
+    }
+
+    /** True for a "bestmove" line (and not, say, an "info string" that mentions the word). */
+    private fun isBestMoveLine(line: String): Boolean =
+        line == "bestmove" || line.startsWith("bestmove ")
+
+    /**
+     * The move of a "bestmove" line. "(none)" when it carries no move or something that is not
+     * a move, so a malformed line is treated like "no legal move" rather than shown as an arrow.
+     */
+    private fun parseBestMove(line: String): String {
+        val token = line.split(WHITESPACE).getOrNull(1) ?: return "(none)"
+        return if (token == "(none)" || token == "0000" || UCI_MOVE.matches(token)) token else {
+            Log.w(TAG, "Malformed bestmove line: $line")
+            "(none)"
+        }
+    }
+
+    /** True once the reader thread has reported that the engine's stdout closed. */
+    private fun isEndOfStream(queue: LinkedBlockingQueue<String>): Boolean = queue.contains(EOF_MARKER)
+
+    /**
+     * Drops whatever the engine printed before the next command, keeping the end-of-stream
+     * marker so a closed stream is still noticed by the next wait.
+     */
+    private fun discardPending(queue: LinkedBlockingQueue<String>) {
+        val eof = isEndOfStream(queue)
+        queue.clear()
+        if (eof) queue.offer(EOF_MARKER)
+    }
+
+    /**
+     * Polls [queue] until a line matching [predicate] arrives. Returns null on timeout,
+     * on end of stream, if the calling thread is interrupted, or if the process is found dead
+     * (and has nothing left to hand over) while waiting.
+     *
+     * The end-of-stream marker is left in the queue, so every later wait on the same queue
+     * returns at once instead of running into its timeout.
+     */
+    private inline fun waitForLine(
+        queue: LinkedBlockingQueue<String>,
+        deadline: Long,
+        predicate: (String) -> Boolean
+    ): String? {
+        var deadSince = 0L
+        while (true) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return null
+            val waitMs = minOf(TimeUnit.NANOSECONDS.toMillis(remaining) + 1, POLL_INTERVAL_MS)
+            val line = try {
+                queue.poll(waitMs, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+            if (line == null) {
+                // A dead process may still have output in the pipe that the reader thread has
+                // not queued yet (the final bestmove, an error message), followed by the
+                // end-of-stream marker. Give it a moment before giving up.
+                if (process?.isAlive != true) {
+                    val now = System.nanoTime()
+                    if (deadSince == 0L) {
+                        deadSince = now
+                    } else if (now - deadSince > TimeUnit.MILLISECONDS.toNanos(DEAD_PROCESS_GRACE_MS)) {
+                        return null
+                    }
+                }
+                continue
+            }
+            if (line === EOF_MARKER) {
+                queue.offer(EOF_MARKER)
+                return null
+            }
+            if (predicate(line)) return line
+        }
+    }
+
+    private fun deadlineAfter(ms: Long): Long = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ms)
+
+    /**
+     * Writes one command line. With [lockWaitMs] the write is skipped (false) when another
+     * thread holds the write lock for longer than that, so callers on the main thread never
+     * block behind a stuck write.
+     */
+    private fun send(command: String, lockWaitMs: Long? = null): Boolean {
+        // One command per line: an embedded line break would smuggle in a second command.
+        if (command.any { it == '\n' || it == '\r' }) {
+            Log.e(TAG, "Refusing to send a command with a line break")
+            return false
+        }
+        if (lockWaitMs == null) {
+            writeLock.lock()
+        } else {
+            val locked = try {
+                writeLock.tryLock(lockWaitMs, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!locked) {
+                Log.w(TAG, "Could not send '$command': the engine input is busy")
+                return false
+            }
+        }
+        try {
+            val w = writer ?: return false
+            w.write(command)
+            w.newLine()
+            w.flush()
+            return true
+        } catch (_: IOException) {
+            return false
+        } finally {
+            writeLock.unlock()
+        }
+    }
+
+    /**
+     * Tears the process down if it died (or, with [force], whatever its state) so the next call
+     * restarts it.
+     */
+    private fun markDeadIfNeeded(force: Boolean = false) {
+        val p = process
+        if (!force && p?.isAlive == true) return
+        searchDied = true
+        shutdownIfCurrent(p)
+    }
+
+    /**
+     * A command could not be written or got no answer in time. A dead process is handled by
+     * [markDeadIfNeeded]; a live one that does not answer is out of sync with this wrapper (a
+     * late answer would be taken for the answer to a later command), so it is torn down as well
+     * and the next call starts a fresh one. Nothing happens when the calling thread was
+     * interrupted: the wait was cut short, the engine is not at fault.
+     */
+    private fun abandon(what: String) {
+        if (Thread.currentThread().isInterrupted) return
+        val p = process
+        if (p?.isAlive != true) {
+            markDeadIfNeeded()
+            return
+        }
+        Log.w(TAG, "$what (${describeExit(p)}); restarting the engine")
+        searchHung = true
+        shutdownIfCurrent(p)
+    }
+
+    /**
+     * Shuts down [p] unless another thread has replaced it meanwhile (through [start]): a check
+     * made on one process must not tear down its successor.
+     */
+    private fun shutdownIfCurrent(p: Process?) {
+        synchronized(stateLock) {
+            if (process === p) shutdownProcess()
+        }
+    }
+
+    /** Call with [stateLock] held. */
+    private fun shutdownProcess() {
+        initialized = false
+        hashMb = 0
+        val p = process
+        val thread = readerThread
+        val w = writer
+        // Stop new writes first, then kill the process before touching the streams: a write
+        // blocked on a full pipe (an engine that stopped reading stdin) only returns once the
+        // process is gone, and closing the writer flushes, which would block the same way.
+        writer = null
+        process = null
+        readerThread = null
+        if (p != null) {
+            p.destroy()
+            try {
+                if (!p.waitFor(DESTROY_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    p.destroyForcibly()
+                    p.waitFor(DESTROY_WAIT_MS, TimeUnit.MILLISECONDS)
+                }
+            } catch (_: InterruptedException) {
+                p.destroyForcibly()
+                Thread.currentThread().interrupt()
+            }
+        }
+        writeLock.lock()
+        try {
+            w?.close()
+        } catch (_: IOException) {
+            // Broken pipe: the process is gone, the stream is closed regardless.
+        } finally {
+            writeLock.unlock()
+        }
+        if (p != null) {
+            try {
+                p.outputStream?.close()
+            } catch (_: IOException) {
+            }
+            try {
+                p.inputStream?.close()
+            } catch (_: IOException) {
+            }
+            try {
+                p.errorStream?.close()
+            } catch (_: IOException) {
+            }
+        }
+        thread?.let { t ->
+            // The process is dead, so its stdout is at end of stream and the reader exits.
+            t.interrupt()
+            try {
+                t.join(DESTROY_WAIT_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (t.isAlive) Log.w(TAG, "Reader thread did not exit")
+        }
+        currentMultiPv = 1
+    }
+}
