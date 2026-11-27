@@ -84,21 +84,6 @@ object MoveColors {
         else -> NEUTRAL
     }
 
-    /** Maps a classification label (case-insensitive) to its short symbol (matches MoveClass). */
-    fun symbolForLabel(label: String): String = when (label.trim().lowercase(Locale.ROOT)) {
-        "brilliant" -> "!!"
-        "great" -> "!"
-        "best" -> "★"
-        "excellent" -> "●"
-        "good" -> "○"
-        "book" -> "📖"
-        "inaccuracy" -> "?!"
-        "mistake" -> "?"
-        "miss" -> "△"
-        "blunder" -> "??"
-        else -> "·"
-    }
-
     /** Maps a classification label (case-insensitive) to its chess.com-style icon drawable. */
     fun drawableResForLabel(label: String): Int = when (label.trim().lowercase(Locale.ROOT)) {
         "brilliant" -> R.drawable.ic_move_brilliant
@@ -232,9 +217,11 @@ class OverlayService : Service() {
             mainHandler.postDelayed(this, if (untilNextSecond == 0L) COUNTDOWN_TICK_MS else untilNextSecond)
         }
     }
-    private val expireCoachMessage = Runnable { dropCoachMessage(restoreWaiting = true) }
-    private var portraitBounds: RectF? = null
-    private var landscapeBounds: RectF? = null
+    private val expireCoachMessage = Runnable { dropCoachMessage() }
+
+    /** Panel position last handed to the window manager; avoids relayouts that change nothing. */
+    private var appliedPanelX = Int.MIN_VALUE
+    private var appliedPanelY = Int.MIN_VALUE
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -381,7 +368,7 @@ class OverlayService : Service() {
 
     /** Removes the coach's reaction, e.g. when the game it belonged to is gone. */
     fun clearCoachMessage() {
-        mainHandler.post { dropCoachMessage(restoreWaiting = true) }
+        mainHandler.post { dropCoachMessage() }
     }
 
     /** Shows a classification badge on the square the opponent's piece landed on. */
@@ -413,11 +400,7 @@ class OverlayService : Service() {
     fun setBoardBounds(portrait: RectF, landscape: RectF) {
         val p = RectF(portrait)
         val l = RectF(landscape)
-        mainHandler.post {
-            portraitBounds = p
-            landscapeBounds = l
-            arrowView?.setBoardBounds(p, l)
-        }
+        mainHandler.post { arrowView?.setBoardBounds(p, l) }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -562,7 +545,7 @@ class OverlayService : Service() {
     private fun setExpanded(value: Boolean) {
         if (expanded == value) return
         expanded = value
-        if (value) userCollapsed = false else userCollapsed = true
+        userCollapsed = !value
         pillView.visibility = if (value) View.GONE else View.VISIBLE
         expandedView.visibility = if (value) View.VISIBLE else View.GONE
         updatePanelWindow()
@@ -588,7 +571,7 @@ class OverlayService : Service() {
         }
         if (autoExpand && !expanded && !userCollapsed) setExpanded(true)
         // The suggestion's own commentary takes over from the reaction to the previous move.
-        dropCoachMessage(restoreWaiting = true)
+        dropCoachMessage()
 
         val commentary = lines.first().commentary
         // Keep the previous line if this update carries no commentary (e.g. a deeper re-analysis),
@@ -615,14 +598,13 @@ class OverlayService : Service() {
     }
 
     /**
-     * Forgets the coach's reaction. With [restoreWaiting] the bubble goes back to the waiting
-     * text if it is still showing the reaction. Main thread only.
+     * Forgets the coach's reaction; the bubble goes back to the waiting (or thinking) text if
+     * it is still showing the reaction. Main thread only.
      */
-    private fun dropCoachMessage(restoreWaiting: Boolean) {
+    private fun dropCoachMessage() {
         mainHandler.removeCallbacks(expireCoachMessage)
         val message = coachMessage ?: return
         coachMessage = null
-        if (!restoreWaiting) return
         val view = commentaryView ?: return
         if (view.text.toString() == message) {
             view.text = if (thinking) thinkingText() else WAITING_TEXT
@@ -667,7 +649,7 @@ class OverlayService : Service() {
         lastScreen = newScreen
         clampAndUpdate()
         root.post { clampAndUpdate() }
-        arrowView?.invalidate()
+        arrowView?.onScreenChanged()
     }
 
     private fun clampAndUpdate() {
@@ -677,13 +659,17 @@ class OverlayService : Service() {
         val maxY = max(0, screen.y - root.height)
         panelParams.x = panelParams.x.coerceIn(0, maxX)
         panelParams.y = panelParams.y.coerceIn(0, maxY)
-        updatePanelWindow()
+        // Mostly called after a text change that left the position alone: a wrap-content window
+        // resizes by itself, so only a real move needs a (costly) window relayout.
+        if (panelParams.x != appliedPanelX || panelParams.y != appliedPanelY) updatePanelWindow()
     }
 
     private fun updatePanelWindow() {
         val root = panelRoot ?: return
         if (root.isAttachedToWindow) {
             windowManager.updateViewLayout(root, panelParams)
+            appliedPanelX = panelParams.x
+            appliedPanelY = panelParams.y
         }
     }
 
@@ -894,10 +880,8 @@ class ArrowView(
         /** Width the halo grows to beyond the arrow, as a fraction of the square size. */
         const val ADVANCE_PULSE_GROW = 0.30f
         val STYLE_RANK_1 = ArrowStyle(255, 0.19f, 0.48f, 0.28f, 22f)  // Best: fully opaque, thicker
-        val STYLE_RANK_2 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
-        val STYLE_RANK_3 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
-        val STYLE_RANK_4 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
-        val STYLE_RANK_5 = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
+        /** Every alternative (rank 2 and up). */
+        val STYLE_ALT = ArrowStyle(200, 0.14f, 0.40f, 0.22f, 22f)
         /** Premove or opponent reply: the main arrow at [THIN_ARROW_SCALE]. */
         val STYLE_THIN = ArrowStyle(
             MATE_PREMOVE_ALPHA,
@@ -912,23 +896,27 @@ class ArrowView(
         /** Total extra width of the outline (split evenly on both sides of the arrow), in dp. */
         const val BORDER_EXTRA_DP = 3f
 
-        fun styleFor(rank: Int): ArrowStyle = when {
-            rank <= 1 -> STYLE_RANK_1
-            rank == 2 -> STYLE_RANK_2
-            rank == 3 -> STYLE_RANK_3
-            rank == 4 -> STYLE_RANK_4
-            else -> STYLE_RANK_5
-        }
+        /** Outline and text color of the "M2" pill. */
+        val MATE_PILL_INK = Color.parseColor("#1B1B1B")
+        const val OPPONENT_BADGE_DP = 18f
 
-        /** Every arrow uses its own classification color, regardless of rank. */
-        @Suppress("UNUSED_PARAMETER")
-        fun arrowColorForRank(rank: Int, classColor: Int): Int = classColor
+        /** Chip texts "2", "3", ... of the premoves, so drawing them allocates nothing. */
+        val CHIP_LABELS = Array(MAX_PREMOVES) { (it + 2).toString() }
+        /** Pill texts "M1", "M2", ...; longer mates are formatted on the fly. */
+        val MATE_LABELS = Array(32) { "M${it + 1}" }
+
+        fun styleFor(rank: Int): ArrowStyle = if (rank <= 1) STYLE_RANK_1 else STYLE_ALT
     }
+
+    private val density = context.resources.displayMetrics.density
 
     private var portraitBounds: RectF? = null
     private var landscapeBounds: RectF? = null
 
+    /** The suggestions, best rank first. */
     private var arrows: List<ArrowData> = emptyList()
+    /** [arrows] back to front (worst rank first, the main arrow last); kept so onDraw need not sort. */
+    private var drawOrder: List<ArrowData> = emptyList()
     /**
      * The user's later moves of the best line, in step order; drawn beneath the main arrow.
      * The chip of premoves[i] reads i + 2: the main arrow is move 1.
@@ -942,28 +930,29 @@ class ArrowView(
     private var opBadgeLabel: String? = null
     private var opBadgeFlipped: Boolean = false
 
-    private val shaftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-    }
-    private val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    // Every paint, path and scratch object below is allocated once: onDraw allocates nothing.
 
-    // Outline paints are opaque black; the translucency (BORDER_ALPHA) is applied once via a
-    // layer so overlapping shaft/head outlines don't darken where they meet.
+    /** Fill of an arrow (and of an arrowhead); the color is set per arrow. */
+    private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    /**
+     * Dark outline behind an arrow. The arrow is one closed path, and fill + stroke grows it
+     * outward by half the stroke width on every edge in a single draw, so the translucent
+     * outline is blended exactly once and needs no offscreen layer.
+     */
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        color = Color.BLACK
-    }
-    private val borderHeadPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        // Fill + stroke grows the triangle outward by half the stroke width on every edge.
         style = Paint.Style.FILL_AND_STROKE
         strokeJoin = Paint.Join.ROUND
         color = Color.BLACK
+        alpha = BORDER_ALPHA
+        strokeWidth = BORDER_EXTRA_DP * density
     }
-    private val layerBounds = RectF()
 
-    private val premovePath = Path()
+    /** Outline of the arrow being drawn. */
+    private val arrowPath = Path()
+    /** Dashed shaft of an opponent reply. */
+    private val dashPath = Path()
+    private val capRect = RectF()
 
     /**
      * Progress (0..1) of the pulse that marks the main arrow as newly promoted from a premove;
@@ -981,16 +970,15 @@ class ArrowView(
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.BUTT
         color = OPPONENT_GREY
+        alpha = OPPONENT_REPLY_ALPHA
         pathEffect = DashPathEffect(
-            floatArrayOf(
-                OPPONENT_DASH_ON_DP * context.resources.displayMetrics.density,
-                OPPONENT_DASH_OFF_DP * context.resources.displayMetrics.density,
-            ),
+            floatArrayOf(OPPONENT_DASH_ON_DP * density, OPPONENT_DASH_OFF_DP * density),
             0f,
         )
     }
 
     // Numbered chip on a premove's destination square: white bold digit on a teal disc.
+    private val chipSize = CHIP_DP * density
     private val chipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = MATE_TEAL
@@ -999,36 +987,71 @@ class ArrowView(
         style = Paint.Style.STROKE
         color = Color.BLACK
         alpha = CHIP_RIM_ALPHA
+        strokeWidth = CHIP_RIM_DP * density
     }
     private val chipTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textAlign = Paint.Align.CENTER
         typeface = Typeface.DEFAULT_BOLD
+        textSize = chipSize * 0.75f
     }
+    /** Distance from a chip's center down to its text baseline. */
+    private val chipTextOffset = chipTextPaint.fontMetrics.let { -(it.ascent + it.descent) / 2f }
+
     private val mateRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         color = MATE_RING_RED
         alpha = MATE_RING_ALPHA
+        strokeWidth = MATE_RING_STROKE_DP * density
     }
 
-    private val matePillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val matePillFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val matePillRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = MATE_PILL_INK
+        strokeWidth = 1.5f * density
+    }
     private val matePillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#1B1B1B")
+        color = MATE_PILL_INK
         textAlign = Paint.Align.CENTER
         typeface = Typeface.DEFAULT_BOLD
     }
     private val matePillRect = RectF()
+    private val fontMetrics = Paint.FontMetrics()
 
     /** Classification icons keyed by drawable resource id, loaded lazily on first use. */
     private val drawableCache = HashMap<Int, Drawable?>()
-    private val headPath = Path()
     private val location = IntArray(2)
-    private val density = context.resources.displayMetrics.density
+
+    /** Board rectangle in view pixels, refilled by [computeBoardRect] on every draw. */
+    private val boardRect = RectF()
+    /** Scratch points for [squareCenter]. */
+    private val startPoint = PointF()
+    private val endPoint = PointF()
+
+    /**
+     * Real screen size. Asking the window manager for it allocates and is not free, so it is
+     * cached and only asked for again after a size or configuration change.
+     */
+    private var screenWidth = 0
+    private var screenHeight = 0
+    private var screenValid = false
 
     fun setBoardBounds(portrait: RectF, landscape: RectF) {
         portraitBounds = RectF(portrait)
         landscapeBounds = RectF(landscape)
         invalidate()
+    }
+
+    /** The screen was rotated or resized: measure it again on the next draw. */
+    fun onScreenChanged() {
+        screenValid = false
+        invalidate()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        onScreenChanged()
     }
 
     /**
@@ -1061,10 +1084,15 @@ class ArrowView(
             .sortedBy { it.rank }.take(MAX_ARROWS)
         val plan = all.filter { it.step > 1 && !it.isOpponentReply }.sortedBy { it.step }
         if (plan.isNotEmpty()) suggestions = suggestions.take(1)
-        this.arrows = suggestions
-        premoves = plan.take(MAX_PREMOVES)
-        opponentReplies = all.filter { it.isOpponentReply }
+        val newPremoves = plan.take(MAX_PREMOVES)
+        val newReplies = all.filter { it.isOpponentReply }
             .sortedBy { it.step }.take(MAX_OPPONENT_REPLIES)
+        // A deeper re-analysis often sends the very same arrows again: nothing to redraw.
+        if (suggestions == this.arrows && newPremoves == premoves && newReplies == opponentReplies) return
+        this.arrows = suggestions
+        drawOrder = suggestions.sortedByDescending { it.rank }
+        premoves = newPremoves
+        opponentReplies = newReplies
         val main = suggestions.firstOrNull()
         val sameMain = main != null && previousMain != null &&
             main.from == previousMain.from && main.to == previousMain.to
@@ -1105,6 +1133,7 @@ class ArrowView(
         stopAdvancePulse()
         drawableCache.clear()
         arrows = emptyList()
+        drawOrder = emptyList()
         premoves = emptyList()
         opponentReplies = emptyList()
         super.onDetachedFromWindow()
@@ -1117,8 +1146,10 @@ class ArrowView(
     private fun drawAdvancePulse(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
         val t = advancePulse
         if (t >= 1f) return
-        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
-        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val start = startPoint
+        val end = endPoint
+        if (!squareCenter(arrow.from, board, arrow.isFlipped, start)) return
+        if (!squareCenter(arrow.to, board, arrow.isFlipped, end)) return
         val style = styleFor(arrow.rank)
         pulsePaint.color = withAlpha(arrow.color, (ADVANCE_PULSE_ALPHA * (1f - t)).roundToInt())
         pulsePaint.strokeWidth = square * (style.shaftFactor + ADVANCE_PULSE_GROW * t)
@@ -1126,6 +1157,7 @@ class ArrowView(
     }
 
     fun clearOpponentBadge() {
+        if (opBadgeSquare == null && opBadgeLabel == null) return
         opBadgeSquare = null
         opBadgeLabel = null
         invalidate()
@@ -1133,7 +1165,9 @@ class ArrowView(
 
     /** Shows a small classification badge on the given square for the opponent's last move. */
     fun setOpponentBadge(square: String, label: String, flipped: Boolean) {
-        opBadgeSquare = square.lowercase(Locale.ROOT)
+        val sq = square.lowercase(Locale.ROOT)
+        if (sq == opBadgeSquare && label == opBadgeLabel && flipped == opBadgeFlipped) return
+        opBadgeSquare = sq
         opBadgeLabel = label
         opBadgeFlipped = flipped
         invalidate()
@@ -1141,41 +1175,47 @@ class ArrowView(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        invalidate()
+        // The framework redraws after a resize by itself; only the cached screen size is stale.
+        screenValid = false
     }
 
     override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
         val hasArrows = arrows.isNotEmpty() || premoves.isNotEmpty() || opponentReplies.isNotEmpty()
-        val hasBadge = opBadgeSquare != null
+        val hasBadge = opBadgeSquare != null && opBadgeLabel != null
         if (!hasArrows && !hasBadge) return
-        val board = boardRectInView() ?: return
+        if (!computeBoardRect()) return
+        val board = boardRect
         val square = board.width() / 8f
         if (hasArrows) {
             // Back to front: alternative moves, the opponent's expected replies (grey, dashed),
             // the user's premoves (teal; last step lowest, so the nearer steps lie on top), then
             // the move to play now, above everything else.
-            val drawOrder = arrows.sortedByDescending { it.rank }
-            val main = drawOrder.lastOrNull()
-            for (arrow in drawOrder) if (arrow !== main) drawArrow(canvas, arrow, board, square)
+            val order = drawOrder
+            val mainIndex = order.size - 1
+            for (i in 0 until mainIndex) drawArrow(canvas, order[i], board, square)
             for (i in opponentReplies.indices.reversed()) {
                 drawThinArrow(canvas, opponentReplies[i], board, square)
             }
             for (i in premoves.indices.reversed()) {
                 drawThinArrow(canvas, premoves[i], board, square)
             }
-            if (main != null) {
+            if (mainIndex >= 0) {
+                val main = order[mainIndex]
                 drawAdvancePulse(canvas, main, board, square)
                 drawArrow(canvas, main, board, square)
             }
-            for (arrow in drawOrder) drawBadge(canvas, arrow, board, square)
+            for (i in order.indices) drawBadge(canvas, order[i], board, square)
         }
-        drawOpponentBadge(canvas, board, square)
+        if (hasBadge) drawOpponentBadge(canvas, board, square)
         if (hasArrows) {
             // Step numbers go above every arrow and badge, the mate ring above everything.
             drawDestinationChips(canvas, board, square)
-            for (arrow in arrows) if (arrow.isMateTarget) drawMateRing(canvas, arrow, board, square)
-            for (arrow in premoves) if (arrow.isMateTarget) drawMateRing(canvas, arrow, board, square)
+            for (i in arrows.indices) {
+                if (arrows[i].isMateTarget) drawMateRing(canvas, arrows[i], board, square)
+            }
+            for (i in premoves.indices) {
+                if (premoves[i].isMateTarget) drawMateRing(canvas, premoves[i], board, square)
+            }
         }
     }
 
@@ -1187,67 +1227,67 @@ class ArrowView(
      * opponent's relocated badge ([opponentBadgeAtBottom]).
      */
     private fun drawDestinationChips(canvas: Canvas, board: RectF, square: Float) {
+        val moves = premoves
+        if (moves.isEmpty()) return
         val badgeSquare = opBadgeSquare?.takeIf { opBadgeLabel != null && opponentBadgeAtBottom(it) }
-        val squares = ArrayList<String>(premoves.size)
-        for ((index, arrow) in premoves.withIndex()) {
-            val slot = squares.count { it == arrow.to } + if (arrow.to == badgeSquare) 1 else 0
-            squares += arrow.to
-            drawDestinationChip(canvas, arrow, index + 2, slot, board, square)
+        for (index in moves.indices) {
+            val arrow = moves[index]
+            var slot = if (arrow.to == badgeSquare) 1 else 0
+            for (earlier in 0 until index) if (moves[earlier].to == arrow.to) slot++
+            drawDestinationChip(canvas, arrow, CHIP_LABELS[index], slot, board, square)
         }
     }
 
+    /**
+     * Draws a suggestion arrow: a dark translucent outline, then the arrow in its own
+     * (classification) color, also for the first move of a forced mate: teal is reserved for
+     * the premoves, so the move to play now never looks like one.
+     *
+     * Shaft (round start) and head are one closed path, drawn twice. Neither pass needs an
+     * offscreen layer, and a translucent arrow is blended once everywhere, with no darker
+     * patch where shaft and head would otherwise overlap.
+     */
     private fun drawArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
-        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
-        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val start = startPoint
+        val end = endPoint
+        if (!squareCenter(arrow.from, board, arrow.isFlipped, start)) return
+        if (!squareCenter(arrow.to, board, arrow.isFlipped, end)) return
         val dx = end.x - start.x
         val dy = end.y - start.y
         val length = hypot(dx, dy)
         if (length < 1f) return
 
         val style = styleFor(arrow.rank)
-        // Always the arrow's own (classification) color, also for the first move of a forced
-        // mate: teal is reserved for the premoves, so the move to play now never looks like one.
-        val color = withAlpha(arrowColorForRank(arrow.rank, arrow.color), style.alpha)
-        shaftPaint.color = color
-        headPaint.color = color
-
         val angle = atan2(dy, dx)
+        val ux = cos(angle)
+        val uy = sin(angle)
         val headLength = min(square * style.headLengthFactor, length * 0.6f)
         val headHalfWidth = square * style.headHalfWidthFactor
+        val halfShaft = min(square * style.shaftFactor / 2f, headHalfWidth)
 
-        val baseX = end.x - headLength * cos(angle)
-        val baseY = end.y - headLength * sin(angle)
+        val baseX = end.x - headLength * ux
+        val baseY = end.y - headLength * uy
+        val perpX = -uy * headHalfWidth
+        val perpY = ux * headHalfWidth
+        val sx = -uy * halfShaft
+        val sy = ux * halfShaft
 
-        val shaftWidth = square * style.shaftFactor
-        val borderExtra = BORDER_EXTRA_DP * density
-        shaftPaint.strokeWidth = shaftWidth
-        borderPaint.strokeWidth = shaftWidth + borderExtra
-        borderHeadPaint.strokeWidth = borderExtra
+        val path = arrowPath
+        path.rewind()
+        path.moveTo(end.x, end.y)
+        path.lineTo(baseX + perpX, baseY + perpY)
+        path.lineTo(baseX + sx, baseY + sy)
+        path.lineTo(start.x + sx, start.y + sy)
+        // Round cap: half a circle around the start, from one side of the shaft to the other.
+        capRect.set(start.x - halfShaft, start.y - halfShaft, start.x + halfShaft, start.y + halfShaft)
+        path.arcTo(capRect, Math.toDegrees(angle.toDouble()).toFloat() + 90f, 180f, false)
+        path.lineTo(baseX - sx, baseY - sy)
+        path.lineTo(baseX - perpX, baseY - perpY)
+        path.close()
 
-        val perpX = -sin(angle) * headHalfWidth
-        val perpY = cos(angle) * headHalfWidth
-        headPath.reset()
-        headPath.moveTo(end.x, end.y)
-        headPath.lineTo(baseX + perpX, baseY + perpY)
-        headPath.lineTo(baseX - perpX, baseY - perpY)
-        headPath.close()
-
-        // 1-2. Dark outline (shaft + head) in a single translucent layer, bounded to this arrow.
-        val pad = max(headHalfWidth, shaftWidth) + borderExtra * 2f
-        layerBounds.set(
-            min(start.x, end.x) - pad,
-            min(start.y, end.y) - pad,
-            max(start.x, end.x) + pad,
-            max(start.y, end.y) + pad,
-        )
-        val saveCount = canvas.saveLayerAlpha(layerBounds, BORDER_ALPHA)
-        canvas.drawLine(start.x, start.y, baseX, baseY, borderPaint)
-        canvas.drawPath(headPath, borderHeadPaint)
-        canvas.restoreToCount(saveCount)
-
-        // 3-4. Solid colored shaft and arrowhead on top.
-        canvas.drawLine(start.x, start.y, baseX, baseY, shaftPaint)
-        canvas.drawPath(headPath, headPaint)
+        canvas.drawPath(path, borderPaint)
+        arrowPaint.color = withAlpha(arrow.color, style.alpha)
+        canvas.drawPath(path, arrowPaint)
     }
 
     /**
@@ -1261,85 +1301,77 @@ class ArrowView(
      * separately ([drawDestinationChip]).
      */
     private fun drawThinArrow(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
-        val start = squareCenter(arrow.from, board, arrow.isFlipped) ?: return
-        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val start = startPoint
+        val end = endPoint
+        if (!squareCenter(arrow.from, board, arrow.isFlipped, start)) return
+        if (!squareCenter(arrow.to, board, arrow.isFlipped, end)) return
         val dx = end.x - start.x
         val dy = end.y - start.y
         val length = hypot(dx, dy)
         if (length < 1f) return
 
         val style = STYLE_THIN
-        val opponent = arrow.isOpponentReply
-        val alpha = if (opponent) OPPONENT_REPLY_ALPHA else style.alpha
-
         val angle = atan2(dy, dx)
-        val headLength = min(square * style.headLengthFactor, length * 0.6f)
-        val headHalfWidth = square * style.headHalfWidthFactor
-        val baseX = end.x - headLength * cos(angle)
-        val baseY = end.y - headLength * sin(angle)
-        val shaftWidth = square * style.shaftFactor
-
         val ux = cos(angle)
         val uy = sin(angle)
+        val headLength = min(square * style.headLengthFactor, length * 0.6f)
+        val headHalfWidth = square * style.headHalfWidthFactor
+        val baseX = end.x - headLength * ux
+        val baseY = end.y - headLength * uy
+        val shaftWidth = square * style.shaftFactor
         val perpX = -uy * headHalfWidth
         val perpY = ux * headHalfWidth
-        headPath.reset()
-        if (opponent) {
+
+        val path = arrowPath
+        path.rewind()
+        path.moveTo(end.x, end.y)
+        path.lineTo(baseX + perpX, baseY + perpY)
+        if (arrow.isOpponentReply) {
             // Dashes run from the head back to the start, so a full dash always meets the head.
             // Butt caps: the shaft ends exactly at the base of the head, without overlap.
-            premovePath.reset()
-            premovePath.moveTo(baseX, baseY)
-            premovePath.lineTo(start.x, start.y)
+            dashPath.rewind()
+            dashPath.moveTo(baseX, baseY)
+            dashPath.lineTo(start.x, start.y)
             opponentShaftPaint.strokeWidth = shaftWidth
-            opponentShaftPaint.alpha = alpha
-            canvas.drawPath(premovePath, opponentShaftPaint)
-            headPath.moveTo(end.x, end.y)
-            headPath.lineTo(baseX + perpX, baseY + perpY)
-            headPath.lineTo(baseX - perpX, baseY - perpY)
-            headPath.close()
-            headPaint.color = withAlpha(OPPONENT_GREY, alpha)
+            canvas.drawPath(dashPath, opponentShaftPaint)
+            arrowPaint.color = withAlpha(OPPONENT_GREY, OPPONENT_REPLY_ALPHA)
         } else {
             // Shaft and head as a single outline, filled once: no seam where they meet.
             val halfShaft = min(shaftWidth / 2f, headHalfWidth)
             val sx = -uy * halfShaft
             val sy = ux * halfShaft
-            headPath.moveTo(end.x, end.y)
-            headPath.lineTo(baseX + perpX, baseY + perpY)
-            headPath.lineTo(baseX + sx, baseY + sy)
-            headPath.lineTo(start.x + sx, start.y + sy)
-            headPath.lineTo(start.x - sx, start.y - sy)
-            headPath.lineTo(baseX - sx, baseY - sy)
-            headPath.lineTo(baseX - perpX, baseY - perpY)
-            headPath.close()
-            headPaint.color = withAlpha(MATE_TEAL, alpha)
+            path.lineTo(baseX + sx, baseY + sy)
+            path.lineTo(start.x + sx, start.y + sy)
+            path.lineTo(start.x - sx, start.y - sy)
+            path.lineTo(baseX - sx, baseY - sy)
+            arrowPaint.color = withAlpha(MATE_TEAL, style.alpha)
         }
-        canvas.drawPath(headPath, headPaint)
+        path.lineTo(baseX - perpX, baseY - perpY)
+        path.close()
+        canvas.drawPath(path, arrowPaint)
     }
 
     /**
      * Draws the number of one of the user's premoves ("2", "3", ...): white and bold in a
      * [CHIP_DP] teal disc, in the bottom-right quarter of the move's destination square, clear
      * of the piece and of the classification badge (top-right).
-     * @param number place of the move in the order; the main arrow is 1
+     * @param label place of the move in the order, as text; the main arrow is 1
      * @param slot 0 for the first chip on the square; later ones step upward by a chip each
      */
     private fun drawDestinationChip(
-        canvas: Canvas, arrow: ArrowData, number: Int, slot: Int, board: RectF, square: Float,
+        canvas: Canvas, arrow: ArrowData, label: String, slot: Int, board: RectF, square: Float,
     ) {
-        val center = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
-        val size = CHIP_DP * density
-        if (size <= 0f) return
+        val center = endPoint
+        if (!squareCenter(arrow.to, board, arrow.isFlipped, center)) return
+        val size = chipSize
         val half = size / 2f
         val offset = square / 4f
         val cx = (center.x + offset).coerceIn(half, max(half, width - half))
         val cy = (center.y + offset - slot * size).coerceIn(half, max(half, height - half))
 
         canvas.drawCircle(cx, cy, half, chipPaint)
-        chipRimPaint.strokeWidth = CHIP_RIM_DP * density
         canvas.drawCircle(cx, cy, half, chipRimPaint)
-        chipTextPaint.textSize = size * 0.75f
-        val fm = chipTextPaint.fontMetrics
-        canvas.drawText(number.toString(), cx, cy - (fm.ascent + fm.descent) / 2f, chipTextPaint)
+        canvas.drawText(label, cx, cy + chipTextOffset, chipTextPaint)
     }
 
     /**
@@ -1348,11 +1380,12 @@ class ArrowView(
      * is unknown): a translucent circle just inside the square's edges.
      */
     private fun drawMateRing(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
-        val center = arrow.mateKingSquare?.let { squareCenter(it, board, arrow.isFlipped) }
-            ?: squareCenter(arrow.to, board, arrow.isFlipped) ?: return
-        val stroke = MATE_RING_STROKE_DP * density
-        mateRingPaint.strokeWidth = stroke
-        canvas.drawCircle(center.x, center.y, (square - stroke) / 2f, mateRingPaint)
+        val center = endPoint
+        val king = arrow.mateKingSquare
+        if (king == null || !squareCenter(king, board, arrow.isFlipped, center)) {
+            if (!squareCenter(arrow.to, board, arrow.isFlipped, center)) return
+        }
+        canvas.drawCircle(center.x, center.y, (square - mateRingPaint.strokeWidth) / 2f, mateRingPaint)
     }
 
     private fun getCachedDrawable(resId: Int): Drawable? =
@@ -1363,7 +1396,8 @@ class ArrowView(
      * the arrowhead. The icon keeps the classification look so the label stays meaningful.
      */
     private fun drawBadge(canvas: Canvas, arrow: ArrowData, board: RectF, square: Float) {
-        val end = squareCenter(arrow.to, board, arrow.isFlipped) ?: return
+        val end = endPoint
+        if (!squareCenter(arrow.to, board, arrow.isFlipped, end)) return
         val style = styleFor(arrow.rank)
         val sizePx = (style.badgeDp * density).roundToInt()
         if (sizePx <= 0) return
@@ -1374,13 +1408,18 @@ class ArrowView(
 
         val mate = arrow.mateIn
         if (mate != null && mate > 0) {
-            drawMatePill(canvas, "M$mate", arrow.color, cx, cy, sizePx.toFloat())
+            val text = if (mate <= MATE_LABELS.size) MATE_LABELS[mate - 1] else "M$mate"
+            drawMatePill(canvas, text, arrow.color, cx, cy, sizePx.toFloat())
             return
         }
+        drawIcon(canvas, arrow.label, cx, cy, sizePx)
+    }
 
-        val drawable = getCachedDrawable(MoveColors.drawableResForLabel(arrow.label)) ?: return
-        val left = (cx - half).roundToInt()
-        val top = (cy - half).roundToInt()
+    /** Draws the classification icon of [label], [sizePx] wide and high, centered on (cx, cy). */
+    private fun drawIcon(canvas: Canvas, label: String, cx: Float, cy: Float, sizePx: Int) {
+        val drawable = getCachedDrawable(MoveColors.drawableResForLabel(label)) ?: return
+        val left = (cx - sizePx / 2f).roundToInt()
+        val top = (cy - sizePx / 2f).roundToInt()
         drawable.setBounds(left, top, left + sizePx, top + sizePx)
         drawable.draw(canvas)
     }
@@ -1398,15 +1437,12 @@ class ArrowView(
         val x = cx.coerceIn(halfW, max(halfW, width - halfW))
         matePillRect.set(x - halfW, cy - halfH, x + halfW, cy + halfH)
 
-        matePillPaint.style = Paint.Style.FILL
-        matePillPaint.color = color
-        canvas.drawRoundRect(matePillRect, halfH, halfH, matePillPaint)
-        matePillPaint.style = Paint.Style.STROKE
-        matePillPaint.strokeWidth = 1.5f * density
-        matePillPaint.color = Color.parseColor("#1B1B1B")
-        canvas.drawRoundRect(matePillRect, halfH, halfH, matePillPaint)
+        matePillFillPaint.color = color
+        canvas.drawRoundRect(matePillRect, halfH, halfH, matePillFillPaint)
+        canvas.drawRoundRect(matePillRect, halfH, halfH, matePillRimPaint)
 
-        val fm = matePillTextPaint.fontMetrics
+        val fm = fontMetrics
+        matePillTextPaint.getFontMetrics(fm)
         canvas.drawText(text, x, cy - (fm.ascent + fm.descent) / 2f, matePillTextPaint)
     }
 
@@ -1419,57 +1455,71 @@ class ArrowView(
     private fun drawOpponentBadge(canvas: Canvas, board: RectF, square: Float) {
         val sq = opBadgeSquare ?: return
         val label = opBadgeLabel ?: return
-        val center = squareCenter(sq, board, opBadgeFlipped) ?: return
-        val sizePx = (18f * density).roundToInt()
+        val center = endPoint
+        if (!squareCenter(sq, board, opBadgeFlipped, center)) return
+        val sizePx = (OPPONENT_BADGE_DP * density).roundToInt()
         if (sizePx <= 0) return
         val half = sizePx / 2f
         val offset = square * 0.45f
         val cx = (center.x + offset).coerceIn(half, max(half, width - half))
         val cy = (if (opponentBadgeAtBottom(sq)) center.y + offset else center.y - offset)
             .coerceIn(half, max(half, height - half))
-
-        val drawable = getCachedDrawable(MoveColors.drawableResForLabel(label)) ?: return
-        val left = (cx - half).roundToInt()
-        val top = (cy - half).roundToInt()
-        drawable.setBounds(left, top, left + sizePx, top + sizePx)
-        drawable.draw(canvas)
+        drawIcon(canvas, label, cx, cy, sizePx)
     }
 
     /**
      * Whether the opponent's badge on [square] sits in the bottom-right corner, because the
      * badge of a suggestion that targets the square owns the top-right one.
      */
-    private fun opponentBadgeAtBottom(square: String): Boolean = arrows.any { it.to == square }
-
-    /** Applies [alpha] (255 for the best move, 200 for alternatives) to [color]'s RGB. */
-    private fun withAlpha(color: Int, alpha: Int): Int =
-        Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
-
-    /** Converts the screen-ratio board bounds for the current orientation into view pixels. */
-    private fun boardRectInView(): RectF? {
-        val screen = screenSizeProvider()
-        if (screen.x <= 0 || screen.y <= 0) return null
-        val ratios = (if (screen.x > screen.y) landscapeBounds else portraitBounds) ?: return null
-        if (ratios.width() <= 0f || ratios.height() <= 0f) return null
-        getLocationOnScreen(location)
-        return RectF(
-            ratios.left * screen.x - location[0],
-            ratios.top * screen.y - location[1],
-            ratios.right * screen.x - location[0],
-            ratios.bottom * screen.y - location[1],
-        )
+    private fun opponentBadgeAtBottom(square: String): Boolean {
+        for (i in arrows.indices) if (arrows[i].to == square) return true
+        return false
     }
 
-    /** Returns the pixel center of an algebraic square (e.g. "e4"), honoring board flip. */
-    private fun squareCenter(square: String, board: RectF, flipped: Boolean): PointF? {
-        if (square.length < 2) return null
+    /** Applies [alpha] (255 for the best move, 200 for alternatives) to [color]'s RGB. */
+    private fun withAlpha(color: Int, alpha: Int): Int = (color and 0x00FFFFFF) or (alpha shl 24)
+
+    /**
+     * Converts the screen-ratio board bounds for the current orientation into view pixels, in
+     * [boardRect]. Returns false when the board is not known (yet).
+     */
+    private fun computeBoardRect(): Boolean {
+        if (!screenValid) {
+            val screen = screenSizeProvider()
+            screenWidth = screen.x
+            screenHeight = screen.y
+            screenValid = true
+        }
+        val sw = screenWidth
+        val sh = screenHeight
+        if (sw <= 0 || sh <= 0) return false
+        val ratios = (if (sw > sh) landscapeBounds else portraitBounds) ?: return false
+        if (ratios.width() <= 0f || ratios.height() <= 0f) return false
+        getLocationOnScreen(location)
+        boardRect.set(
+            ratios.left * sw - location[0],
+            ratios.top * sh - location[1],
+            ratios.right * sw - location[0],
+            ratios.bottom * sh - location[1],
+        )
+        return true
+    }
+
+    /**
+     * Writes the pixel center of an algebraic square (e.g. "e4"), honoring board flip, into
+     * [out]. Returns false (leaving [out] alone) if [square] is not a square.
+     */
+    private fun squareCenter(square: String, board: RectF, flipped: Boolean, out: PointF): Boolean {
+        if (square.length < 2) return false
         val file = square[0] - 'a'
         val rank = square[1] - '1'
-        if (file !in 0..7 || rank !in 0..7) return null
+        if (file !in 0..7 || rank !in 0..7) return false
         val col = if (flipped) 7 - file else file
         val row = if (flipped) rank else 7 - rank
-        val sw = board.width() / 8f
-        val sh = board.height() / 8f
-        return PointF(board.left + (col + 0.5f) * sw, board.top + (row + 0.5f) * sh)
+        out.set(
+            board.left + (col + 0.5f) * board.width() / 8f,
+            board.top + (row + 0.5f) * board.height() / 8f,
+        )
+        return true
     }
 }

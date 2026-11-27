@@ -20,8 +20,9 @@ private val Node.hasArea get() = width > 0 && height > 0
  *  1. A FEN placement string in any node's text or content description.
  *  2. Per-node piece descriptions. A node's text and description are split into words (case and
  *     accents ignored) and searched for a square ("e4"), a piece name and a colour, in any order
- *     and in English, Spanish, French, German, Portuguese, Italian or Russian. "White Knight on
- *     e4", "e4 White Knight" and "Caballo blanco en e4" all read the same.
+ *     and in English, Spanish, French, German, Portuguese, Italian, Russian, Dutch, Polish,
+ *     Catalan or Galician. "White Knight on e4", "e4 White Knight" and "Caballo blanco en e4"
+ *     all read the same.
  *
  * Nodes that name a piece but no square ("White Knight") are placed by their screen bounds. The
  * board grid for that is fitted to the nodes that do name a square, including empty squares
@@ -57,9 +58,16 @@ object BoardPositionParser {
 
     // Regexes come first: the word tables below are normalised with them during initialisation.
     private val COMBINING_MARKS = Regex("\\p{Mn}+")
-    private val WORD_SEPARATORS = Regex("[^\\p{L}\\p{N}]+")
-    private val SQUARE_WORD = Regex("[a-h][1-8]")
-    private val FEN_REGEX = Regex("[rnbqkpRNBQKP1-8]{1,8}(?:/[rnbqkpRNBQKP1-8]{1,8}){7}")
+    // The FEN must stand alone: without the boundaries, the tail of an over-long first row
+    // ("rnbqkbnrr/...") would be read as a valid eight-square row.
+    private val FEN_REGEX = Regex(
+        "(?<![\\p{L}\\p{N}/])[rnbqkpRNBQKP1-8]{1,8}(?:/[rnbqkpRNBQKP1-8]{1,8}){7}(?![\\p{L}\\p{N}/])"
+    )
+
+    /** Longer strings (chat, articles, the move list as one node) are not piece descriptions. */
+    private const val MAX_DESCRIPTION_LENGTH = 200
+
+    private const val FEN_PIECES = "pnbrqkPNBRQK"
 
     /**
      * Piece names to lowercase FEN letters, stored normalised (see [normalize]). Each line lists
@@ -75,6 +83,15 @@ object BoardPositionParser {
         add('r', "rook", "torre", "tour", "turm", "ладья", "ладью", "ладьи")
         add('q', "queen", "dama", "reina", "dame", "reine", "rainha", "donna", "regina", "ферзь", "ферзя")
         add('k', "king", "rey", "roi", "könig", "koenig", "rei", "re", "король", "короля")
+        // Dutch and Polish ("pion" and "dame" are already listed), then the Catalan and Galician
+        // words not shared with Spanish or Portuguese. A language is listed in full or not at
+        // all: a half-known one would silently drop the pieces whose names are missing.
+        add('p', "pionek", "peó")
+        add('n', "paard", "skoczek", "cavall", "cabalo")
+        add('b', "loper", "goniec")
+        add('r', "toren", "wieża")
+        add('q', "hetman")
+        add('k', "koning", "król")
     }
 
     /** Colour words in the same languages. Normalising also covers "weiss" and "черный". */
@@ -86,6 +103,7 @@ object BoardPositionParser {
         "branco", "branca", "brancos", "brancas",
         "bianco", "bianca", "bianchi", "bianche",
         "белый", "белая", "белые", "белого", "белой", "белую", "белым", "белых",
+        "wit", "witte", "biały", "biała", "białe", "blanques",
     )
     private val BLACK_WORDS: Set<String> = normalizedSetOf(
         "black",
@@ -95,6 +113,7 @@ object BoardPositionParser {
         "preto", "preta", "pretos", "pretas",
         "nero", "nera", "neri", "nere",
         "чёрный", "чёрная", "чёрные", "чёрного", "чёрной", "чёрную", "чёрным", "чёрных",
+        "zwart", "zwarte", "czarny", "czarna", "czarne", "negre", "negres",
     )
 
     /** Fewest square-naming nodes a board grid is fitted to. */
@@ -205,7 +224,8 @@ object BoardPositionParser {
             var empty = 0
             for (file in 'a'..'h') {
                 val piece = positions["$file$rank"]
-                if (piece != null) {
+                // Anything but a FEN piece letter would corrupt the string; treat it as empty.
+                if (piece != null && piece in FEN_PIECES) {
                     if (empty > 0) { sb.append(empty); empty = 0 }
                     sb.append(piece)
                 } else {
@@ -254,10 +274,18 @@ object BoardPositionParser {
 
     /** Reads [node]'s words; null if it names neither a square nor a piece, or is ambiguous. */
     private fun describe(node: Node): Described? {
-        val words = listOfNotNull(node.contentDescription, node.text).flatMap(::wordsOf)
+        // Text and description are often the same string; reading it twice gains nothing.
+        val description = node.contentDescription?.takeIf { it.length <= MAX_DESCRIPTION_LENGTH }
+        val text = node.text?.takeIf { it.length <= MAX_DESCRIPTION_LENGTH && it != description }
+        val words = when {
+            description == null && text == null -> return null
+            description == null -> wordsOf(text!!)
+            text == null -> wordsOf(description)
+            else -> wordsOf(description) + wordsOf(text)
+        }
         if (words.isEmpty()) return null
 
-        val squares = words.filter { SQUARE_WORD.matches(it) }.toSet()
+        val squares = words.filterTo(HashSet(2), ::isSquare)
         // Several squares ("e2 e4", "Knight from g1 to f3") describe a move, not a square.
         if (squares.size > 1) return null
 
@@ -299,13 +327,37 @@ object BoardPositionParser {
         return if (tie) null else best
     }
 
-    /** Lowercase, without accents ("Peón" -> "peon", "чёрный" -> "черныи"), ß as "ss". */
-    private fun normalize(s: String): String =
-        COMBINING_MARKS.replace(Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD), "")
+    /**
+     * Lowercase, without accents ("Peón" -> "peon", "чёрный" -> "черныи"), ß as "ss".
+     * Compatibility forms are folded too, so full-width "ｅ４" reads as "e4". Lowercasing is
+     * locale-independent (a Turkish device does not turn "I" into "ı").
+     */
+    private fun normalize(s: String): String {
+        // Most descriptions are plain ASCII and need neither the normaliser nor a regex.
+        if (s.all { it.code < 0x80 }) return s.lowercase()
+        return COMBINING_MARKS.replace(Normalizer.normalize(s.lowercase(), Normalizer.Form.NFKD), "")
             .replace("ß", "ss")
+    }
 
-    private fun wordsOf(s: String): List<String> =
-        normalize(s).split(WORD_SEPARATORS).filter { it.isNotEmpty() }
+    /** The normalised runs of letters and digits in [s]; whitespace and punctuation separate. */
+    private fun wordsOf(s: String): List<String> {
+        val n = normalize(s)
+        val words = ArrayList<String>(8)
+        var start = -1
+        for (i in n.indices) {
+            if (n[i].isLetterOrDigit()) {
+                if (start < 0) start = i
+            } else if (start >= 0) {
+                words += n.substring(start, i)
+                start = -1
+            }
+        }
+        if (start >= 0) words += n.substring(start)
+        return words
+    }
+
+    private fun isSquare(word: String): Boolean =
+        word.length == 2 && word[0] in 'a'..'h' && word[1] in '1'..'8'
 
     private fun normalizedSetOf(vararg words: String): Set<String> = words.mapTo(HashSet(), ::normalize)
 
