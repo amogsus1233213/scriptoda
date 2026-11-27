@@ -2,6 +2,7 @@ package com.chesstrainer.app.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Intent
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
@@ -21,7 +22,9 @@ import android.view.accessibility.AccessibilityWindowInfo
  * ([AccessibilityData.lastStablePositions]) and the user's side
  * ([AccessibilityData.userPlaysWhite]) wait for that confirmation.
  *
- * Everything runs on the main thread: accessibility events and the [handler] callbacks.
+ * Everything runs on the main thread: accessibility events and the [handler] callbacks, so the
+ * fields below need no locking. Only [instance] and [AccessibilityData] are read from other
+ * threads; both are @Volatile / synchronized.
  */
 class BoardAccessibilityService : AccessibilityService() {
 
@@ -59,6 +62,9 @@ class BoardAccessibilityService : AccessibilityService() {
         )
         private const val TARGET_LEFT_DELAY_MS = 2000L
 
+        /** Longest exception message copied into [AccessibilityData.lastRejectReason]. */
+        private const val MAX_ERROR_MESSAGE = 200
+
         @Volatile
         var instance: BoardAccessibilityService? = null
             private set
@@ -67,8 +73,14 @@ class BoardAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private val scheduledRead = Runnable {
         readScheduled = false
-        readBoard()
+        if (connected) readBoard()
     }
+
+    /**
+     * True between [onServiceConnected] and teardown ([onUnbind] / [onDestroy]). Reads and
+     * rescheduling stop once it is false, so nothing re-posts to [handler] after teardown.
+     */
+    private var connected = false
     private var readScheduled = false
 
     /** [SystemClock.uptimeMillis] the scheduled read is due at; only valid while [readScheduled]. */
@@ -97,23 +109,38 @@ class BoardAccessibilityService : AccessibilityService() {
     /** Deferred target-left reset: gives transient system UI time to dismiss before wiping the game. */
     private var targetLeftPending = false
     private val targetLeftRunnable = Runnable {
-        if (targetLeftPending) {
+        if (connected && targetLeftPending) {
             targetLeftPending = false
-            // Another package's window event followed by two quiet seconds does not prove the
-            // chess app is gone: launchers and system UI send such events while it stays in
-            // front (gesture bar, taskbar, edge panels), and a board nobody touches is quiet.
-            // Only reset when its window really is off the screen.
-            if (AccessibilityData.targetPackageVisible && isTargetOnScreen()) {
-                Log.d(TAG, "Chess app still on screen; not resetting")
-                readBoard()
-            } else {
-                doTargetLeft()
+            try {
+                handleTargetLeftTimeout()
+            } catch (e: RuntimeException) {
+                // Runs on the main thread; a throw here would crash the process.
+                Log.e(TAG, "Target-left check failed", e)
             }
+        }
+    }
+
+    private fun handleTargetLeftTimeout() {
+        // Another package's window event followed by two quiet seconds does not prove the
+        // chess app is gone: launchers and system UI send such events while it stays in
+        // front (gesture bar, taskbar, edge panels), and a board nobody touches is quiet.
+        // Only reset when its window really is off the screen.
+        if (AccessibilityData.targetPackageVisible && isTargetOnScreen()) {
+            Log.d(TAG, "Chess app still on screen; not resetting")
+            readBoard()
+        } else {
+            doTargetLeft()
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        // Start from a clean slate in case of a reconnect without a new instance.
+        handler.removeCallbacksAndMessages(null)
+        readScheduled = false
+        targetLeftPending = false
+        resetReadState()
+        connected = true
         instance = this
         AccessibilityData.serviceConnected = true
         // Needed for [getWindows], which finds the chess app when another window is the active
@@ -132,7 +159,16 @@ class BoardAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
+        if (event == null || !connected) return
+        try {
+            handleEvent(event)
+        } catch (e: RuntimeException) {
+            // Stale nodes / events (NPE, IllegalStateException) must never kill the service.
+            Log.e(TAG, "Error handling accessibility event", e)
+        }
+    }
+
+    private fun handleEvent(event: AccessibilityEvent) {
         val pkg = event.packageName?.toString() ?: return
         // Our own overlay's events say nothing about the chess app.
         if (pkg == packageName) return
@@ -185,10 +221,11 @@ class BoardAccessibilityService : AccessibilityService() {
             // the restart, until the system stops rebinding the service (enabled in settings,
             // but never connected).
             Log.e(TAG, "Board read failed", e)
-            AccessibilityData.lastRejectReason = "Board read failed: ${e.javaClass.simpleName}: ${e.message}"
+            AccessibilityData.lastRejectReason =
+                "Board read failed: ${e.javaClass.simpleName}: ${e.message?.take(MAX_ERROR_MESSAGE)}"
         } finally {
             // Heartbeat; a sooner read scheduled by the read above is kept (see scheduleRead).
-            if (AccessibilityData.targetPackageVisible) scheduleRead(HEARTBEAT_MS)
+            if (connected && AccessibilityData.targetPackageVisible) scheduleRead(HEARTBEAT_MS)
         }
     }
 
@@ -227,9 +264,18 @@ class BoardAccessibilityService : AccessibilityService() {
         try {
             val active = rootInActiveWindow
             if (active != null) {
-                activePackage = active.packageName?.toString()
-                if (activePackage == TARGET_PACKAGE) return active
-                active.recycle()
+                // Ownership passes to the caller only on the success path; every other exit
+                // (including a throw from a stale node) recycles it.
+                var keep = false
+                try {
+                    activePackage = active.packageName?.toString()
+                    if (activePackage == TARGET_PACKAGE) {
+                        keep = true
+                        return active
+                    }
+                } finally {
+                    if (!keep) safeRecycle(active)
+                }
             }
         } catch (e: RuntimeException) {
             Log.w(TAG, "Could not read the active window", e)
@@ -238,32 +284,38 @@ class BoardAccessibilityService : AccessibilityService() {
         var best: AccessibilityNodeInfo? = null
         var bestArea = -1L
         var windowCount = 0
+        var windowList: List<AccessibilityWindowInfo> = emptyList()
         try {
+            windowList = windows.orEmpty()
             val bounds = Rect()
-            for (window in windows.orEmpty()) {
+            for (window in windowList) {
                 windowCount++
                 if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
                 val root = window.root ?: continue
-                if (root.packageName?.toString() != TARGET_PACKAGE) {
-                    root.recycle()
-                    continue
-                }
-                window.getBoundsInScreen(bounds)
-                val area = bounds.width().toLong() * bounds.height()
-                if (area > bestArea) {
-                    best?.recycle()
-                    best = root
-                    bestArea = area
-                } else {
-                    root.recycle()
+                // Recycled in the finally unless it became [best]; a throw from a stale node
+                // (packageName, getBoundsInScreen) cannot leak it.
+                var kept = false
+                try {
+                    if (root.packageName?.toString() != TARGET_PACKAGE) continue
+                    window.getBoundsInScreen(bounds)
+                    val area = bounds.width().toLong() * bounds.height()
+                    if (area > bestArea) {
+                        best?.let { safeRecycle(it) }
+                        best = root
+                        bestArea = area
+                        kept = true
+                    }
+                } finally {
+                    if (!kept) safeRecycle(root)
                 }
             }
         } catch (e: RuntimeException) {
             Log.w(TAG, "Could not read the window list", e)
-            best?.let {
-                try { it.recycle() } catch (_: RuntimeException) {}
-                best = null
-            }
+            best?.let { safeRecycle(it) }
+            best = null
+        } finally {
+            // getWindows() hands out copies that, before API 33, go back to a pool on recycle().
+            for (window in windowList) safeRecycle(window)
         }
         if (best == null) {
             AccessibilityData.lastRejectReason = if (activePackage == null && windowCount == 0) {
@@ -278,8 +330,27 @@ class BoardAccessibilityService : AccessibilityService() {
     /** Whether the chess app has a window on screen right now. */
     private fun isTargetOnScreen(): Boolean {
         val root = findTargetRoot() ?: return false
-        root.recycle()
+        safeRecycle(root)
         return true
+    }
+
+    /** Recycles [node]; a node that is already recycled or stale must not take the service down. */
+    @Suppress("DEPRECATION")
+    private fun safeRecycle(node: AccessibilityNodeInfo) {
+        try {
+            node.recycle()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Could not recycle node", e)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun safeRecycle(window: AccessibilityWindowInfo) {
+        try {
+            window.recycle()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Could not recycle window", e)
+        }
     }
 
     /** The chess app's view tree, or null if it is not on screen or cannot be read. */
@@ -297,7 +368,7 @@ class BoardAccessibilityService : AccessibilityService() {
             AccessibilityData.lastRejectReason = "Error reading view tree: ${e.javaClass.simpleName}"
             null
         } finally {
-            root.recycle()
+            safeRecycle(root)
         }
     }
 
@@ -537,6 +608,7 @@ class BoardAccessibilityService : AccessibilityService() {
      * waits behind it.
      */
     private fun scheduleRead(delayMs: Long) {
+        if (!connected) return
         val at = SystemClock.uptimeMillis() + delayMs
         if (readScheduled && scheduledReadAt <= at) return
         handler.removeCallbacks(scheduledRead)
@@ -569,14 +641,44 @@ class BoardAccessibilityService : AccessibilityService() {
         Log.w(TAG, "Accessibility service interrupted")
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        tearDown()
+        Log.i(TAG, "Accessibility service unbound")
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
+        tearDown()
+        super.onDestroy()
+        Log.i(TAG, "Accessibility service destroyed")
+    }
+
+    /** Stops all pending work and drops cached state. Idempotent: runs from onUnbind and onDestroy. */
+    private fun tearDown() {
+        connected = false
         handler.removeCallbacksAndMessages(null)
         readScheduled = false
         targetLeftPending = false
-        instance = null
-        AccessibilityData.serviceConnected = false
-        AccessibilityData.clear()
-        super.onDestroy()
-        Log.i(TAG, "Accessibility service destroyed")
+        resetReadState()
+        // Only clear the static reference if it still points at us, not at a newer instance.
+        if (instance === this) {
+            instance = null
+            AccessibilityData.serviceConnected = false
+            AccessibilityData.clear()
+        }
+    }
+
+    /** Forgets everything learned from earlier reads; releases the cached node list. */
+    private fun resetReadState() {
+        lastReadTime = 0L
+        lastNodes = null
+        lastResult = null
+        lastPositions = null
+        identicalReads = 0
+        lastOrientation = null
+        identicalOrientations = 0
+        game.reset()
+        lastMoveCount = 0
+        moveTrackingActive = false
     }
 }

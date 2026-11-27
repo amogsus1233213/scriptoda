@@ -105,6 +105,7 @@ object AccessibilityData {
     }
 
     /** The chess app is no longer in front, so the side the user plays can't be vouched for. */
+    @Synchronized
     fun onTargetLeft() {
         targetPackageVisible = false
         userPlaysWhite = null
