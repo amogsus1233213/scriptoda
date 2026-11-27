@@ -2229,20 +2229,36 @@ class AnalysisCoordinator(
                 premovePreviewPlacement = placement
                 val line = mateLine
                 if (line != null) {
-                    // Find the next user-move index in the PV (even indices are user moves).
+                    // Search all remaining user moves in the PV, not just the next one.
+                    // When multiple premoves are queued rapidly, the 2nd premove matches
+                    // a later PV entry, so the offset must reflect the actual distance.
                     val nextUserIdx = if (line.played % 2 == 0) line.played else line.played + 1
-                    val expected = line.pv.getOrNull(nextUserIdx)
-                    if (expected != null && expected.length >= 4 &&
-                        expected.regionMatches(0, move.uci, 0, 4, ignoreCase = true)
-                    ) {
-                        val remaining = remainingMateLines(line, premoveOffset = 1)
-                        if (remaining.isNotEmpty()) {
-                            Log.d(TAG, "Premove fallback: matches PV[$nextUserIdx]=$expected, " +
-                                "showing next arrow")
-                            postMultiSuggestion(remaining, line.flipped)
+                    var matched = false
+                    var pvIdx = nextUserIdx
+                    var offset = 1
+                    while (pvIdx < line.pv.size) {
+                        val candidate = line.pv[pvIdx]
+                        if (candidate.length >= 4 &&
+                            candidate.regionMatches(0, move.uci, 0, 4, ignoreCase = true)
+                        ) {
+                            val remaining = remainingMateLines(line, premoveOffset = offset)
+                            if (remaining.isNotEmpty()) {
+                                Log.d(TAG, "Premove fallback: matches PV[$pvIdx]=$candidate " +
+                                    "(offset=$offset), showing next arrow")
+                                postMultiSuggestion(remaining, line.flipped)
+                            } else {
+                                Log.d(TAG, "Premove fallback: matches PV[$pvIdx]=$candidate " +
+                                    "(offset=$offset), no remaining arrows")
+                            }
+                            matched = true
+                            break
                         }
-                    } else {
-                        Log.d(TAG, "Premove fallback: ${move.uci} != expected $expected at PV[$nextUserIdx]")
+                        pvIdx += 2
+                        offset++
+                    }
+                    if (!matched) {
+                        Log.d(TAG, "Premove fallback: ${move.uci} doesn't match any user " +
+                            "PV move from index $nextUserIdx")
                     }
                 }
                 return
@@ -3138,6 +3154,7 @@ class AnalysisCoordinator(
         if (expected == null || expected.length < 4 || !expected.regionMatches(0, uci, 0, 4, ignoreCase = true)) {
             Log.d(TAG, "MateLine left: move=$uci, expected=$expected, played=${line.played}, pv.size=${line.pv.size}")
             mateLine = null
+            lastCommittedMate = null
             return emptyList()
         }
         line.played++
