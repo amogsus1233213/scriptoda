@@ -9,6 +9,7 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -87,6 +88,16 @@ class StockfishEngine(private val binaryPath: String) {
         private const val QUIT_WAIT_MS = 1_000L
         private const val DESTROY_WAIT_MS = 500L
         private const val POLL_INTERVAL_MS = 100L
+        /**
+         * Once the process is found dead, how long [waitForLine] still waits for the reader
+         * thread to hand over what the engine wrote before exiting (and the end-of-stream marker).
+         */
+        private const val DEAD_PROCESS_GRACE_MS = 300L
+        /**
+         * How long [stop] and [interruptSearch] wait for the write lock. They are called from the
+         * main thread and must never block on a search thread that is stuck writing.
+         */
+        private const val STOP_LOCK_WAIT_MS = 50L
         private const val ENGINE_THREADS = 6
         /** First hash size tried. See the class comment for the fallback. */
         private const val ENGINE_HASH_MB = 512
@@ -105,11 +116,14 @@ class StockfishEngine(private val binaryPath: String) {
         private val EOF_MARKER = String(charArrayOf('\u0000'))
 
         private val WHITESPACE = Regex("\\s+")
+
+        /** A move in UCI long algebraic notation ("e2e4", "e7e8q"). */
+        private val UCI_MOVE = Regex("[a-h][1-8][a-h][1-8][qrbn]?")
     }
 
     private val analysisLock = ReentrantLock()
     private val stateLock = Any()
-    private val writeLock = Any()
+    private val writeLock = ReentrantLock()
 
     @Volatile private var process: Process? = null
     @Volatile private var writer: BufferedWriter? = null
@@ -121,9 +135,15 @@ class StockfishEngine(private val binaryPath: String) {
     /** Hash size (MB) the next launch asks for. Only ever reduced. */
     @Volatile private var targetHashMb = ENGINE_HASH_MB
     /** Incremented by every [quit], so a search can tell a requested shutdown from a death. */
-    @Volatile private var quitCount = 0
+    private val quitCount = AtomicInteger()
     /** Set when the process died on its own during the current search. Guarded by [analysisLock]. */
-    private var searchDied = false
+    @Volatile private var searchDied = false
+    /**
+     * Set when the process was alive but stopped answering during the current search and was
+     * torn down for it. Worth a retry on a fresh process, but not a reason to shrink the hash.
+     * Guarded by [analysisLock].
+     */
+    @Volatile private var searchHung = false
 
     /**
      * Hash size (MB) the running engine was configured with, 0 while it is not running. Lower
@@ -186,7 +206,7 @@ class StockfishEngine(private val binaryPath: String) {
                 .redirectErrorStream(true)
                 .start()
             val queue = LinkedBlockingQueue<String>()
-            val reader = BufferedReader(InputStreamReader(p.inputStream))
+            val reader = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
             val thread = Thread({
                 try {
                     while (true) {
@@ -208,7 +228,7 @@ class StockfishEngine(private val binaryPath: String) {
             }
 
             process = p
-            writer = BufferedWriter(OutputStreamWriter(p.outputStream))
+            writer = BufferedWriter(OutputStreamWriter(p.outputStream, Charsets.UTF_8))
             lines = queue
             readerThread = thread
             currentMultiPv = 1
@@ -245,6 +265,12 @@ class StockfishEngine(private val binaryPath: String) {
             val alive = hashSet && p.isAlive && send("uci") &&
                 waitForLine(queue, deadlineAfter(HANDSHAKE_TIMEOUT_MS)) { it == "uciok" } != null &&
                 p.isAlive
+            if (!alive && Thread.currentThread().isInterrupted) {
+                // The caller gave up while waiting; that says nothing about the hash size.
+                Log.w(TAG, "Interrupted while setting Hash=$hash MB")
+                shutdownProcess()
+                return Launch.FAILED
+            }
             if (!alive) {
                 Log.w(TAG, "Engine lost while setting Hash=$hash MB (${describeExit(p)})" +
                     if (lastOutput.isNotEmpty()) ", last output: $lastOutput" else "")
@@ -326,22 +352,35 @@ class StockfishEngine(private val binaryPath: String) {
             return null
         }
 
+        moves.firstOrNull { !UCI_MOVE.matches(it) }?.let { bad ->
+            Log.w(TAG, "Refusing to analyse with malformed move '$bad' in $moves")
+            return null
+        }
+
         analysisLock.withLock {
             // A second attempt only after the engine died on its own: it is restarted (with a
             // smaller hash table) and the same position searched again, so that a killed engine
             // costs a delay and not the answer.
             repeat(2) { attempt ->
-                val quitsBefore = quitCount
+                val quitsBefore = quitCount.get()
                 searchDied = false
+                searchHung = false
                 val results = searchOnce(fen, depth, lineCount, moves, moveTimeMs)
                 if (results != null) return results
                 // Nothing to retry if the engine is alive, was shut down on purpose, or the
                 // calling thread is being stopped.
-                if (!searchDied || quitCount != quitsBefore || Thread.currentThread().isInterrupted) {
+                if ((!searchDied && !searchHung) || quitCount.get() != quitsBefore ||
+                    Thread.currentThread().isInterrupted
+                ) {
                     return null
                 }
-                reduceHash("in use when the engine died during a search")
-                Log.w(TAG, "Engine died during a search" + if (attempt == 0) "; restarting and retrying" else " again")
+                if (searchDied) {
+                    reduceHash("in use when the engine died during a search")
+                    Log.w(TAG, "Engine died during a search" + if (attempt == 0) "; restarting and retrying" else " again")
+                } else {
+                    Log.w(TAG, "Engine stopped answering during a search" +
+                        if (attempt == 0) "; restarting and retrying" else " again")
+                }
             }
             return null
         }
@@ -358,17 +397,17 @@ class StockfishEngine(private val binaryPath: String) {
         if (!isReady() && !start()) return null
         val queue = lines
 
-        queue.clear()
+        discardPending(queue)
         if (!send("isready") ||
             waitForLine(queue, deadlineAfter(READY_TIMEOUT_MS)) { it == "readyok" } == null
         ) {
-            markDeadIfNeeded()
+            abandon("No readyok before the search")
             return null
         }
 
         if (lineCount != currentMultiPv) {
             if (!send("setoption name MultiPV value $lineCount")) {
-                markDeadIfNeeded()
+                abandon("Could not set MultiPV")
                 return null
             }
             currentMultiPv = lineCount
@@ -381,7 +420,7 @@ class StockfishEngine(private val binaryPath: String) {
         // Both limits are sent: the engine stops at whichever comes first.
         val goCommand = if (moveTimeMs > 0) "go depth $depth movetime $moveTimeMs" else "go depth $depth"
         if (!send(position) || !send(goCommand)) {
-            markDeadIfNeeded()
+            abandon("Could not send the search")
             return null
         }
 
@@ -426,8 +465,8 @@ class StockfishEngine(private val binaryPath: String) {
 
         while (bestMove == null) {
             val line = waitForLine(queue, deadline) { true } ?: break
-            if (line.startsWith("bestmove")) {
-                bestMove = line.split(WHITESPACE).getOrNull(1) ?: "(none)"
+            if (isBestMoveLine(line)) {
+                bestMove = parseBestMove(line)
             } else if (line.startsWith("info ")) {
                 record(parseInfo(line) ?: continue)
             }
@@ -436,28 +475,35 @@ class StockfishEngine(private val binaryPath: String) {
         if (bestMove == null) {
             // The process died mid-search: whatever was collected comes from a half-finished
             // search, so nothing is returned and the next call restarts the engine.
-            if (process?.isAlive != true) {
-                markDeadIfNeeded()
+            if (process?.isAlive != true || isEndOfStream(queue)) {
+                markDeadIfNeeded(force = true)
                 return null
             }
+            // Timeout, or the calling thread was interrupted. Either way the engine is still
+            // searching and its bestmove must be collected here, or it would be taken as the
+            // answer of the next search. The interrupt flag is put aside for the drain (it would
+            // make every wait return at once) and restored afterwards.
+            val wasInterrupted = Thread.interrupted()
             send("stop")
             val stopDeadline = deadlineAfter(STOP_DRAIN_TIMEOUT_MS)
             while (bestMove == null) {
                 val stopLine = waitForLine(queue, stopDeadline) { true } ?: break
-                if (stopLine.startsWith("bestmove")) {
-                    bestMove = stopLine.split(WHITESPACE).getOrNull(1) ?: "(none)"
+                if (isBestMoveLine(stopLine)) {
+                    bestMove = parseBestMove(stopLine)
                 } else if (stopLine.startsWith("info ")) {
                     record(parseInfo(stopLine) ?: continue)
                 }
             }
+            if (wasInterrupted) Thread.currentThread().interrupt()
             if (bestMove == null) {
                 // Still no bestmove: the engine is either dead or still searching. Left
                 // alive, its late bestmove would be read as the answer of the next search
                 // and every later result would be one search behind, so it is torn down and
                 // the next call starts a fresh process.
-                val diedMeanwhile = process?.isAlive != true
+                val p = process
+                val diedMeanwhile = p?.isAlive != true
                 Log.w(TAG, "No bestmove before the timeout (process dead=$diedMeanwhile); restarting the engine")
-                synchronized(stateLock) { shutdownProcess() }
+                shutdownIfCurrent(p)
                 if (diedMeanwhile) {
                     searchDied = true
                     return null
@@ -485,12 +531,14 @@ class StockfishEngine(private val binaryPath: String) {
     fun newGame(): Boolean = analysisLock.withLock {
         if (!isReady()) return false
         val queue = lines
-        queue.clear()
+        discardPending(queue)
         // "ucinewgame" clears the whole hash table, hence the long timeout.
         if (!send("ucinewgame") || !send("isready") ||
             waitForLine(queue, deadlineAfter(HASH_READY_TIMEOUT_MS)) { it == "readyok" } == null
         ) {
-            markDeadIfNeeded()
+            // A fresh process (started by the next search) has an empty hash table too, so
+            // tearing down an engine that does not answer loses nothing.
+            abandon("No readyok after ucinewgame")
             return false
         }
         true
@@ -498,7 +546,7 @@ class StockfishEngine(private val binaryPath: String) {
 
     /** Interrupts the current search; the pending [analyze] call returns promptly. */
     fun stop() {
-        if (process?.isAlive == true) send("stop")
+        if (process?.isAlive == true) send("stop", STOP_LOCK_WAIT_MS)
     }
 
     /**
@@ -507,12 +555,12 @@ class StockfishEngine(private val binaryPath: String) {
      * "bestmove" that [analyzeMultiPv] picks up.
      */
     fun interruptSearch() {
-        if (initialized && process?.isAlive == true) send("stop")
+        if (initialized && process?.isAlive == true) send("stop", STOP_LOCK_WAIT_MS)
     }
 
     /** Asks the engine to exit and releases the process. */
     fun quit() {
-        quitCount++
+        quitCount.incrementAndGet()
         synchronized(stateLock) {
             val p = process ?: return
             if (p.isAlive) {
@@ -684,7 +732,7 @@ class StockfishEngine(private val binaryPath: String) {
                     i += 2
                 }
                 "multipv" -> {
-                    multiPv = tokens.getOrNull(i + 1)?.toIntOrNull() ?: 1
+                    multiPv = tokens.getOrNull(i + 1)?.toIntOrNull()?.takeIf { it >= 1 } ?: 1
                     i += 2
                 }
                 "score" -> {
@@ -694,13 +742,16 @@ class StockfishEngine(private val binaryPath: String) {
                         "cp" -> cp = value
                         "mate" -> mate = value
                     }
-                    i += 3
-                    val next = tokens.getOrNull(i)
-                    if (next == "lowerbound" || next == "upperbound") {
-                        bound = true
-                        lowerBound = next == "lowerbound"
-                        i++
-                    }
+                    // Only skip the value when there is one: a truncated "score cp" must not
+                    // swallow the next key.
+                    i += if (value != null) 3 else 2
+                }
+                // Stockfish prints the bound after the "wdl" triple when UCI_ShowWDL is on, so
+                // it is not always right behind the score.
+                "lowerbound", "upperbound" -> {
+                    bound = true
+                    lowerBound = tokens[i] == "lowerbound"
+                    i++
                 }
                 "pv" -> {
                     pv = tokens.subList(i + 1, tokens.size).toList()
@@ -714,8 +765,9 @@ class StockfishEngine(private val binaryPath: String) {
             }
         }
 
-        val d = depth ?: return null
+        val d = depth?.takeIf { it >= 0 } ?: return null
         if (cp == null && mate == null) return null
+        if (pv.any { !UCI_MOVE.matches(it) }) pv = pv.takeWhile { UCI_MOVE.matches(it) }
         return InfoLine(d, multiPv, cp, mate, bound, pv, lowerBound)
     }
 
@@ -840,15 +892,49 @@ class StockfishEngine(private val binaryPath: String) {
         else -> -MATE_SCORE // "mate 0": side to move is checkmated
     }
 
+    /** True for a "bestmove" line (and not, say, an "info string" that mentions the word). */
+    private fun isBestMoveLine(line: String): Boolean =
+        line == "bestmove" || line.startsWith("bestmove ")
+
+    /**
+     * The move of a "bestmove" line. "(none)" when it carries no move or something that is not
+     * a move, so a malformed line is treated like "no legal move" rather than shown as an arrow.
+     */
+    private fun parseBestMove(line: String): String {
+        val token = line.split(WHITESPACE).getOrNull(1) ?: return "(none)"
+        return if (token == "(none)" || token == "0000" || UCI_MOVE.matches(token)) token else {
+            Log.w(TAG, "Malformed bestmove line: $line")
+            "(none)"
+        }
+    }
+
+    /** True once the reader thread has reported that the engine's stdout closed. */
+    private fun isEndOfStream(queue: LinkedBlockingQueue<String>): Boolean = queue.contains(EOF_MARKER)
+
+    /**
+     * Drops whatever the engine printed before the next command, keeping the end-of-stream
+     * marker so a closed stream is still noticed by the next wait.
+     */
+    private fun discardPending(queue: LinkedBlockingQueue<String>) {
+        val eof = isEndOfStream(queue)
+        queue.clear()
+        if (eof) queue.offer(EOF_MARKER)
+    }
+
     /**
      * Polls [queue] until a line matching [predicate] arrives. Returns null on timeout,
-     * on end of stream, or if the process is found dead while waiting.
+     * on end of stream, if the calling thread is interrupted, or if the process is found dead
+     * (and has nothing left to hand over) while waiting.
+     *
+     * The end-of-stream marker is left in the queue, so every later wait on the same queue
+     * returns at once instead of running into its timeout.
      */
     private inline fun waitForLine(
         queue: LinkedBlockingQueue<String>,
         deadline: Long,
         predicate: (String) -> Boolean
     ): String? {
+        var deadSince = 0L
         while (true) {
             val remaining = deadline - System.nanoTime()
             if (remaining <= 0) return null
@@ -860,47 +946,145 @@ class StockfishEngine(private val binaryPath: String) {
                 return null
             }
             if (line == null) {
-                if (process?.isAlive != true && queue.isEmpty()) return null
+                // A dead process may still have output in the pipe that the reader thread has
+                // not queued yet (the final bestmove, an error message), followed by the
+                // end-of-stream marker. Give it a moment before giving up.
+                if (process?.isAlive != true) {
+                    val now = System.nanoTime()
+                    if (deadSince == 0L) {
+                        deadSince = now
+                    } else if (now - deadSince > TimeUnit.MILLISECONDS.toNanos(DEAD_PROCESS_GRACE_MS)) {
+                        return null
+                    }
+                }
                 continue
             }
-            if (line === EOF_MARKER) return null
+            if (line === EOF_MARKER) {
+                queue.offer(EOF_MARKER)
+                return null
+            }
             if (predicate(line)) return line
         }
     }
 
     private fun deadlineAfter(ms: Long): Long = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ms)
 
-    private fun send(command: String): Boolean = synchronized(writeLock) {
-        val w = writer ?: return false
+    /**
+     * Writes one command line. With [lockWaitMs] the write is skipped (false) when another
+     * thread holds the write lock for longer than that, so callers on the main thread never
+     * block behind a stuck write.
+     */
+    private fun send(command: String, lockWaitMs: Long? = null): Boolean {
+        // One command per line: an embedded line break would smuggle in a second command.
+        if (command.any { it == '\n' || it == '\r' }) {
+            Log.e(TAG, "Refusing to send a command with a line break")
+            return false
+        }
+        if (lockWaitMs == null) {
+            writeLock.lock()
+        } else {
+            val locked = try {
+                writeLock.tryLock(lockWaitMs, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!locked) {
+                Log.w(TAG, "Could not send '$command': the engine input is busy")
+                return false
+            }
+        }
         try {
+            val w = writer ?: return false
             w.write(command)
             w.newLine()
             w.flush()
-            true
+            return true
         } catch (_: IOException) {
-            false
+            return false
+        } finally {
+            writeLock.unlock()
         }
     }
 
-    /** Tears the process down if it died so the next call restarts it. */
-    private fun markDeadIfNeeded() {
-        if (process?.isAlive != true) {
-            searchDied = true
-            synchronized(stateLock) { shutdownProcess() }
+    /**
+     * Tears the process down if it died (or, with [force], whatever its state) so the next call
+     * restarts it.
+     */
+    private fun markDeadIfNeeded(force: Boolean = false) {
+        val p = process
+        if (!force && p?.isAlive == true) return
+        searchDied = true
+        shutdownIfCurrent(p)
+    }
+
+    /**
+     * A command could not be written or got no answer in time. A dead process is handled by
+     * [markDeadIfNeeded]; a live one that does not answer is out of sync with this wrapper (a
+     * late answer would be taken for the answer to a later command), so it is torn down as well
+     * and the next call starts a fresh one. Nothing happens when the calling thread was
+     * interrupted: the wait was cut short, the engine is not at fault.
+     */
+    private fun abandon(what: String) {
+        if (Thread.currentThread().isInterrupted) return
+        val p = process
+        if (p?.isAlive != true) {
+            markDeadIfNeeded()
+            return
+        }
+        Log.w(TAG, "$what (${describeExit(p)}); restarting the engine")
+        searchHung = true
+        shutdownIfCurrent(p)
+    }
+
+    /**
+     * Shuts down [p] unless another thread has replaced it meanwhile (through [start]): a check
+     * made on one process must not tear down its successor.
+     */
+    private fun shutdownIfCurrent(p: Process?) {
+        synchronized(stateLock) {
+            if (process === p) shutdownProcess()
         }
     }
 
+    /** Call with [stateLock] held. */
     private fun shutdownProcess() {
         initialized = false
         hashMb = 0
-        synchronized(writeLock) {
+        val p = process
+        val thread = readerThread
+        val w = writer
+        // Stop new writes first, then kill the process before touching the streams: a write
+        // blocked on a full pipe (an engine that stopped reading stdin) only returns once the
+        // process is gone, and closing the writer flushes, which would block the same way.
+        writer = null
+        process = null
+        readerThread = null
+        if (p != null) {
+            p.destroy()
             try {
-                writer?.close()
+                if (!p.waitFor(DESTROY_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    p.destroyForcibly()
+                    p.waitFor(DESTROY_WAIT_MS, TimeUnit.MILLISECONDS)
+                }
+            } catch (_: InterruptedException) {
+                p.destroyForcibly()
+                Thread.currentThread().interrupt()
+            }
+        }
+        writeLock.lock()
+        try {
+            w?.close()
+        } catch (_: IOException) {
+            // Broken pipe: the process is gone, the stream is closed regardless.
+        } finally {
+            writeLock.unlock()
+        }
+        if (p != null) {
+            try {
+                p.outputStream?.close()
             } catch (_: IOException) {
             }
-            writer = null
-        }
-        process?.let { p ->
             try {
                 p.inputStream?.close()
             } catch (_: IOException) {
@@ -909,24 +1093,17 @@ class StockfishEngine(private val binaryPath: String) {
                 p.errorStream?.close()
             } catch (_: IOException) {
             }
-            p.destroy()
-            try {
-                if (!p.waitFor(DESTROY_WAIT_MS, TimeUnit.MILLISECONDS)) p.destroyForcibly()
-            } catch (_: InterruptedException) {
-                p.destroyForcibly()
-                Thread.currentThread().interrupt()
-            }
         }
-        process = null
-        readerThread?.let { t ->
+        thread?.let { t ->
+            // The process is dead, so its stdout is at end of stream and the reader exits.
             t.interrupt()
             try {
                 t.join(DESTROY_WAIT_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
+            if (t.isAlive) Log.w(TAG, "Reader thread did not exit")
         }
-        readerThread = null
         currentMultiPv = 1
     }
 }
